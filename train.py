@@ -45,9 +45,14 @@ def sweep(args) -> dict:
     # Persist the ACTUAL resolved samples (not just the args that produced
     # them) so evaluate.py can load the exact same test pool later instead of
     # re-deriving a split that silently drifts if any flag doesn't match
-    # (PCS_METHOD_SPEC.md §7 dev/test contamination).
-    save_dev_test_split(dev, test, args.split_out)
-    print(f"Dev/test split saved to {args.split_out} -- evaluate.py reads its 'test' half from here by default")
+    # (PCS_METHOD_SPEC.md §7 dev/test contamination). --skip-split-write is
+    # for scripts/shard_pipeline.py's multi-GPU sweep: every shard resolves
+    # the IDENTICAL split (same seed/args), so the orchestrator writes it
+    # once upfront and every shard just skips re-writing it, instead of N
+    # processes racing to write the same file concurrently.
+    if not args.skip_split_write:
+        save_dev_test_split(dev, test, args.split_out)
+        print(f"Dev/test split saved to {args.split_out} -- evaluate.py reads its 'test' half from here by default")
 
     model, tokenizer = load_reader(args.reader_model, device=args.device)
     if args.relevance == 'e6':
@@ -59,7 +64,10 @@ def sweep(args) -> dict:
         relevance = SyntheticRelevanceProvider(seed=args.seed)
 
     ratios = [float(r) for r in args.ratios.split(',')]
-    lambdas = [0.0] + LAMBDA_GRID + [1.0]  # anchors included for the full curve, excluded from the pick below
+    # --lambdas restricts the sweep to a subset (scripts/shard_pipeline.py's
+    # multi-GPU sweep: each GPU shard gets a disjoint slice of the grid).
+    # Default is the full grid, identical to a plain single-process run.
+    lambdas = [round(float(l), 1) for l in args.lambdas.split(',')] if args.lambdas else [0.0] + LAMBDA_GRID + [1.0]
 
     curve = {}
     for lam in lambdas:
@@ -86,7 +94,13 @@ def sweep(args) -> dict:
         print(f"  lambda={lam:.1f}  mean_token_f1={curve[lam]['mean_token_f1']:.4f}  "
               f"({', '.join(f'{r}x={v:.4f}' for r, v in per_ratio.items())})")
 
-    best_lam = max(LAMBDA_GRID, key=lambda l: curve[l]['mean_token_f1'])
+    # Interior grid points actually present in `curve` -- the full set on a
+    # plain run, possibly a strict subset on one shard of a multi-GPU sweep
+    # (scripts/shard_pipeline.py's merge step recomputes the authoritative
+    # chosen_lambda from every shard's combined curve; a lone shard's value
+    # here is not meaningful on its own and is overwritten by that merge).
+    interior_present = [l for l in LAMBDA_GRID if l in curve]
+    best_lam = max(interior_present, key=lambda l: curve[l]['mean_token_f1']) if interior_present else None
     return {'curve': curve, 'chosen_lambda': best_lam, 'ratios': ratios, 'relevance_source': args.relevance}
 
 
@@ -96,6 +110,12 @@ def main():
     ap.add_argument('--encoder-path', default=None, help="trained E6 token-classifier checkpoint")
     ap.add_argument('--relevance', choices=['e6', 'synthetic'], default='e6')
     ap.add_argument('--ratios', default='4,8')
+    ap.add_argument('--lambdas', default=None,
+                     help="comma list overriding the full 11-point grid (0.0..1.0 step 0.1) -- "
+                          "scripts/shard_pipeline.py uses this to give each GPU shard a disjoint slice")
+    ap.add_argument('--skip-split-write', action='store_true',
+                     help="don't (re)write --split-out -- for shard_pipeline.py, where the orchestrator "
+                          "writes it once upfront and every shard resolves an identical split anyway")
     ap.add_argument('--num-dev-essays', type=int, default=10, help="Paul Graham essays held out for dev RULER/Kamradt samples")
     ap.add_argument('--samples-per-essay', type=int, default=2)
     ap.add_argument('--longbench-dev', type=int, default=20, help="LongBench passage_retrieval_en rows held out for dev")
@@ -112,8 +132,12 @@ def main():
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     with open(args.out, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
-    print(f"\nChosen lambda* = {result['chosen_lambda']:.1f} (peak of the 9-point interior grid)")
-    print(f"Curve saved to {args.out} -- pass --lam {result['chosen_lambda']:.1f} to evaluate.py")
+    if result['chosen_lambda'] is not None:
+        print(f"\nChosen lambda* = {result['chosen_lambda']:.1f} (peak of the 9-point interior grid)")
+        print(f"Curve saved to {args.out} -- pass --lam {result['chosen_lambda']:.1f} to evaluate.py")
+    else:
+        print(f"\nNo interior grid point in this run's --lambdas ({args.lambdas}) -- "
+              f"partial curve saved to {args.out} (shard_pipeline.py merge-train picks the real chosen_lambda)")
 
 
 if __name__ == '__main__':

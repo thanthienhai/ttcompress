@@ -49,7 +49,8 @@ def _ci_block(values, clusters):
 
 
 def run_arm(arm, ratio, samples, tokenizer, model, relevance, lam, max_new_tokens):
-    compressor = make_compressor(arm, ratio, tokenizer, model, relevance_provider=relevance, lam=lam)
+    compressor = make_compressor(arm, ratio, tokenizer, model, relevance_provider=relevance, lam=lam,
+                                  device=str(getattr(model, 'device', 'cuda')))
     per_source = defaultdict(lambda: {'f1': [], 'nr': [], 'doc': []})
     f1s, nrs, docs = [], [], []
     for sample in samples:
@@ -75,29 +76,9 @@ def run_arm(arm, ratio, samples, tokenizer, model, relevance, lam, max_new_token
     }
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--reader-model', required=True)
-    ap.add_argument('--encoder-path', default=None)
-    ap.add_argument('--relevance', choices=['e6', 'synthetic'], default='e6')
-    ap.add_argument('--lam', type=float, required=True, help="lambda* chosen by train.py's dev sweep")
-    ap.add_argument('--arms', default=','.join(DEFAULT_ARMS))
-    ap.add_argument('--split-file', default='results/dev_test_split.json',
-                     help="load the test half from here (written by train.py); falls back to "
-                          "regenerating from --num-dev-essays et al. if this path doesn't exist")
-    ap.add_argument('--num-dev-essays', type=int, default=10, help="regeneration fallback only -- must match train.py's run")
-    ap.add_argument('--samples-per-essay', type=int, default=2, help="regeneration fallback only -- must match train.py's run")
-    ap.add_argument('--longbench-dev', type=int, default=20, help="regeneration fallback only -- must match train.py's run")
-    ap.add_argument('--split-seed', type=int, default=1234, help="regeneration fallback only -- must match train.py's run")
-    ap.add_argument('--max-new-tokens', type=int, default=None,
-                     help="overrides the per-source default (32 LongBench / 128 RULER / 32 Kamradt) for every source")
-    ap.add_argument('--device', default='cuda')
-    ap.add_argument('--attn-implementation', default=None,
-                     help="forced to 'eager' automatically when --arms includes h2o/snapkv; set explicitly to override")
-    ap.add_argument('--out', default='results/official_bench.json')
-    args = ap.parse_args()
-
+def run_bench(args) -> dict:
     arms = args.arms.split(',')
+    ratios_filter = {float(r) for r in args.ratios.split(',')} if args.ratios else None
 
     if os.path.exists(args.split_file):
         _dev, samples = load_dev_test_split(args.split_file)
@@ -131,7 +112,11 @@ def main():
     results = {}
     for arm in arms:
         results[arm] = {}
-        for ratio in ARM_RATIOS[arm]:
+        ratios_to_run = [r for r in ARM_RATIOS[arm] if ratios_filter is None or r in ratios_filter]
+        if ratios_filter is not None and not ratios_to_run:
+            print(f"[WARN] --ratios {sorted(ratios_filter)} has no overlap with {arm}'s own ratios "
+                  f"{ARM_RATIOS[arm]} -- skipping {arm} entirely")
+        for ratio in ratios_to_run:
             print(f"\n=== {arm} @ {ratio}x ===")
             stats = run_arm(arm, ratio, samples, tokenizer, model, relevance, args.lam, args.max_new_tokens)
             results[arm][f'{ratio}x'] = stats
@@ -142,9 +127,39 @@ def main():
                 sf1 = src_stats['token_f1']
                 print(f"    {src}: token_f1 = {sf1['mean']:.4f}  95% CI [{sf1['ci95'][0]:.4f}, {sf1['ci95'][1]:.4f}]  (n={sf1['n']})")
 
+    return {'lam': args.lam, 'arms': results}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--reader-model', required=True)
+    ap.add_argument('--encoder-path', default=None)
+    ap.add_argument('--relevance', choices=['e6', 'synthetic'], default='e6')
+    ap.add_argument('--lam', type=float, required=True, help="lambda* chosen by train.py's dev sweep")
+    ap.add_argument('--arms', default=','.join(DEFAULT_ARMS))
+    ap.add_argument('--split-file', default='results/dev_test_split.json',
+                     help="load the test half from here (written by train.py); falls back to "
+                          "regenerating from --num-dev-essays et al. if this path doesn't exist")
+    ap.add_argument('--num-dev-essays', type=int, default=10, help="regeneration fallback only -- must match train.py's run")
+    ap.add_argument('--samples-per-essay', type=int, default=2, help="regeneration fallback only -- must match train.py's run")
+    ap.add_argument('--longbench-dev', type=int, default=20, help="regeneration fallback only -- must match train.py's run")
+    ap.add_argument('--split-seed', type=int, default=1234, help="regeneration fallback only -- must match train.py's run")
+    ap.add_argument('--max-new-tokens', type=int, default=None,
+                     help="overrides the per-source default (32 LongBench / 128 RULER / 32 Kamradt) for every source")
+    ap.add_argument('--device', default='cuda')
+    ap.add_argument('--attn-implementation', default=None,
+                     help="forced to 'eager' automatically when --arms includes h2o/snapkv; set explicitly to override")
+    ap.add_argument('--ratios', default=None,
+                     help="comma list restricting each arm's ratios to the intersection with this set -- "
+                          "scripts/shard_pipeline.py uses this to give each GPU shard exactly one (arm, ratio) "
+                          "cell, e.g. --arms encoder_pcs --ratios 4. Default: every ratio ARM_RATIOS defines per arm")
+    ap.add_argument('--out', default='results/official_bench.json')
+    args = ap.parse_args()
+
+    result = run_bench(args)
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
     with open(args.out, 'w', encoding='utf-8') as f:
-        json.dump({'lam': args.lam, 'arms': results}, f, ensure_ascii=False, indent=2)
+        json.dump(result, f, ensure_ascii=False, indent=2)
     print(f"\nSaved to {args.out}")
 
 

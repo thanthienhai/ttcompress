@@ -93,6 +93,77 @@ bench, not a free CPU pass — budget for it accordingly (`--num-dev-essays`/
   so there is nothing left to keep in sync (see `save_dev_test_split`/
   `load_dev_test_split` in `public_datasets.py`).
 
+## A real bug, found by actually running the "unexercised" h2o/snapkv arms
+
+`SnapKVCompressor`'s docstring always said h2o/snapkv were "NOT exercised on
+this dev machine" — asked to estimate `run_pipeline.sh`'s wall-clock on real
+hardware, that claim got checked instead of trusted, and it broke
+immediately: `_compute_attention_importance` called the 8B reader with
+`output_attentions=True` on the FULL, uncompressed context. HF hands back
+attention weights for every layer at once (it can't return a subset), and at
+LongBench's real context length (~15,000 tokens) that's
+`36 layers × 32 heads × 15,000² × 2 bytes ≈ 518GB` just for the attention
+tensors — a guaranteed CUDA OOM on any real GPU, not a slow arm, a crashing
+one, and it would have hit within the first minute of `evaluate.py`'s
+default `--arms` (LongBench sorts first in the test pool).
+
+**Fix, not a workaround**: SnapKV/H2O's own published algorithm only ever
+needs attention from a small trailing "observation window" (`window_size`
+query positions, already a constructor parameter — the intent was always
+there, just not implemented) against the full KV cache — not every query
+position's attention, which the old single-pass call retained regardless of
+ever reading it. `_compute_attention_importance` now does a prefill pass
+with `output_attentions=False` (builds the KV cache, same cost as ordinary
+generation prefill) followed by a small windowed pass with
+`output_attentions=True` over just the last `window_size` tokens. This is
+mathematically IDENTICAL to the original single pass — verified in
+`tests/test_snapkv_windowed_attention.py` against a real (if tiny)
+multi-layer attention reference implementation in float64 (max diff ~1e-10,
+pure floating-point noise; a real logic bug would show up 8+ orders of
+magnitude larger, confirmed by first observing exactly that at float32) —
+just far cheaper: at LongBench's scale, ~3GB instead of ~518GB.
+
+A second, smaller bug turned up alongside it: `registry.make_compressor`
+never passed `--device` through to `SnapKVCompressor`, which defaulted to
+`device='cuda'` unconditionally — invisible on the documented single-GPU
+`cuda:0` default, but a real device mismatch (or an outright crash) on
+`--device cpu` smoke tests, on `cuda:N` for N>0, or on
+`run_pipeline_multi_gpu.sh`'s per-shard GPU pinning below. Fixed by deriving
+the device from the model actually doing the forward pass instead
+(`tests/test_registry_device.py`).
+
+## Multi-GPU sharding: `run_pipeline_multi_gpu.sh`
+
+Neither `train.py`'s λ sweep nor `evaluate.py`'s arm/ratio bench
+parallelizes internally — each is a single process pinned to one `--device`,
+so a machine with N GPUs, run through plain `run_pipeline.sh`, only ever
+uses one of them. `run_pipeline_multi_gpu.sh` is the sharded alternative:
+same six steps, but steps 4/5 split their work across `NUM_GPUS` GPUs
+(`.env`/`--num-gpus`, `cuda:0..cuda:N-1`):
+
+- **Step 4** splits the 11-point λ grid round-robin across GPUs
+  (`train.py --lambdas`, new) — every shard resolves the identical dev/test
+  split (same seed), so it's written once upfront
+  (`train.py --skip-split-write`, new) instead of N processes racing to
+  write the same file.
+- **Step 5** splits the (arm, ratio) cells — `encoder_pcs@4x`, `encoder_pcs@8x`,
+  `h2o@8x`, `snapkv@8x` by default, a natural fit for 4 GPUs
+  (`evaluate.py --ratios`, new, restricts an arm's ratios to the given set).
+- `scripts/shard_pipeline.py` computes each shard's slice
+  (`lambdas-for-shard`/`cells-for-shard`) and merges every shard's output
+  JSON back into the exact single-process file shape
+  (`merge-train`/`merge-eval`) — `results/lambda_sweep_dev.json` and
+  `results/official_bench.json` look identical either way, so nothing
+  downstream (step 6's push, `evaluate.py` reading `chosen_lambda`) needs to
+  know sharding happened. Partitioning is round-robin, not contiguous
+  blocks, and correctly leaves a shard idle (not an error) when `NUM_GPUS`
+  exceeds the work-unit count — tested in `tests/test_shard_pipeline.py`.
+
+```bash
+./run_pipeline_multi_gpu.sh --reader-model Qwen/Qwen3-8B --encoder-path models/encoder_compressor
+./run_pipeline_multi_gpu.sh --num-gpus 4 --relevance synthetic --skip-install   # smoke-test the sharding itself
+```
+
 ## Layout
 
 ```
@@ -106,12 +177,17 @@ ttcompress/
   reader.py           prompt building + greedy generation
   registry.py         arm name -> compressor factory
 train.py              "training" flow = the λ sweep on the dev split (no gradients, ever)
+                      --lambdas/--skip-split-write: shard_pipeline.py's multi-GPU sweep support
 evaluate.py           official bench on the test split + CI (pooled and per-source)
-tests/                mandatory λ=1 ≡ TruncationCompressor equivalence test, metrics sanity
+                      --ratios: shard_pipeline.py's multi-GPU sweep support (one arm/ratio cell per shard)
+tests/                mandatory λ=1 ≡ TruncationCompressor equivalence test, metrics sanity,
+                      SnapKV windowed-attention equivalence, shard partitioning/merging
 run_pipeline.sh        one command: install -> fetch data -> sanity test -> train -> evaluate
+run_pipeline_multi_gpu.sh  same, but steps 4/5 sharded across NUM_GPUS GPUs -- see below
 scripts/
   fetch_data.sh                    downloads/assembles everything under data/ (not committed)
   build_paul_graham_essays.py      helper fetch_data.sh calls to assemble the essay corpus JSON
+  shard_pipeline.py                run_pipeline_multi_gpu.sh's work partitioning + shard-output merging
 data/
   paul_graham_essays.json               haystack corpus (RULER + Kamradt) -- gitignored, run fetch_data.sh
   longbench_passage_retrieval_en.jsonl  LongBench split, as published -- gitignored, run fetch_data.sh

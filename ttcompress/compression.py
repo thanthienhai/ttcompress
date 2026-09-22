@@ -192,22 +192,57 @@ class SnapKVCompressor(BaseCompressor):
         return f"SnapKV-{self.mode}"
 
     def _compute_attention_importance(self, input_ids: torch.Tensor, attention_mask=None) -> torch.Tensor:
+        """Attention-weight importance per key position, from the LAST
+        `window_size` query positions only, averaged over the last
+        len(layers)//4 layers -- exactly what SnapKV/H2O (Li et al. 2024;
+        Zhang et al. 2023) call the "observation window".
+
+        Split into two forward passes so only the observation window's
+        attention weights ever get materialized, not every query
+        position's: output_attentions=True hands back attention for EVERY
+        layer at once (HF can't return a subset of layers), and at PCS's
+        real context lengths that's infeasible -- LongBench's ~15,000-token
+        documents would need 36 layers x 32 heads x 15,000^2 x 2 bytes =~
+        518GB just for the attention tensors, a guaranteed CUDA OOM on any
+        real GPU (this was unexercised code -- see the class docstring --
+        until it was actually run and hit this). The math is unchanged:
+        running the observation window through with a KV cache already
+        built from the preceding tokens gives IDENTICAL attention weights
+        to a single full pass (verified in
+        tests/test_snapkv_windowed_attention.py against a real attention
+        reference implementation) -- only what gets computed/retained is
+        smaller.
+        """
         if self.model is None:
             raise RuntimeError("SnapKV requires a model for attention computation")
         n = input_ids.shape[1]
+        window_start = max(0, n - self.window_size)
+
         with torch.no_grad():
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_attentions=True, use_cache=True)
+            if window_start > 0:
+                prefill = self.model(
+                    input_ids=input_ids[:, :window_start],
+                    attention_mask=None if attention_mask is None else attention_mask[:, :window_start],
+                    use_cache=True, output_attentions=False,
+                )
+                outputs = self.model(
+                    input_ids=input_ids[:, window_start:],
+                    attention_mask=None if attention_mask is None else attention_mask[:, :n],
+                    past_key_values=prefill.past_key_values, use_cache=True, output_attentions=True,
+                    cache_position=torch.arange(window_start, n, device=input_ids.device),
+                )
+            else:
+                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_attentions=True, use_cache=True)
+
         all_attentions = outputs.attentions
         if all_attentions is None:
             raise RuntimeError("Model did not return attention weights. Set output_attentions=True.")
 
-        attn_stack = torch.stack(all_attentions, dim=0)  # [L, B, H, S, S]
+        attn_stack = torch.stack(all_attentions, dim=0)  # [L, B, H, W, S] -- W = window_size (or n if n <= window_size)
         num_layers_to_use = max(1, len(all_attentions) // 4)
         recent_attns = attn_stack[-num_layers_to_use:]
-        window_start = max(0, n - self.window_size)
-        window_attn = recent_attns[:, :, :, window_start:, :]
 
-        importance = window_attn.mean(dim=0).sum(dim=2).mean(dim=0)  # [H, S]
+        importance = recent_attns.mean(dim=0).sum(dim=2).mean(dim=0)  # [H, S]
         if self.pooling in ('maxpool', 'avgpool') and self.kernel_size > 1:
             pool = F.max_pool1d if self.pooling == 'maxpool' else F.avg_pool1d
             imp = pool(importance.unsqueeze(0), kernel_size=self.kernel_size, stride=1, padding=self.kernel_size // 2)

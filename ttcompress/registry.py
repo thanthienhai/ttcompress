@@ -24,6 +24,7 @@ ARM_RATIOS = {
 def make_compressor(
     arm: str, ratio: float, tokenizer, model=None,
     relevance_provider: Optional[RelevanceProvider] = None, lam: Optional[float] = None,
+    device: Optional[str] = None,
 ) -> BaseCompressor:
     config = CompressionConfig(target_ratio=ratio)
     if arm == 'truncation':
@@ -34,8 +35,15 @@ def make_compressor(
         if lam is None:
             raise ValueError("encoder_pcs requires --lam")
         return PCSCompressor(tokenizer, model, config, lam=lam, relevance_provider=relevance_provider)
-    if arm == 'h2o':
-        return SnapKVCompressor(tokenizer, model, config, mode='h2o')
-    if arm == 'snapkv':
-        return SnapKVCompressor(tokenizer, model, config, mode='snapkv')
+    if arm in ('h2o', 'snapkv'):
+        # SnapKVCompressor's own device default ('cuda') was never overridden
+        # here, so it silently ignored --device cpu/cuda:N and always ran on
+        # cuda:0 regardless of where `model` actually lives -- invisible on a
+        # single-GPU cuda:0 run, but a real mismatch (or an outright crash on
+        # a CPU-only smoke test) otherwise, including run_pipeline_multi_gpu.sh's
+        # per-shard cuda:i pinning. Falls back to the model's own .device,
+        # not a hardcoded default, so it always matches the model actually
+        # doing the forward pass.
+        resolved_device = device if device is not None else str(getattr(model, 'device', 'cuda'))
+        return SnapKVCompressor(tokenizer, model, config, device=resolved_device, mode=arm)
     raise ValueError(f"unknown arm {arm!r}; choose from {ARMS}")
