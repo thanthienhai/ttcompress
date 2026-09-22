@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / lint / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets / local env overrides
+.env
+.env.*
+!.env.example
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Model checkpoints / caches — never commit weights or a local HF cache
+# (E6 checkpoints, reader models).
+models/
+*.safetensors
+*.bin
+*.ckpt
+*.pt
+.cache/
+huggingface_cache/
+
+# Run outputs — keep the directory (.gitkeep), not generated results
+results/*
+!results/.gitkeep
+
+# Downloaded/generated dataset files — fetched by scripts/fetch_data.sh, not
+# pushed to git (paul_graham_essays.json is 640KB, longbench_passage_retrieval_en.jsonl
+# is 11MB; both are trivially re-downloadable and don't belong in history).
+# data/SOURCES.md (provenance/license notes) stays tracked.
+data/*.json
+data/*.jsonl
