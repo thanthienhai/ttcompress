@@ -62,6 +62,9 @@ huggingface_cache/
 # Run outputs — keep the directory (.gitkeep), not generated results
 results/*
 !results/.gitkeep
+labels/
+logs/
+runs/
 
 # Downloaded/generated dataset files — fetched by scripts/fetch_data.sh, not
 # pushed to git (paul_graham_essays.json is 640KB, longbench_passage_retrieval_en.jsonl

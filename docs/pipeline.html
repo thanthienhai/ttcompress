@@ -1,0 +1,363 @@
+<meta charset="utf-8">
+<title>Luồng ttcompress</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground: #f5f6f3;
+    --surface: #ffffff;
+    --ink: #1b2320;
+    --muted: #5b6763;
+    --line: #dde2dc;
+    --gpu: #b4540a;
+    --gpu-soft: #fbeee2;
+    --cpu: #3d5a80;
+    --cpu-soft: #e6edf6;
+    --train: #7a3e9d;
+    --train-soft: #f2e8f7;
+    --code-bg: #eef1ec;
+    --font-body: "Be Vietnam Pro", "Segoe UI", system-ui, -apple-system, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --ground: #141816;
+      --surface: #1c211f;
+      --ink: #e7ece9;
+      --muted: #9aa6a1;
+      --line: #2e3532;
+      --gpu: #f0a15e;
+      --gpu-soft: #33251a;
+      --cpu: #8fb0dc;
+      --cpu-soft: #1d2735;
+      --train: #c99ae6;
+      --train-soft: #2b2034;
+      --code-bg: #232926;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground: #141816;
+    --surface: #1c211f;
+    --ink: #e7ece9;
+    --muted: #9aa6a1;
+    --line: #2e3532;
+    --gpu: #f0a15e;
+    --gpu-soft: #33251a;
+    --cpu: #8fb0dc;
+    --cpu-soft: #1d2735;
+    --train: #c99ae6;
+    --train-soft: #2b2034;
+    --code-bg: #232926;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.6;
+    padding-inline: 20px;
+    padding-block: 40px 64px;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; display: flex; flex-direction: column; gap: 40px; }
+  h1, h2, h3 { text-wrap: balance; margin: 0; line-height: 1.25; }
+  h1 { font-size: 30px; font-weight: 700; letter-spacing: -0.01em; }
+  h2 { font-size: 20px; font-weight: 600; }
+  h3 { font-size: 16px; font-weight: 600; }
+  p { margin: 0; }
+  code, .mono { font-family: var(--font-mono); font-size: 0.86em; }
+  .lede { color: var(--muted); max-width: 68ch; margin-top: 10px; }
+  .eyebrow {
+    font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
+  }
+
+  /* legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 18px; font-size: 13px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  .dot.gpu { background: var(--gpu); } .dot.cpu { background: var(--cpu); } .dot.train { background: var(--train); }
+
+  /* overview chain */
+  .chain { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 7px 12px; border-radius: 999px; font-size: 13.5px; font-weight: 500;
+    border: 1px solid transparent; text-decoration: none; color: var(--ink);
+  }
+  .chip b { font-family: var(--font-mono); font-weight: 500; font-size: 12px; opacity: 0.75; }
+  .chip.gpu { background: var(--gpu-soft); border-color: color-mix(in srgb, var(--gpu) 35%, transparent); }
+  .chip.cpu { background: var(--cpu-soft); border-color: color-mix(in srgb, var(--cpu) 35%, transparent); }
+  .chip.train { background: var(--train-soft); border-color: color-mix(in srgb, var(--train) 35%, transparent); }
+  .chip:hover, .chip:focus-visible { border-color: var(--ink); outline: none; }
+  .arrow { color: var(--muted); font-size: 14px; }
+  .phase-label { width: 100%; margin-top: 6px; }
+
+  /* core idea */
+  .idea { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .idea > div { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; display: flex; flex-direction: column; gap: 8px; }
+  .idea .flow { font-family: var(--font-mono); font-size: 13px; color: var(--ink); line-height: 1.9; }
+  .idea .cost { font-size: 13px; color: var(--muted); }
+  .idea .cost strong { color: var(--ink); font-weight: 600; }
+
+  /* stages */
+  .stages { display: flex; flex-direction: column; }
+  .stage {
+    display: grid; grid-template-columns: 56px 1fr; gap: 0 18px;
+    position: relative; padding-bottom: 26px;
+  }
+  .stage:last-child { padding-bottom: 0; }
+  .rail { display: flex; flex-direction: column; align-items: center; }
+  .num {
+    width: 40px; height: 40px; border-radius: 50%;
+    display: grid; place-items: center;
+    font-family: var(--font-mono); font-weight: 500; font-size: 14px;
+    color: var(--surface);
+  }
+  .stage.gpu .num { background: var(--gpu); }
+  .stage.cpu .num { background: var(--cpu); }
+  .stage.train .num { background: var(--train); }
+  .rail::after { content: ""; flex: 1; width: 2px; background: var(--line); margin-top: 6px; }
+  .stage:last-child .rail::after { display: none; }
+
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  .card-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
+  .tag { font-size: 11.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 8px; border-radius: 4px; }
+  .stage.gpu .tag { color: var(--gpu); background: var(--gpu-soft); }
+  .stage.cpu .tag { color: var(--cpu); background: var(--cpu-soft); }
+  .stage.train .tag { color: var(--train); background: var(--train-soft); }
+  .what { color: var(--ink); max-width: 72ch; }
+
+  dl.facts { display: grid; grid-template-columns: 120px 1fr; gap: 8px 16px; margin: 0; font-size: 14px; }
+  dl.facts dt { color: var(--muted); font-size: 12.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; padding-top: 2px; }
+  dl.facts dd { margin: 0; min-width: 0; }
+  ul.models { margin: 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 6px; }
+  ul.models li { font-family: var(--font-mono); font-size: 12.5px; background: var(--code-bg); padding: 2px 8px; border-radius: 4px; }
+  .cmd {
+    font-family: var(--font-mono); font-size: 12.5px; background: var(--code-bg);
+    padding: 8px 10px; border-radius: 6px; overflow-x: auto; white-space: pre; margin: 0;
+  }
+  .out { font-family: var(--font-mono); font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+  .note { font-size: 13.5px; color: var(--muted); }
+
+  .runbox { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; display: flex; flex-direction: column; gap: 12px; }
+  .runbox .cmd { font-size: 13px; }
+
+  footer { font-size: 13px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 16px; }
+
+  @media (max-width: 720px) {
+    .idea { grid-template-columns: 1fr; }
+    .stage { grid-template-columns: 40px 1fr; gap: 0 12px; }
+    .num { width: 32px; height: 32px; font-size: 13px; }
+    dl.facts { grid-template-columns: 1fr; gap: 2px; }
+    dl.facts dd { margin-bottom: 8px; }
+    h1 { font-size: 25px; }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .chip { transition: border-color 0.15s ease; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">ttcompress · Amortized Utility Attribution</p>
+    <h1>Luồng pipeline: từ nhãn đến báo cáo</h1>
+    <p class="lede">Mười bước do <code>run_pipeline.sh</code> chạy lần lượt. Mỗi bước ghi kết quả ra đĩa và bỏ qua phần đã xong, nên chạy lại sau khi lỗi sẽ tiếp tục từ chỗ dừng. Màu cho biết bước đó ăn tài nguyên gì.</p>
+    <div class="legend" aria-label="Chú thích màu">
+      <span><i class="dot gpu"></i>GPU, gọi LLM reader (nặng nhất)</span>
+      <span><i class="dot train"></i>GPU, train hoặc chạy encoder nhỏ</span>
+      <span><i class="dot cpu"></i>CPU, tính toán nhẹ</span>
+    </div>
+  </header>
+
+  <section aria-labelledby="overview-h">
+    <h2 id="overview-h" class="eyebrow" style="margin-bottom:12px">Toàn cảnh</h2>
+    <div class="chain">
+      <span class="phase-label eyebrow">Chuẩn bị</span>
+      <a class="chip cpu" href="#s0"><b>0</b>Kiểm tra môi trường</a><span class="arrow">→</span>
+      <a class="chip cpu" href="#s1"><b>1</b>Tải dữ liệu &amp; model</a>
+      <span class="phase-label eyebrow">Sinh nhãn (Stage A)</span>
+      <a class="chip gpu" href="#s2"><b>2</b>Đo bằng reader</a><span class="arrow">→</span>
+      <a class="chip cpu" href="#s3"><b>3</b>Fit Ridge ra β</a><span class="arrow">→</span>
+      <a class="chip cpu" href="#s4"><b>4</b>Gộp nhãn 3 reader</a>
+      <span class="phase-label eyebrow">Train pruner (Stage B)</span>
+      <a class="chip train" href="#s5"><b>5</b>Train 5 pruner</a>
+      <span class="phase-label eyebrow">Đánh giá trên test</span>
+      <a class="chip train" href="#s6"><b>6</b>Nén (select)</a><span class="arrow">→</span>
+      <a class="chip gpu" href="#s7"><b>7</b>Reader trả lời</a><span class="arrow">→</span>
+      <a class="chip cpu" href="#s8"><b>8</b>Báo cáo</a><span class="arrow">→</span>
+      <a class="chip cpu" href="#s9"><b>9</b>Upload HuggingFace</a>
+    </div>
+  </section>
+
+  <section class="idea" aria-label="Ý tưởng cốt lõi">
+    <div>
+      <p class="eyebrow">Lúc train: đắt, làm một lần</p>
+      <p class="flow">document → che ngẫu nhiên các chunk (K≈64 lần)<br>→ reader trả lời → token F1<br>→ Ridge: mỗi chunk đóng góp bao nhiêu F1 = β</p>
+      <p class="cost"><strong>K + 1 lượt gọi LLM</strong> cho mỗi document, mỗi reader.</p>
+    </div>
+    <div>
+      <p class="eyebrow">Lúc dùng: rẻ, một lượt</p>
+      <p class="flow">câu hỏi + document → pruner (encoder)<br>→ điểm cho từng chunk<br>→ giữ các chunk điểm cao vừa ngân sách token</p>
+      <p class="cost"><strong>1 lượt encoder</strong>, không gọi LLM. Pruner học lại β của bước train.</p>
+    </div>
+  </section>
+
+  <section aria-labelledby="stages-h">
+    <h2 id="stages-h" class="eyebrow" style="margin-bottom:16px">Từng bước</h2>
+    <div class="stages">
+
+      <article class="stage cpu" id="s0">
+        <div class="rail"><span class="num">0</span></div>
+        <div class="card">
+          <div class="card-head"><h3>Kiểm tra môi trường</h3><span class="tag">preflight · CPU</span></div>
+          <p class="what">Kiểm tra số GPU thật có đủ <code>NUM_GPUS</code> không, import được torch / transformers / vLLM không, và chạy nhanh các unit test CPU. Hỏng ở đây thì dừng ngay, không tốn giờ GPU.</p>
+          <dl class="facts">
+            <dt>Chạy</dt><dd><pre class="cmd">nvidia-smi · python -m pytest tests/...</pre></dd>
+            <dt>Kết quả</dt><dd class="out">không ghi file, chỉ báo đạt / không đạt</dd>
+          </dl>
+        </div>
+      </article>
+
+      <article class="stage cpu" id="s1">
+        <div class="rail"><span class="num">1</span></div>
+        <div class="card">
+          <div class="card-head"><h3>Tải dữ liệu và model</h3><span class="tag">prefetch · CPU + mạng</span></div>
+          <p class="what">Tải mọi dataset và model <em>một lần</em> trong một tiến trình, trước khi tách ra nhiều GPU, để các tiến trình không tranh nhau tải. Model gated (nếu có) thiếu <code>HF_TOKEN</code> sẽ báo lỗi ở đây.</p>
+          <dl class="facts">
+            <dt>Dữ liệu</dt>
+            <dd><ul class="models"><li>UIT-ViQuAD 2.0</li><li>XQuAD-vi</li><li>VIMQA</li><li>HotpotQA</li><li>2WikiMultihopQA</li></ul></dd>
+            <dt>Model</dt>
+            <dd><ul class="models"><li>Qwen3-8B</li><li>Qwen3-1.7B</li><li>Llama-SEA-LION-v3-8B</li><li>Qwen3-32B</li><li>bge-reranker-v2-m3</li><li>bge-m3</li></ul></dd>
+            <dt>Chạy</dt><dd><pre class="cmd">python scripts/prefetch.py --sources ... --models ...</pre></dd>
+            <dt>Kết quả</dt><dd class="out">HF cache (~/.cache/huggingface hoặc $HF_HOME)</dd>
+          </dl>
+        </div>
+      </article>
+
+      <article class="stage gpu" id="s2">
+        <div class="rail"><span class="num">2</span></div>
+        <div class="card">
+          <div class="card-head"><h3>Đo: che chunk, hỏi reader</h3><span class="tag">labels · GPU, bước tốn nhất</span></div>
+          <p class="what">Với mỗi document train/dev: tạo K mask ngẫu nhiên (mỗi chunk được giữ với xác suất 0,5 hoặc 0,25; K từ 64 đến 256), ghép các chunk được giữ thành ngữ cảnh, cho reader trả lời rồi chấm token F1 và log-prob của đáp án. Mọi reader thấy <em>cùng một bộ mask</em> cho cùng một document.</p>
+          <dl class="facts">
+            <dt>Dùng</dt>
+            <dd><ul class="models"><li>Qwen3-8B (chính)</li><li>Qwen3-1.7B</li><li>Llama-SEA-LION-v3-8B</li></ul></dd>
+            <dt>Dữ liệu</dt><dd>uit_viquad, vimqa, hotpotqa · 3000 document train + 300 dev mỗi nguồn</dd>
+            <dt>Chạy</dt><dd><pre class="cmd">python generate_labels.py measure --backend vllm  # 1 tiến trình / GPU</pre></dd>
+            <dt>Kết quả</dt><dd class="out">labels/raw/&lt;reader&gt;/&lt;nguồn&gt;_&lt;split&gt;/&lt;doc&gt;.json (mask + F1 + log-prob)</dd>
+          </dl>
+        </div>
+      </article>
+
+      <article class="stage cpu" id="s3">
+        <div class="rail"><span class="num">3</span></div>
+        <div class="card">
+          <div class="card-head"><h3>Fit Ridge: chunk nào đáng bao nhiêu</h3><span class="tag">fit · CPU</span></div>
+          <p class="what">Hồi quy F1 theo mask, được β cho từng chunk (mức đóng góp vào đáp án đúng). α chọn bằng CV trên dev, rồi β được chuẩn hoá z-score trong từng document. Làm hai lần: với F1 (phương pháp chính) và với log-prob (ablation).</p>
+          <dl class="facts">
+            <dt>Chạy</dt><dd><pre class="cmd">python generate_labels.py fit --target f1|logprob</pre></dd>
+            <dt>Kết quả</dt><dd class="out">labels/fit/&lt;reader&gt;/&lt;f1|logprob&gt;/... + summary.json</dd>
+            <dt>Cần xem</dt><dd class="note">summary.json: R² của surrogate, β có tìm đúng needle/supporting fact không (gold_recall_at_g), phần do vị trí giải thích (position_r2)</dd>
+          </dl>
+        </div>
+      </article>
+
+      <article class="stage cpu" id="s4">
+        <div class="rail"><span class="num">4</span></div>
+        <div class="card">
+          <div class="card-head"><h3>Gộp nhãn của 3 reader</h3><span class="tag">ensemble · CPU</span></div>
+          <p class="what">Lấy trung bình z-score β của 3 reader cho mỗi document, thành nhãn không phụ thuộc một reader cụ thể. Đồng thời đo độ đồng thuận giữa các reader.</p>
+          <dl class="facts">
+            <dt>Chạy</dt><dd><pre class="cmd">python generate_labels.py ensemble --fit-dirs A,B,C</pre></dd>
+            <dt>Kết quả</dt><dd class="out">labels/fit/ensemble/f1/... + cross_reader_spearman trong summary.json</dd>
+          </dl>
+        </div>
+      </article>
+
+      <article class="stage train" id="s5">
+        <div class="rail"><span class="num">5</span></div>
+        <div class="card">
+          <div class="card-head"><h3>Train pruner</h3><span class="tag">train · 1 GPU / lần train</span></div>
+          <p class="what">Cross-encoder đọc [câu hỏi; toàn bộ chunk], pool từng chunk rồi cho một điểm. Học xếp hạng chunk theo nhãn (ListNet + MSE, hoặc BCE với nhãn span). Chọn epoch tốt nhất theo nDCG@3 trên dev, không cần gọi reader.</p>
+          <dl class="facts">
+            <dt>Backbone</dt><dd><ul class="models"><li>BAAI/bge-reranker-v2-m3</li></ul></dd>
+            <dt>5 pruner</dt>
+            <dd><ul class="models"><li>pruner_beta_primary (ours)</li><li>pruner_beta_ensemble (ours)</li><li>pruner_span (đối chứng)</li><li>pruner_logprob_primary</li><li>pruner_beta_primary_posadj</li></ul></dd>
+            <dt>Chạy</dt><dd><pre class="cmd">python train_pruner.py --label-source beta|ensemble|span</pre></dd>
+            <dt>Kết quả</dt><dd class="out">models/pruner_*/ + train_log.json</dd>
+          </dl>
+        </div>
+      </article>
+
+      <article class="stage train" id="s6">
+        <div class="rail"><span class="num">6</span></div>
+        <div class="card">
+          <div class="card-head"><h3>Nén document test</h3><span class="tag">select · GPU nhẹ</span></div>
+          <p class="what">Mỗi arm nén từng document test xuống ngân sách token = độ dài / 4 hoặc / 8 (đếm bằng tokenizer Qwen3-8B). Nén <em>một lần</em>; mọi reader ở bước sau dùng đúng cùng bản nén.</p>
+          <dl class="facts">
+            <dt>Arm</dt>
+            <dd><ul class="models"><li>full</li><li>lead</li><li>random</li><li>bm25</li><li>embed (bge-m3)</li><li>oracle_span</li><li>oracle_support</li><li>5 pruner ở bước 5</li><li>+ XProvence, LLMLingua-2 (tuỳ chọn)</li></ul></dd>
+            <dt>Dữ liệu</dt><dd>test: uit_viquad, xquad_vi, vimqa, hotpotqa, 2wiki · 500 document mỗi nguồn (xquad_vi, 2wiki chưa từng train)</dd>
+            <dt>Chạy</dt><dd><pre class="cmd">python evaluate.py select --split test --ratios 4,8</pre></dd>
+            <dt>Kết quả</dt><dd class="out">results/eval_test/selections_shard*.jsonl</dd>
+          </dl>
+        </div>
+      </article>
+
+      <article class="stage gpu" id="s7">
+        <div class="rail"><span class="num">7</span></div>
+        <div class="card">
+          <div class="card-head"><h3>Reader trả lời trên bản nén</h3><span class="tag">answer · GPU</span></div>
+          <p class="what">Từng reader trả lời mọi bản nén; chấm EM, token F1, answer recall. Qwen3-32B không tham gia sinh nhãn, dùng để kiểm tra pruner có hợp với một reader lạ hay không.</p>
+          <dl class="facts">
+            <dt>Dùng</dt>
+            <dd><ul class="models"><li>Qwen3-8B</li><li>Qwen3-1.7B</li><li>Llama-SEA-LION-v3-8B</li><li>Qwen3-32B (held-out, 2 GPU)</li></ul></dd>
+            <dt>Chạy</dt><dd><pre class="cmd">python evaluate.py answer --reader-model ... --tp 1|2</pre></dd>
+            <dt>Kết quả</dt><dd class="out">results/eval_test/answers_&lt;reader&gt;_shard*.jsonl</dd>
+          </dl>
+        </div>
+      </article>
+
+      <article class="stage cpu" id="s8">
+        <div class="rail"><span class="num">8</span></div>
+        <div class="card">
+          <div class="card-head"><h3>Báo cáo</h3><span class="tag">report · CPU</span></div>
+          <p class="what">Tách riêng theo reader × nguồn × tỉ lệ nén × arm, không bao giờ gộp các nguồn. Có CI bootstrap theo cụm, chênh lệch F1 có ghép cặp (ours so với từng arm khác), upgrade retention giữa các cặp reader, và F1 theo độ sâu needle.</p>
+          <dl class="facts">
+            <dt>Chạy</dt><dd><pre class="cmd">python evaluate.py report --ours ours_beta,ours_ens</pre></dd>
+            <dt>Kết quả</dt><dd class="out">results/eval_test/report.md, report.json</dd>
+          </dl>
+        </div>
+      </article>
+
+      <article class="stage cpu" id="s9">
+        <div class="rail"><span class="num">9</span></div>
+        <div class="card">
+          <div class="card-head"><h3>Upload lên HuggingFace</h3><span class="tag">upload · CPU + mạng</span></div>
+          <p class="what">Mỗi pruner lên một model repo riêng, kèm model card ghi nhãn đã dùng và chỉ số dev. Dữ liệu đánh giá (document test, bản nén, câu trả lời, report) và nhãn lên một dataset repo. Mặc định là repo private, đặt dưới tên user của token. Token thiếu quyền ghi sẽ bị phát hiện ngay ở bước 0.</p>
+          <dl class="facts">
+            <dt>Chạy</dt><dd><pre class="cmd">python scripts/upload_hf.py --run-name pilot --models-dir ... --eval-dir ...</pre></dd>
+            <dt>Kết quả</dt><dd class="out">&lt;user&gt;/ttcompress-&lt;run&gt;-pruner-* (model) · &lt;user&gt;/ttcompress-&lt;run&gt;-eval (dataset)</dd>
+          </dl>
+        </div>
+      </article>
+
+    </div>
+  </section>
+
+  <section class="runbox" aria-labelledby="run-h">
+    <h2 id="run-h">Chạy thế nào</h2>
+    <p class="note">Chạy pilot nhỏ trước để đo tốc độ thật, rồi mới chạy đầy đủ. Mỗi lần chạy nằm trong một <code>RUN_ROOT</code> riêng.</p>
+    <pre class="cmd">cp .env.example .env      # điền HF_TOKEN (quyền ghi); file này là cấu hình chạy full
+N_TRAIN=300 N_DEV=30 N_TEST=50 RUN_ROOT=/mnt/hps/anhm-paper/ttcompress/runs/pilot HF_RUN_NAME=pilot ./run_pipeline.sh   # pilot 1/10
+./run_pipeline.sh         # full: 3000 train / 300 dev / 500 test mỗi nguồn</pre>
+    <p class="note">Lỗi ở shard nào thì script in đuôi log <code>logs/&lt;bước&gt;_shard&lt;k&gt;.log</code> và dừng. Sửa xong chạy lại cùng lệnh, phần đã làm được giữ nguyên.</p>
+  </section>
+
+  <footer>Chi tiết phương pháp và giả thuyết: METHOD_SPEC.md · Mã: generate_labels.py, train_pruner.py, evaluate.py, run_pipeline.sh</footer>
+</div>

@@ -1,8 +1,13 @@
-torch>=2.0
+torch>=2.2
 transformers>=4.49
 huggingface_hub>=0.24
-datasets>=5.0
+datasets>=2.19
 numpy
+scipy
 pandas
 pyarrow
 pytest
+# label generation / evaluation at scale (one process per GPU)
+vllm>=0.6 ; platform_system == "Linux"
+# optional baselines -- only needed when the corresponding --arms are used
+# llmlingua            # llmlingua2 arm

@@ -1,212 +1,278 @@
 #!/usr/bin/env bash
-# run_pipeline.sh -- the whole PCS flow in one command: install deps, fetch
-# data, sanity-test, sweep lambda on dev ("training", PCS_METHOD_SPEC.md
-# §6/§11), run the official bench on test, optionally push results to HF.
+# End-to-end pipeline (METHOD_SPEC.md §7): labels from several readers ->
+# fit + ensemble -> pruners (single-reader beta, ensemble beta, span control,
+# ablations) -> fixed-budget evaluation with every reader -> report.
 #
-#   ./run_pipeline.sh --reader-model Qwen/Qwen3-8B --encoder-path models/encoder_compressor
-#   ./run_pipeline.sh --relevance synthetic --skip-install    # smoke-test, no checkpoint/deps reinstall
-#   ./run_pipeline.sh --lam 0.4 --skip-train                  # skip the sweep, evaluate at a known lambda
-#   ./run_pipeline.sh --push-to-hub --hf-repo-id you/ttcompress-pcs-results
+# One process per GPU group (CUDA_VISIBLE_DEVICES), so every process just
+# uses 'cuda'. Readers matching LARGE_READER_PATTERN run with tensor
+# parallelism over TP_LARGE GPUs (NUM_GPUS / TP_LARGE processes).
+# Every stage is resumable: finished documents / selections / answers on
+# disk are skipped, so re-running after a crash continues where it stopped.
 #
-# Every step is individually skippable (--skip-install/--skip-fetch/--skip-test/
-# --skip-train/--skip-eval) so a partial re-run doesn't redo expensive steps.
-# --push-to-hub is opt-in (off by default) and pushes only run artifacts
-# (results/*.json: the lambda curve, the exact dev/test split, the official
-# CI) to a private HF Dataset repo -- PCS never trains a model
-# (PCS_METHOD_SPEC.md constraint #1: bolt-on only), so there is no model
-# repo to push to. See scripts/push_results.py.
+#   NUM_GPUS=4 ./run_pipeline.sh                          # everything
+#   STAGES="labels fit" ./run_pipeline.sh                 # a subset
+#   N_TRAIN=50 N_DEV=20 N_TEST=30 RUN_ROOT=runs/pilot ./run_pipeline.sh   # pilot
 set -euo pipefail
+cd "$(dirname "$0")"
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$REPO_ROOT"
+# Configuration: ./.env (copy of .env.example: every setting + HF_TOKEN; gitignored), and optionally
+# ENV_FILE=<another file> loaded before it. Plain KEY=VALUE lines; a variable already set in the
+# environment wins, so   N_TRAIN=100 ./run_pipeline.sh   overrides .env for one run.
+load_env_file() {
+  local file=$1 line key value
+  [[ -f "$file" ]] || { echo "ENV_FILE $file not found"; exit 1; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] \
+      || { echo "$file: cannot parse line: $line"; exit 1; }
+    key=${BASH_REMATCH[2]}; value=${BASH_REMATCH[3]}
+    if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then value=${BASH_REMATCH[1]}; fi
+    [[ -z "$value" ]] && continue   # KEY= means "use the default" (an exported empty HF_HOME/HF_TOKEN breaks the hub)
+    [[ -n "${!key+x}" ]] || export "$key=$value"
+  done < "$file"
+}
+[[ -n "${ENV_FILE:-}" ]] && load_env_file "$ENV_FILE"
+[[ -f .env ]] && load_env_file .env
 
-# Load .env if present (see .env.example) -- `set -a` auto-exports every
-# variable it defines, so plain `${VAR:-default}` below and every child
-# process (python, huggingface_hub) see it, not just this script.
-if [ -f .env ]; then
-    set -a
-    # shellcheck disable=SC1091
-    source .env
-    set +a
-fi
+NUM_GPUS=${NUM_GPUS:-4}
+BACKEND=${BACKEND:-vllm}
+STAGES=${STAGES:-"preflight prefetch labels fit ensemble train select answer report upload"}
+# Label readers (the first one is the primary reader).
+LABEL_READERS=${LABEL_READERS:-"Qwen/Qwen3-8B Qwen/Qwen3-1.7B aisingapore/Llama-SEA-LION-v3-8B"}
+# Evaluation readers: the label readers plus one NEVER used for labels (held-out, RQ3).
+EVAL_READERS=${EVAL_READERS:-"$LABEL_READERS Qwen/Qwen3-32B"}
+LARGE_READER_PATTERN=${LARGE_READER_PATTERN:-"(3[0-9]|7[0-9])B"}
+TP_LARGE=${TP_LARGE:-2}
+TRAIN_SOURCES=${TRAIN_SOURCES:-"uit_viquad vimqa hotpotqa"}
+# xquad_vi and 2wiki are never trained on: cross-dataset transfer.
+EVAL_SOURCES=${EVAL_SOURCES:-"uit_viquad,xquad_vi,vimqa,hotpotqa,2wiki"}
+N_TRAIN=${N_TRAIN:-3000}
+N_DEV=${N_DEV:-300}
+N_TEST=${N_TEST:-500}
+RATIOS=${RATIOS:-"4,8"}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}        # longest document measured: ~9k Qwen3 tokens
+GPU_MEM=${GPU_MEM:-0.90}
+DOCS_PER_CALL=${DOCS_PER_CALL:-16}
+BACKBONE=${BACKBONE:-BAAI/bge-reranker-v2-m3}
+EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-m3}
+RUN_ROOT=${RUN_ROOT:-.}
+LABELS=${LABELS:-$RUN_ROOT/labels}
+MODELS=${MODELS:-$RUN_ROOT/models}
+EVAL_DIR=${EVAL_DIR:-$RUN_ROOT/results/eval_test}
+LOGS=${LOGS:-$RUN_ROOT/logs}
+# Extra flags passed through verbatim, e.g. MEASURE_ARGS="--distractors hard" for the hard-negative ablation
+# (use a separate RUN_ROOT per ablation: label and selection dirs refuse mixed settings).
+MEASURE_ARGS=${MEASURE_ARGS:-}
+TRAIN_ARGS=${TRAIN_ARGS:-}
+SELECT_ARGS=${SELECT_ARGS:-}
+ANSWER_ARGS=${ANSWER_ARGS:-}
+# HuggingFace upload (stage `upload`): pruners -> model repos, eval outputs (+ labels) -> one dataset repo.
+# HF_NAMESPACE empty = the HF_TOKEN owner; HF_RUN_NAME defaults to the RUN_ROOT folder name.
+HF_NAMESPACE=${HF_NAMESPACE:-}
+HF_REPO_PREFIX=${HF_REPO_PREFIX:-ttcompress}
+HF_RUN_NAME=${HF_RUN_NAME:-$(basename "$RUN_ROOT")}
+HF_PRIVATE=${HF_PRIVATE:-true}
+HF_UPLOAD_LABELS=${HF_UPLOAD_LABELS:-false}
 
-# ---------------------------------------------------------------------------
-# Defaults (.env / env-var overridable; CLI flags below take precedence over both)
-# ---------------------------------------------------------------------------
-READER_MODEL="${READER_MODEL:-Qwen/Qwen3-8B}"
-ENCODER_PATH="${ENCODER_PATH:-}"
-RELEVANCE="${RELEVANCE:-e6}"          # e6 | synthetic (see ttcompress/relevance.py)
-DEVICE="${DEVICE:-cuda}"
-RATIOS="${RATIOS:-4,8}"
-ARMS="${ARMS:-encoder_pcs,h2o,snapkv}"
-HF_REPO_ID="${HF_REPO_ID:-}"           # dataset repo id, e.g. you/ttcompress-pcs-results
-HF_PRIVATE="${HF_PRIVATE:-1}"          # 1 = private (default), 0 = public
-VENV=""
-LAM=""                                  # if set, skip the sweep and use this lambda directly
-FORCE_FETCH=0
-PUSH_TO_HUB="${PUSH_TO_HUB:-0}"
-SKIP_INSTALL=0
-SKIP_FETCH=0
-SKIP_TEST=0
-SKIP_TRAIN=0
-SKIP_EVAL=0
+echo "== config${ENV_FILE:+ ($ENV_FILE)}: RUN_ROOT=$RUN_ROOT LABELS=$LABELS NUM_GPUS=$NUM_GPUS BACKEND=$BACKEND"
+echo "   N_TRAIN=$N_TRAIN N_DEV=$N_DEV N_TEST=$N_TEST RATIOS=$RATIOS STAGES=\"$STAGES\""
+echo "   LABEL_READERS=\"$LABEL_READERS\""
+echo "   EVAL_READERS=\"$EVAL_READERS\""
+echo "   TRAIN_SOURCES=\"$TRAIN_SOURCES\" EVAL_SOURCES=$EVAL_SOURCES HF_TOKEN=$([[ -n "${HF_TOKEN:-}" ]] && echo set || echo unset)"
+echo "   HF_HOME=${HF_HOME:-~/.cache/huggingface} HF_NAMESPACE=${HF_NAMESPACE:-<token user>} HF_RUN_NAME=$HF_RUN_NAME HF_PRIVATE=$HF_PRIVATE"
 
-usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
-    cat <<'EOF'
-Flags:
-  --reader-model NAME     HF causal LM id/path (default: Qwen/Qwen3-8B)
-  --encoder-path PATH     trained E6 token-classifier checkpoint (required unless --relevance synthetic)
-  --relevance e6|synthetic
-  --device cuda|cpu
-  --ratios LIST           e.g. 4,8 (passed to train.py's sweep)
-  --arms LIST             e.g. encoder_pcs,h2o,snapkv (passed to evaluate.py)
-  --lam FLOAT             skip the sweep, evaluate directly at this lambda
-  --venv PATH             create/use a venv here before installing requirements.txt
-  --force-fetch           re-download data/ even if already present
-  --push-to-hub           push results/*.json to a HF Dataset repo after step 5 (needs --hf-repo-id, HF_TOKEN)
-  --hf-repo-id ID         e.g. you/ttcompress-pcs-results
-  --hf-public             push as a public repo instead of the private default
-  --skip-install / --skip-fetch / --skip-test / --skip-train / --skip-eval
-  -h, --help
-EOF
+export TOKENIZERS_PARALLELISM=false
+export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
+export PYTHONUNBUFFERED=1
+
+tag() { echo "${1//\//--}"; }
+first() { echo "$1"; }
+PRIMARY_MODEL=$(first $LABEL_READERS)
+PRIMARY=$(tag "$PRIMARY_MODEL")
+has_stage() { [[ " $STAGES " == *" $1 "* ]]; }
+tp_for() { if [[ "$1" =~ $LARGE_READER_PATTERN ]]; then echo "$TP_LARGE"; else echo 1; fi; }
+mkdir -p "$LOGS"
+# Physical GPU ids: honour a scheduler-provided CUDA_VISIBLE_DEVICES (Slurm etc.), else 0..NUM_GPUS-1.
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then IFS=',' read -r -a GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
+else mapfile -t GPU_IDS < <(seq 0 $((NUM_GPUS - 1))); fi
+(( ${#GPU_IDS[@]} >= NUM_GPUS )) || { echo "NUM_GPUS=$NUM_GPUS but only ${#GPU_IDS[@]} GPU id(s): ${GPU_IDS[*]}"; exit 1; }
+gpu_group() {  # gpu_group <first-slot> <count> -> "id,id"
+  local out=""; for ((j = $1; j < $1 + $2; j++)); do out="$out,${GPU_IDS[$j]}"; done; echo "${out#,}"
 }
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --reader-model) READER_MODEL="$2"; shift 2 ;;
-        --encoder-path) ENCODER_PATH="$2"; shift 2 ;;
-        --relevance) RELEVANCE="$2"; shift 2 ;;
-        --device) DEVICE="$2"; shift 2 ;;
-        --ratios) RATIOS="$2"; shift 2 ;;
-        --arms) ARMS="$2"; shift 2 ;;
-        --lam) LAM="$2"; shift 2 ;;
-        --venv) VENV="$2"; shift 2 ;;
-        --force-fetch) FORCE_FETCH=1; shift ;;
-        --push-to-hub) PUSH_TO_HUB=1; shift ;;
-        --hf-repo-id) HF_REPO_ID="$2"; shift 2 ;;
-        --hf-public) HF_PRIVATE=0; shift ;;
-        --skip-install) SKIP_INSTALL=1; shift ;;
-        --skip-fetch) SKIP_FETCH=1; shift ;;
-        --skip-test) SKIP_TEST=1; shift ;;
-        --skip-train) SKIP_TRAIN=1; shift ;;
-        --skip-eval) SKIP_EVAL=1; shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) echo "Unknown flag: $1" >&2; usage; exit 1 ;;
-    esac
-done
-
-if [ "$RELEVANCE" = "e6" ] && [ -z "$ENCODER_PATH" ] && { [ "$SKIP_TRAIN" -eq 0 ] || [ "$SKIP_EVAL" -eq 0 ]; }; then
-    echo "[FATAL] --relevance e6 needs --encoder-path (a trained E6 checkpoint)." >&2
-    echo "        Pass --relevance synthetic instead to smoke-test the pipeline without one." >&2
-    exit 1
-fi
-if [ "$PUSH_TO_HUB" -eq 1 ] && [ -z "$HF_REPO_ID" ]; then
-    echo "[FATAL] --push-to-hub needs --hf-repo-id (or HF_REPO_ID in .env), e.g. you/ttcompress-pcs-results" >&2
-    exit 1
-fi
-
-PY=python
-[ -n "$VENV" ] && PY="$VENV/bin/python"
-
-step() { echo; echo "=== $* ==="; }
-
-# ---------------------------------------------------------------------------
-# 1. Install
-# ---------------------------------------------------------------------------
-if [ "$SKIP_INSTALL" -eq 0 ]; then
-    step "1/6  Install"
-    if [ -n "$VENV" ]; then
-        [ -d "$VENV" ] || python -m venv "$VENV"
-        "$VENV/bin/pip" install -q -U pip
-        "$VENV/bin/pip" install -q -r requirements.txt
-    else
-        "$PY" -m pip install -q -U pip
-        "$PY" -m pip install -q -r requirements.txt
+# run_sharded <name> <gpus-per-process> <cmd...>
+# Launches NUM_GPUS/gpp processes; process s sees GPUs [s*gpp, (s+1)*gpp) and gets
+# --shard s --num-shards P. On failure, prints the tail of each failing log and exits.
+run_sharded() {
+  local name=$1 gpp=$2; shift 2
+  local procs=$(( NUM_GPUS / gpp ))
+  (( procs >= 1 )) || { echo "need at least $gpp GPUs for $name"; exit 1; }
+  local pids=() logs=()
+  for ((s = 0; s < procs; s++)); do
+    local gpus; gpus=$(gpu_group $((s * gpp)) "$gpp")
+    local log="$LOGS/${name}_shard${s}.log"
+    echo "   [$name] shard $s/$procs on GPU $gpus -> $log"
+    CUDA_VISIBLE_DEVICES=$gpus "$@" --shard "$s" --num-shards "$procs" >> "$log" 2>&1 &
+    pids+=($!); logs+=("$log")
+  done
+  local failed=0
+  for i in "${!pids[@]}"; do
+    if ! wait "${pids[$i]}"; then
+      failed=1
+      echo "!! [$name] shard $i FAILED -- last lines of ${logs[$i]}:"; tail -n 25 "${logs[$i]}"
     fi
-else
-    step "1/6  Install (skipped)"
+  done
+  (( failed == 0 )) || { echo "!! stage $name failed; fix and re-run (finished work is kept)"; exit 1; }
+}
+
+if has_stage preflight; then
+  echo "== preflight"
+  visible=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)
+  (( ${visible:-0} >= NUM_GPUS )) || { echo "NUM_GPUS=$NUM_GPUS but nvidia-smi sees ${visible:-0} GPU(s)"; exit 1; }
+  python - "$BACKEND" <<'PY'
+import sys
+import torch, transformers, numpy, scipy, pandas, datasets, huggingface_hub  # noqa: F401
+print(f"torch {torch.__version__} (cuda {torch.version.cuda}, {torch.cuda.device_count()} GPUs), "
+      f"transformers {transformers.__version__}")
+assert torch.cuda.is_available(), "torch cannot see CUDA"
+if sys.argv[1] == 'vllm':
+    import vllm
+    print(f"vllm {vllm.__version__}")
+PY
+  python -m pytest -q -x tests/test_attribution.py tests/test_selection_metrics.py tests/test_evaluate_report.py
+  if has_stage upload; then  # a missing or read-only token should fail now, not after training
+    python scripts/upload_hf.py --check ${HF_NAMESPACE:+--namespace "$HF_NAMESPACE"}
+  fi
 fi
 
-# ---------------------------------------------------------------------------
-# 2. Fetch data (scripts/fetch_data.sh -- see data/SOURCES.md; not committed)
-# ---------------------------------------------------------------------------
-if [ "$SKIP_FETCH" -eq 0 ]; then
-    step "2/6  Fetch data"
-    if [ "$FORCE_FETCH" -eq 1 ]; then
-        ./scripts/fetch_data.sh --force
-    else
-        ./scripts/fetch_data.sh
-    fi
-else
-    step "2/6  Fetch data (skipped)"
+if has_stage prefetch; then
+  echo "== prefetch (single process; avoids N processes racing on the HF cache)"
+  all_models=$(echo "$LABEL_READERS $EVAL_READERS $BACKBONE $EMBED_MODEL" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
+  all_sources=$(echo "$TRAIN_SOURCES ${EVAL_SOURCES//,/ }" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
+  python scripts/prefetch.py --sources "$all_sources" --models "$all_models" 2>&1 | tee -a "$LOGS/prefetch.log"
 fi
 
-# ---------------------------------------------------------------------------
-# 3. Sanity test -- the mandatory lambda=1 <-> TruncationCompressor
-#    equivalence test (PCS_METHOD_SPEC.md §2/§11) must pass before any other
-#    number from this run is trusted. No GPU needed, seconds to run.
-# ---------------------------------------------------------------------------
-if [ "$SKIP_TEST" -eq 0 ]; then
-    step "3/6  Sanity tests"
-    "$PY" -m pytest tests/ -q
-else
-    step "3/6  Sanity tests (skipped)"
+if has_stage labels; then
+  for reader in $LABEL_READERS; do
+    tp=$(tp_for "$reader")
+    for src in $TRAIN_SOURCES; do
+      for split in train dev; do
+        n=$N_TRAIN; [[ $split == dev ]] && n=$N_DEV
+        echo "== labels: $reader $src/$split (n=$n, tp=$tp)"
+        run_sharded "labels_$(tag "$reader")_${src}_$split" "$tp" \
+          python generate_labels.py measure --source "$src" --split "$split" --n "$n" \
+          --reader-model "$reader" --backend "$BACKEND" --max-model-len "$MAX_MODEL_LEN" --tp "$tp" \
+          --gpu-memory-utilization "$GPU_MEM" --docs-per-call "$DOCS_PER_CALL" --out-root "$LABELS/raw" $MEASURE_ARGS
+      done
+    done
+  done
 fi
 
-# ---------------------------------------------------------------------------
-# 4. Train = the lambda sweep on the dev split (no gradients -- see
-#    train.py's docstring on why this is GPU-bound, not the "CPU only" §9
-#    describes). Writes results/dev_test_split.json + results/lambda_sweep_dev.json.
-# ---------------------------------------------------------------------------
-if [ -n "$LAM" ]; then
-    step "4/6  Train (skipped -- using --lam $LAM)"
-elif [ "$SKIP_TRAIN" -eq 0 ]; then
-    step "4/6  Train (lambda sweep on dev)"
-    train_args=(--reader-model "$READER_MODEL" --relevance "$RELEVANCE" --ratios "$RATIOS" --device "$DEVICE")
-    [ -n "$ENCODER_PATH" ] && train_args+=(--encoder-path "$ENCODER_PATH")
-    "$PY" train.py "${train_args[@]}"
-    LAM="$("$PY" -c "import json; print(json.load(open('results/lambda_sweep_dev.json'))['chosen_lambda'])")"
-    echo "Chosen lambda* = $LAM"
-else
-    step "4/6  Train (skipped)"
-    if [ -f results/lambda_sweep_dev.json ]; then
-        LAM="$("$PY" -c "import json; print(json.load(open('results/lambda_sweep_dev.json'))['chosen_lambda'])")"
-        echo "Reusing lambda* = $LAM from an earlier results/lambda_sweep_dev.json"
-    fi
+if has_stage fit; then
+  for reader in $LABEL_READERS; do
+    r=$(tag "$reader")
+    for target in f1 logprob; do
+      for src in $TRAIN_SOURCES; do
+        for split in train dev; do
+          echo "== fit: $r $target $src/$split"
+          python generate_labels.py fit --raw-dir "$LABELS/raw/$r/${src}_$split" --target "$target" \
+            --alpha-from "$LABELS/raw/$r/${src}_dev" --out-dir "$LABELS/fit/$r/$target/${src}_$split" \
+            >> "$LOGS/fit.log" 2>&1 || { echo "!! fit failed:"; tail -n 25 "$LOGS/fit.log"; exit 1; }
+        done
+      done
+    done
+  done
 fi
 
-# ---------------------------------------------------------------------------
-# 5. Evaluate = the official bench on test (pooled + per-source CI). Reads
-#    its test set from results/dev_test_split.json (written by step 4) by
-#    default -- see evaluate.py's docstring on why that avoids dev/test leakage.
-# ---------------------------------------------------------------------------
-if [ "$SKIP_EVAL" -eq 0 ]; then
-    step "5/6  Evaluate"
-    if [ -z "$LAM" ]; then
-        echo "[FATAL] No lambda available -- pass --lam FLOAT, or drop --skip-train so step 4 can pick one." >&2
-        exit 1
-    fi
-    eval_args=(--reader-model "$READER_MODEL" --relevance "$RELEVANCE" --arms "$ARMS" --device "$DEVICE" --lam "$LAM")
-    [ -n "$ENCODER_PATH" ] && eval_args+=(--encoder-path "$ENCODER_PATH")
-    "$PY" evaluate.py "${eval_args[@]}"
-else
-    step "5/6  Evaluate (skipped)"
+if has_stage ensemble; then
+  for src in $TRAIN_SOURCES; do
+    for split in train dev; do
+      dirs=""
+      for reader in $LABEL_READERS; do dirs="$dirs,$LABELS/fit/$(tag "$reader")/f1/${src}_$split"; done
+      echo "== ensemble: $src/$split"
+      python generate_labels.py ensemble --fit-dirs "${dirs#,}" --out-dir "$LABELS/fit/ensemble/f1/${src}_$split" \
+        >> "$LOGS/ensemble.log" 2>&1 || { echo "!! ensemble failed:"; tail -n 25 "$LOGS/ensemble.log"; exit 1; }
+    done
+  done
 fi
 
-# ---------------------------------------------------------------------------
-# 6. Push results/*.json to a HF Dataset repo -- opt-in (--push-to-hub /
-#    PUSH_TO_HUB=1), off by default. See scripts/push_results.py's docstring
-#    on why this is a Dataset repo, not a Model repo.
-# ---------------------------------------------------------------------------
-if [ "$PUSH_TO_HUB" -eq 1 ]; then
-    step "6/6  Push results to HF"
-    push_args=(--repo-id "$HF_REPO_ID")
-    [ "$HF_PRIVATE" -eq 0 ] && push_args+=(--public)
-    "$PY" scripts/push_results.py "${push_args[@]}"
-else
-    step "6/6  Push results to HF (skipped -- pass --push-to-hub to enable)"
+label_dirs() {  # label_dirs <reader-tag-or-ensemble> <target> <split>
+  local out=""
+  for src in $TRAIN_SOURCES; do out="$out,$LABELS/fit/$1/$2/${src}_$3"; done
+  echo "${out#,}"
+}
+
+if has_stage train; then
+  # name | label source | label reader | target | extra flags
+  RUNS=(
+    "pruner_beta_primary|beta|$PRIMARY|f1|"
+    "pruner_beta_ensemble|ensemble|ensemble|f1|"
+    "pruner_span|span|$PRIMARY|f1|"
+    "pruner_logprob_primary|beta|$PRIMARY|logprob|"
+    "pruner_beta_primary_posadj|beta|$PRIMARY|f1|--position-adjust"
+  )
+  pids=(); names=(); g=0
+  flush_train() {
+    local failed=0
+    for i in "${!pids[@]}"; do
+      if ! wait "${pids[$i]}"; then
+        failed=1; echo "!! train ${names[$i]} FAILED:"; tail -n 25 "$LOGS/train_${names[$i]}.log"
+      fi
+    done
+    pids=(); names=()
+    (( failed == 0 )) || exit 1
+  }
+  for run in "${RUNS[@]}"; do
+    IFS='|' read -r name source reader target extra <<< "$run"
+    if [[ -f "$MODELS/$name/train_log.json" ]]; then echo "== train $name: done, skipping"; continue; fi
+    echo "== train $name (GPU $g) -> $LOGS/train_$name.log"
+    # shellcheck disable=SC2086
+    CUDA_VISIBLE_DEVICES=${GPU_IDS[$g]} python train_pruner.py --label-source "$source" \
+      --train-labels "$(label_dirs "$reader" "$target" train)" --dev-labels "$(label_dirs "$reader" "$target" dev)" \
+      --backbone "$BACKBONE" --grad-checkpointing $extra $TRAIN_ARGS --out-dir "$MODELS/$name" \
+      > "$LOGS/train_$name.log" 2>&1 &
+    pids+=($!); names+=("$name")
+    g=$(( (g + 1) % NUM_GPUS ))
+    if (( g == 0 )); then flush_train; fi
+  done
+  flush_train
 fi
 
-step "Done"
-echo "Results under ./results/"
+if has_stage select; then
+  ARMS="full,lead,random,bm25,embed=embed:$EMBED_MODEL,oracle_span,oracle_support"
+  ARMS="$ARMS,ours_beta=pruner:$MODELS/pruner_beta_primary,ours_ens=pruner:$MODELS/pruner_beta_ensemble"
+  ARMS="$ARMS,span_sup=pruner:$MODELS/pruner_span,abl_logprob=pruner:$MODELS/pruner_logprob_primary"
+  ARMS="$ARMS,abl_posadj=pruner:$MODELS/pruner_beta_primary_posadj"
+  ARMS="$ARMS${EXTRA_ARMS:+,$EXTRA_ARMS}"   # e.g. EXTRA_ARMS="xprovence=provence:naver/xprovence-reranker-bgem3-v1,llmlingua2"
+  echo "== select ($ARMS)"
+  run_sharded select 1 python evaluate.py select --sources "$EVAL_SOURCES" --split test --n "$N_TEST" \
+    --arms "$ARMS" --ratios "$RATIOS" --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" $SELECT_ARGS
+fi
+
+if has_stage answer; then
+  for reader in $EVAL_READERS; do
+    tp=$(tp_for "$reader")
+    echo "== answer: $reader (tp=$tp)"
+    run_sharded "answer_$(tag "$reader")" "$tp" python evaluate.py answer --out-dir "$EVAL_DIR" \
+      --reader-model "$reader" --backend "$BACKEND" --max-model-len "$MAX_MODEL_LEN" --tp "$tp" \
+      --gpu-memory-utilization "$GPU_MEM" $ANSWER_ARGS
+  done
+fi
+
+if has_stage report; then
+  echo "== report"
+  python evaluate.py report --out-dir "$EVAL_DIR" --ours ours_beta,ours_ens > "$LOGS/report.log" 2>&1 \
+    || { tail -n 25 "$LOGS/report.log"; exit 1; }
+  echo "report: $EVAL_DIR/report.md"
+fi
+
+if has_stage upload; then
+  echo "== upload to HuggingFace (run '$HF_RUN_NAME', private=$HF_PRIVATE, labels=$HF_UPLOAD_LABELS)"
+  upload_flags=(--prefix "$HF_REPO_PREFIX" --run-name "$HF_RUN_NAME" --models-dir "$MODELS" --eval-dir "$EVAL_DIR"
+                --labels-dir "$LABELS")
+  [[ -n "$HF_NAMESPACE" ]] && upload_flags+=(--namespace "$HF_NAMESPACE")
+  [[ "$HF_PRIVATE" == true ]] || upload_flags+=(--public)
+  [[ "$HF_UPLOAD_LABELS" == true ]] && upload_flags+=(--include-labels)
+  python scripts/upload_hf.py "${upload_flags[@]}" 2>&1 | tee -a "$LOGS/upload.log"
+fi
