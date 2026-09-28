@@ -77,6 +77,19 @@ def take_n(items: Sequence, n: Optional[int], key: Callable) -> List:
     return list(ranked) if n is None else list(ranked[:n])
 
 
+def sample_key(doc: Dict) -> str:
+    """The key load_documents ranked this document by (a QADocument.to_dict()):
+    the dataset example id for single-hop haystacks, the doc_id for multi-hop."""
+    return doc['metadata']['source_id'] if doc['hop'] == 'single' else doc['doc_id']
+
+
+def first_n_docs(docs: Sequence[Dict], n: Optional[int]) -> List[Dict]:
+    """The documents load_documents(source, split, n) chooses, recovered from
+    any superset of them -- e.g. every record in a label dir that runs with a
+    larger N share. Exact because the sample is nested (take_n)."""
+    return take_n(docs, n, key=sample_key)
+
+
 def _norm(text: str) -> str:
     return unicodedata.normalize('NFC', text).lower().strip()
 

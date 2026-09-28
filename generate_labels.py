@@ -35,7 +35,7 @@ from ttcompress.attribution import (
 )
 from ttcompress.metrics import spearman, token_f1
 from ttcompress.reader import MAX_NEW_TOKENS, load_reader, reader_tag
-from ttcompress.sources import SOURCES, load_documents
+from ttcompress.sources import SOURCES, first_n_docs, load_documents
 
 
 def add_document_args(p):
@@ -149,9 +149,22 @@ def _summary_stats(labels, alpha_info=None):
     return out
 
 
+def _first_n_records(raw_dir: str, n):
+    """The measure records of the first n documents in load_documents order. A raw dir is shared by runs
+    with different N (pilot -> mid -> full) and holds every document any of them measured; fitting it
+    whole would silently train a small-N run on the large-N documents."""
+    records = [load_mask_outcomes(p) for p in record_paths(raw_dir)]
+    if n is None:
+        return records
+    if len(records) < n:
+        raise SystemExit(f"{raw_dir} has {len(records)} measured documents, --n asks for {n}: finish the labels stage")
+    keep = {d['doc_id'] for d in first_n_docs([r.doc for r in records], n)}
+    return [r for r in records if r.doc['doc_id'] in keep]
+
+
 def cmd_fit(args):
-    paths = record_paths(args.raw_dir)
-    if not paths:
+    records = _first_n_records(args.raw_dir, args.n)
+    if not records:
         raise SystemExit(f"no measure output in {args.raw_dir}")
     alpha_info = {}
     if args.alpha is not None:
@@ -160,20 +173,23 @@ def cmd_fit(args):
         if not args.alpha_from:
             raise SystemExit("pass --alpha, or --alpha-from <dev measure dir> (alpha is chosen on dev, never on train)")
         # comma list: an eval-only source (xquad_vi, 2wiki) has no dev labels of its own -> pooled train-source dev
-        dev = [load_mask_outcomes(p) for d in args.alpha_from.split(',') if d for p in record_paths(d)]
+        dev = [r for d in args.alpha_from.split(',') if d for r in _first_n_records(d, args.alpha_n)]
         if not dev:
             raise SystemExit(f"no measure output in {args.alpha_from}")
         grid = [float(a) for a in args.alpha_grid.split(',')]
         alpha, scores = select_alpha([(r.masks, r.f1 if args.target == 'f1' else r.logprob) for r in dev], grid)
         alpha_info = {'alpha': alpha, 'alpha_cv_mse': scores, 'alpha_dev_dir': args.alpha_from, 'n_alpha_docs': len(dev)}
         print(f"alpha={alpha} by dev CV over {len(dev)} docs: {scores}")
+    os.makedirs(args.out_dir, exist_ok=True)
+    for stale in record_paths(args.out_dir):  # a re-fit with a smaller --n must not leave extra documents behind
+        os.remove(stale)
     labels = []
-    for p in paths:
-        lab = fit_document(load_mask_outcomes(p), args.target, alpha, args.n_boot)
+    for rec in records:
+        lab = fit_document(rec, args.target, alpha, args.n_boot)
         save_record(lab, args.out_dir)
         labels.append(lab)
     summary = _summary_stats(labels, alpha_info or {'alpha': alpha})
-    summary.update({'target': args.target, 'raw_dir': args.raw_dir})
+    summary.update({'target': args.target, 'raw_dir': args.raw_dir, 'n_requested': args.n})
     with open(os.path.join(args.out_dir, 'summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(json.dumps({k: v for k, v in summary.items() if k != 'position_prior_by_decile'}, indent=2))
@@ -192,6 +208,9 @@ def cmd_ensemble(args):
     for d, m in zip(dirs, per_dir):
         if dropped[d]:
             print(f"[WARN] {d}: {dropped[d]} of {len(m)} documents dropped (not labeled by every reader)")
+    os.makedirs(args.out_dir, exist_ok=True)
+    for stale in record_paths(args.out_dir):
+        os.remove(stale)
     labels, agreement = [], defaultdict(list)
     for doc_id in common:
         group = [m[doc_id] for m in per_dir]
@@ -246,6 +265,9 @@ def main():
     f.add_argument('--alpha', type=float, default=None)
     f.add_argument('--alpha-from', default=None, help="dev measure dir(s) for alpha CV (comma list = pooled)")
     f.add_argument('--alpha-grid', default='0.1,0.3,1,3,10')
+    f.add_argument('--n', type=int, default=None,
+                   help="fit only the first n documents (load_documents order) of --raw-dir; default all")
+    f.add_argument('--alpha-n', type=int, default=None, help="same, for each --alpha-from dir")
     f.add_argument('--n-boot', type=int, default=0, help="bootstrap CIs per chunk (slow; diagnostics only)")
     f.add_argument('--out-dir', required=True)
     f.set_defaults(func=cmd_fit)

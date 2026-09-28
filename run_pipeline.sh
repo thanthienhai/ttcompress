@@ -12,6 +12,8 @@
 #   NUM_GPUS=4 ./run_pipeline.sh                          # everything
 #   STAGES="labels fit" ./run_pipeline.sh                 # a subset
 #   N_TRAIN=50 N_DEV=20 N_TEST=30 RUN_ROOT=runs/pilot ./run_pipeline.sh   # pilot
+#   SMOKE=1 ./run_pipeline.sh                             # every stage on a few documents -> <runs>/smoke
+#   DISTRACTORS=hard ./run_pipeline.sh                    # hard-distractor ablation -> <RUN_ROOT>_distractors-hard
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -34,6 +36,19 @@ load_env_file() {
 }
 [[ -n "${ENV_FILE:-}" ]] && load_env_file "$ENV_FILE"
 [[ -f .env ]] && load_env_file .env
+
+# SMOKE=1: every stage on a handful of documents, to surface cluster-side failures (package installs, vLLM,
+# XProvence / LLMLingua-2 APIs, paths, permissions) in about an hour -- dominated by model start-ups --
+# instead of hours into a long run. Overrides the sizes from .env, writes to <parent of RUN_ROOT>/smoke,
+# never uploads. Its labels land in the shared LABELS: same settings, nested documents, reused later.
+if [[ "${SMOKE:-0}" == 1 ]]; then
+  N_TRAIN=8; N_DEV=4; N_TEST=4; ORACLE_N=4
+  RUN_ROOT="$(dirname "${RUN_ROOT:-./main}")/smoke"; HF_RUN_NAME=smoke
+  STAGES=${STAGES:-"preflight prefetch labels fit ensemble train select answer report"}
+  STAGES=${STAGES//upload/}
+  TRAIN_ARGS="${TRAIN_ARGS:-} --epochs 1"
+  EXTRA_SEEDS=1   # exercise the seed path once, cheaply
+fi
 
 NUM_GPUS=${NUM_GPUS:-4}
 BACKEND=${BACKEND:-vllm}
@@ -66,7 +81,26 @@ DOCS_PER_CALL=${DOCS_PER_CALL:-16}
 BACKBONE=${BACKBONE:-BAAI/bge-reranker-v2-m3}
 EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-m3}
 RUN_ROOT=${RUN_ROOT:-.}
+# Distractor ablation (METHOD_SPEC.md §6): DISTRACTORS=hard (single-hop haystacks padded from the needle's own
+# article) and/or MULTIHOP_PAD_CHARS=<n> (multi-hop documents lengthened with easy distractors), applied to
+# labels AND evaluation. Labels, fits, models and results get their own suffixed directories, so the
+# ablation never mixes with the main run (the label dirs would refuse mixed settings anyway).
+DISTRACTORS=${DISTRACTORS:-}
+MULTIHOP_PAD_CHARS=${MULTIHOP_PAD_CHARS:-}
+ABLATION=${DISTRACTORS:+_distractors-$DISTRACTORS}${MULTIHOP_PAD_CHARS:+_pad-$MULTIHOP_PAD_CHARS}
+if [[ -n "$ABLATION" ]]; then
+  RUN_ROOT="$RUN_ROOT$ABLATION"
+  [[ -n "${LABELS:-}" ]] && LABELS="$LABELS$ABLATION"
+  HF_RUN_NAME=$(basename "$RUN_ROOT")
+  doc_flags="${DISTRACTORS:+ --distractors $DISTRACTORS}${MULTIHOP_PAD_CHARS:+ --multihop-pad-chars $MULTIHOP_PAD_CHARS}"
+  MEASURE_ARGS="${MEASURE_ARGS:-}$doc_flags"   # argparse: the last --distractors wins over .env's
+  SELECT_ARGS="${SELECT_ARGS:-}$doc_flags"
+fi
+# LABELS/raw: reader measurements, expensive, SHARED across runs (nested documents: a larger N reuses a
+# smaller run's). FIT: ridge fits + ensembles, cheap, PER RUN and restricted to this run's N_TRAIN / N_DEV /
+# ORACLE_N documents -- a shared fit dir would train a small-N run on whatever a larger run measured.
 LABELS=${LABELS:-$RUN_ROOT/labels}
+FIT=${FIT:-$RUN_ROOT/labels_fit}
 MODELS=${MODELS:-$RUN_ROOT/models}
 EVAL_DIR=${EVAL_DIR:-$RUN_ROOT/results/eval_test}
 LOGS=${LOGS:-$RUN_ROOT/logs}
@@ -74,6 +108,11 @@ LOGS=${LOGS:-$RUN_ROOT/logs}
 # (use a separate RUN_ROOT per ablation: label and selection dirs refuse mixed settings).
 MEASURE_ARGS=${MEASURE_ARGS:-}
 TRAIN_ARGS=${TRAIN_ARGS:-}
+# Training-seed robustness: ours_beta and ours_ens are also trained with these seeds (arms ours_beta_s<k>,
+# ours_ens_s<k>); the report shows F1 per seed and whether every seed agrees with the H1 verdicts.
+# EXTRA_SEEDS=none turns it off (an empty KEY= in .env means "default").
+EXTRA_SEEDS=${EXTRA_SEEDS:-"1 2"}
+[[ "$EXTRA_SEEDS" == none ]] && EXTRA_SEEDS=""
 SELECT_ARGS=${SELECT_ARGS:-}
 ANSWER_ARGS=${ANSWER_ARGS:-}
 # HuggingFace upload (stage `upload`): pruners -> model repos, eval outputs (+ labels) -> one dataset repo.
@@ -84,8 +123,9 @@ HF_RUN_NAME=${HF_RUN_NAME:-$(basename "$RUN_ROOT")}
 HF_PRIVATE=${HF_PRIVATE:-true}
 HF_UPLOAD_LABELS=${HF_UPLOAD_LABELS:-false}
 
-echo "== config${ENV_FILE:+ ($ENV_FILE)}: RUN_ROOT=$RUN_ROOT LABELS=$LABELS NUM_GPUS=$NUM_GPUS BACKEND=$BACKEND"
+echo "== config${ENV_FILE:+ ($ENV_FILE)}: RUN_ROOT=$RUN_ROOT LABELS=$LABELS FIT=$FIT NUM_GPUS=$NUM_GPUS BACKEND=$BACKEND"
 echo "   N_TRAIN=$N_TRAIN N_DEV=$N_DEV N_TEST=$N_TEST ORACLE_N=$ORACLE_N RATIOS=$RATIOS STAGES=\"$STAGES\""
+echo "   EXTRA_SEEDS=\"$EXTRA_SEEDS\"${ABLATION:+ ABLATION=$ABLATION}${SMOKE:+ SMOKE=$SMOKE}"
 echo "   LABEL_READERS=\"$LABEL_READERS\""
 echo "   EVAL_READERS=\"$EVAL_READERS\""
 echo "   TRAIN_SOURCES=\"$TRAIN_SOURCES\" EVAL_SOURCES=$EVAL_SOURCES HF_TOKEN=$([[ -n "${HF_TOKEN:-}" ]] && echo set || echo unset)"
@@ -135,6 +175,33 @@ run_sharded() {
   (( failed == 0 )) || { echo "!! stage $name failed; fix and re-run (finished work is kept)"; exit 1; }
 }
 
+# Published-compressor arms need packages the vLLM image does not ship: llmlingua2 -> `llmlingua`;
+# provence:/XProvence -> `spacy` + its multilingual sentence model `xx_sent_ud_sm` (loaded when the
+# remote modeling code is imported). Installed on demand with the image's torch / transformers / vllm /
+# numpy / tokenizers pinned as constraints, so pip fails instead of swapping the CUDA build vLLM needs.
+pip_pinned() {  # pip_pinned <package...>
+  local pins; pins=$(mktemp)
+  python -m pip freeze 2>/dev/null | grep -iE '^(torch|transformers|vllm|numpy|tokenizers)==' > "$pins" || true
+  if ! python -m pip install --quiet "$@" -c "$pins"; then
+    echo "!! pip install $* failed (conflicts with pinned: $(paste -sd' ' "$pins"));"
+    echo "   install by hand or drop the arm from EXTRA_ARMS"; rm -f "$pins"; exit 1
+  fi
+  rm -f "$pins"
+}
+ensure_baseline_deps() {
+  if [[ ",${EXTRA_ARMS:-}," == *llmlingua2* ]] && ! python -c "import llmlingua" 2>/dev/null; then
+    echo "== installing llmlingua (EXTRA_ARMS has llmlingua2)"
+    pip_pinned llmlingua
+    python -c "import llmlingua" || { echo "!! llmlingua installed but does not import"; exit 1; }
+  fi
+  if [[ ",${EXTRA_ARMS:-}" == *provence:* ]] && ! python -c "import spacy; spacy.load('xx_sent_ud_sm')" 2>/dev/null; then
+    echo "== installing spacy + xx_sent_ud_sm (EXTRA_ARMS has a provence: arm)"
+    pip_pinned spacy
+    python -m spacy download xx_sent_ud_sm || { echo "!! spacy model xx_sent_ud_sm download failed"; exit 1; }
+    python -c "import spacy; spacy.load('xx_sent_ud_sm')" || { echo "!! xx_sent_ud_sm does not load"; exit 1; }
+  fi
+}
+
 if has_stage preflight; then
   echo "== preflight"
   visible=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)
@@ -150,9 +217,7 @@ if sys.argv[1] == 'vllm':
     print(f"vllm {vllm.__version__}")
 PY
   python -m pytest -q -x tests/test_attribution.py tests/test_selection_metrics.py tests/test_evaluate_report.py
-  if [[ ",${EXTRA_ARMS:-}," == *llmlingua2* ]]; then  # an optional baseline must not fail hours later at select
-    python -c "import llmlingua" || { echo "EXTRA_ARMS has llmlingua2 but 'pip install llmlingua' is missing"; exit 1; }
-  fi
+  ensure_baseline_deps  # an optional baseline must not fail hours later at select
   if has_stage upload; then  # a missing or read-only token should fail now, not after training
     python scripts/upload_hf.py --check ${HF_NAMESPACE:+--namespace "$HF_NAMESPACE"}
   fi
@@ -201,7 +266,8 @@ if has_stage fit; then
         for split in train dev; do
           echo "== fit: $r $target $src/$split"
           python generate_labels.py fit --raw-dir "$LABELS/raw/$r/${src}_$split" --target "$target" \
-            --alpha-from "$LABELS/raw/$r/${src}_dev" --out-dir "$LABELS/fit/$r/$target/${src}_$split" \
+            --alpha-from "$LABELS/raw/$r/${src}_dev" --out-dir "$FIT/$r/$target/${src}_$split" \
+            --n "$([[ $split == dev ]] && echo "$N_DEV" || echo "$N_TRAIN")" --alpha-n "$N_DEV" \
             >> "$LOGS/fit.log" 2>&1 || { echo "!! fit failed:"; tail -n 25 "$LOGS/fit.log"; exit 1; }
         done
       done
@@ -216,7 +282,7 @@ if has_stage fit; then
       [[ " $TRAIN_SOURCES " == *" $src "* ]] && alpha_from="$LABELS/raw/$PRIMARY/${src}_dev"
       echo "== fit (oracle_beta): $PRIMARY f1 $src/test"
       python generate_labels.py fit --raw-dir "$LABELS/raw/$PRIMARY/${src}_test" --target f1 \
-        --alpha-from "$alpha_from" --out-dir "$LABELS/fit/$PRIMARY/f1/${src}_test" \
+        --alpha-from "$alpha_from" --out-dir "$FIT/$PRIMARY/f1/${src}_test" --n "$ORACLE_N" --alpha-n "$N_DEV" \
         >> "$LOGS/fit.log" 2>&1 || { echo "!! fit failed:"; tail -n 25 "$LOGS/fit.log"; exit 1; }
     done
   fi
@@ -226,9 +292,9 @@ if has_stage ensemble; then
   for src in $TRAIN_SOURCES; do
     for split in train dev; do
       dirs=""
-      for reader in $LABEL_READERS; do dirs="$dirs,$LABELS/fit/$(tag "$reader")/f1/${src}_$split"; done
+      for reader in $LABEL_READERS; do dirs="$dirs,$FIT/$(tag "$reader")/f1/${src}_$split"; done
       echo "== ensemble: $src/$split"
-      python generate_labels.py ensemble --fit-dirs "${dirs#,}" --out-dir "$LABELS/fit/ensemble/f1/${src}_$split" \
+      python generate_labels.py ensemble --fit-dirs "${dirs#,}" --out-dir "$FIT/ensemble/f1/${src}_$split" \
         >> "$LOGS/ensemble.log" 2>&1 || { echo "!! ensemble failed:"; tail -n 25 "$LOGS/ensemble.log"; exit 1; }
     done
   done
@@ -236,7 +302,7 @@ fi
 
 label_dirs() {  # label_dirs <reader-tag-or-ensemble> <target> <split>
   local out=""
-  for src in $TRAIN_SOURCES; do out="$out,$LABELS/fit/$1/$2/${src}_$3"; done
+  for src in $TRAIN_SOURCES; do out="$out,$FIT/$1/$2/${src}_$3"; done
   echo "${out#,}"
 }
 
@@ -249,6 +315,9 @@ if has_stage train; then
     "pruner_logprob_primary|beta|$PRIMARY|logprob|"
     "pruner_beta_primary_posadj|beta|$PRIMARY|f1|--position-adjust"
   )
+  for seed in $EXTRA_SEEDS; do  # name | source | reader | target | extra | seed
+    RUNS+=("pruner_beta_primary_s$seed|beta|$PRIMARY|f1||$seed" "pruner_beta_ensemble_s$seed|ensemble|ensemble|f1||$seed")
+  done
   pids=(); names=(); g=0
   flush_train() {
     local failed=0
@@ -261,13 +330,13 @@ if has_stage train; then
     (( failed == 0 )) || exit 1
   }
   for run in "${RUNS[@]}"; do
-    IFS='|' read -r name source reader target extra <<< "$run"
+    IFS='|' read -r name source reader target extra seed <<< "$run"
     if [[ -f "$MODELS/$name/train_log.json" ]]; then echo "== train $name: done, skipping"; continue; fi
     echo "== train $name (GPU $g) -> $LOGS/train_$name.log"
     # shellcheck disable=SC2086
     CUDA_VISIBLE_DEVICES=${GPU_IDS[$g]} python train_pruner.py --label-source "$source" \
       --train-labels "$(label_dirs "$reader" "$target" train)" --dev-labels "$(label_dirs "$reader" "$target" dev)" \
-      --backbone "$BACKBONE" --grad-checkpointing $extra $TRAIN_ARGS --out-dir "$MODELS/$name" \
+      --backbone "$BACKBONE" --grad-checkpointing $extra $TRAIN_ARGS ${seed:+--seed "$seed"} --out-dir "$MODELS/$name" \
       > "$LOGS/train_$name.log" 2>&1 &
     pids+=($!); names+=("$name")
     g=$(( (g + 1) % NUM_GPUS ))
@@ -277,17 +346,22 @@ if has_stage train; then
 fi
 
 if has_stage select; then
+  ensure_baseline_deps  # also when select runs without preflight (STAGES="select answer report")
   # reranker = the pruner's backbone zero-shot: ours vs reranker isolates what the attribution labels add
   ARMS="full,lead,random,bm25,embed=embed:$EMBED_MODEL,reranker=reranker:$BACKBONE,oracle_span,oracle_support"
   ARMS="$ARMS,ours_beta=pruner:$MODELS/pruner_beta_primary,ours_ens=pruner:$MODELS/pruner_beta_ensemble"
   ARMS="$ARMS,span_sup=pruner:$MODELS/pruner_span,abl_logprob=pruner:$MODELS/pruner_logprob_primary"
   ARMS="$ARMS,abl_posadj=pruner:$MODELS/pruner_beta_primary_posadj"
+  for seed in $EXTRA_SEEDS; do
+    ARMS="$ARMS,ours_beta_s$seed=pruner:$MODELS/pruner_beta_primary_s$seed"
+    ARMS="$ARMS,ours_ens_s$seed=pruner:$MODELS/pruner_beta_ensemble_s$seed"
+  done
   ARMS="$ARMS${EXTRA_ARMS:+,$EXTRA_ARMS}"   # e.g. EXTRA_ARMS="xprovence=provence:naver/xprovence-reranker-bgem3-v1,llmlingua2"
   oracle_flags=()
   if (( ORACLE_N > 0 )); then
     oracle_dirs=""
     for src in ${EVAL_SOURCES//,/ }; do
-      d="$LABELS/fit/$PRIMARY/f1/${src}_test"
+      d="$FIT/$PRIMARY/f1/${src}_test"
       [[ -f "$d/summary.json" ]] || { echo "!! $d missing: run the labels + fit stages first (ORACLE_N=$ORACLE_N)"; exit 1; }
       oracle_dirs="$oracle_dirs,$d"
     done
@@ -321,15 +395,17 @@ if has_stage report; then
   for reader in $EVAL_READERS; do [[ " $LABEL_READERS " == *" $reader "* ]] || heldout="$heldout,$(tag "$reader")"; done
   python evaluate.py report --out-dir "$EVAL_DIR" --ours ours_beta,ours_ens --primary-reader "$PRIMARY" \
     --heldout-readers "${heldout#,}" --equiv-margin "$EQUIV_MARGIN" --oracle-margin "$ORACLE_MARGIN" \
-    --min-upgrade-gap "$MIN_UPGRADE_GAP" --labels-dir "$LABELS" > "$LOGS/report.log" 2>&1 \
+    --min-upgrade-gap "$MIN_UPGRADE_GAP" --labels-dir "$LABELS" --fit-dir "$FIT" > "$LOGS/report.log" 2>&1 \
     || { tail -n 25 "$LOGS/report.log"; exit 1; }
-  echo "report: $EVAL_DIR/report.md"
+  python scripts/paper_tables.py --report "$EVAL_DIR/report.json" --primary-reader "$PRIMARY" >> "$LOGS/report.log" 2>&1 \
+    || { tail -n 25 "$LOGS/report.log"; exit 1; }
+  echo "report: $EVAL_DIR/report.md (paper tables + CSVs: $EVAL_DIR/paper/)"
 fi
 
 if has_stage upload; then
   echo "== upload to HuggingFace (run '$HF_RUN_NAME', private=$HF_PRIVATE, labels=$HF_UPLOAD_LABELS)"
   upload_flags=(--prefix "$HF_REPO_PREFIX" --run-name "$HF_RUN_NAME" --models-dir "$MODELS" --eval-dir "$EVAL_DIR"
-                --labels-dir "$LABELS")
+                --labels-dir "$LABELS" --fit-dir "$FIT")
   [[ -n "$HF_NAMESPACE" ]] && upload_flags+=(--namespace "$HF_NAMESPACE")
   [[ "$HF_PRIVATE" == true ]] || upload_flags+=(--public)
   [[ "$HF_UPLOAD_LABELS" == true ]] && upload_flags+=(--include-labels)

@@ -4,8 +4,8 @@ import pandas as pd
 import pytest
 
 from ttcompress.sources import (
-    build_haystack, dev_or_test, hash_unit, is_yes_no, load_documents, multihop_row_to_doc, pad_with_distractors,
-    take_n,
+    _squad_rows_to_docs, build_haystack, dev_or_test, first_n_docs, hash_unit, is_yes_no, load_documents,
+    multihop_row_to_doc, pad_with_distractors, take_n,
 )
 from tests.conftest import make_doc
 
@@ -15,6 +15,19 @@ def test_hash_split_is_a_pure_function_of_the_key():
     assert 0.0 <= hash_unit('x') < 1.0
     fractions = [dev_or_test(f'k{i}', 0.2) == 'dev' for i in range(5000)]
     assert 0.17 < sum(fractions) / len(fractions) < 0.23
+
+
+def test_first_n_docs_recovers_the_sample_from_a_larger_run():
+    """A label dir shared by runs holds the first 40 docs; a 15-doc run must fit exactly its own 15."""
+    rows = [{'id': f'q{i}', 'title': f't{i % 4}', 'context': f'đoạn văn {i} có đáp án a{i}.', 'question': f'hỏi {i}?',
+             'answers': [f'a{i}'], 'cluster': f'uit:t{i % 4}'} for i in range(60)]
+    def load(n):  # load_documents' single-hop path, minus the dataset download
+        return [d.to_dict() for d in _squad_rows_to_docs(rows, take_n(rows, n, key=lambda r: r['id']),
+                                                         'uit_viquad', 'train', 300, 'random')]
+    shared = load(40)
+    assert [d['doc_id'] for d in first_n_docs(shared, 15)] == [d['doc_id'] for d in load(15)]
+    multi = [{'doc_id': f'hotpotqa_train_{i}', 'hop': 'multi', 'metadata': {'source_id': str(i)}} for i in range(50)]
+    assert first_n_docs(multi, 7) == take_n(multi, 7, key=lambda d: d['doc_id'])
 
 
 def test_take_n_is_nested_and_deterministic():

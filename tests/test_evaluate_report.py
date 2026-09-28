@@ -115,3 +115,87 @@ def test_report_cost_table_from_raw_labels(tmp_path):
     assert cost['labels'] == [{'reader': 'Qwen--Qwen3-8B', 'set': 'hotpotqa_train', 'n_docs': 3, 'calls_per_doc': 65.0,
                                'seconds_per_doc': 2.0, 'total_hours': 6.0 / 3600}]
     assert cost['select_ms'][0]['arm'] == 'ours_beta'
+
+
+def test_text_arm_is_forced_into_the_budget(fake_tokenizer):
+    from evaluate import _text_within_budget
+    from tests.conftest import make_doc
+
+    class Overshooting:  # compresses to ~1.5x the asked size, like a rate counted in another tokenizer
+        def __init__(self):
+            self.asked = []
+
+        def compress_text(self, doc, ratio):
+            self.asked.append(ratio)
+            return ' '.join(['w'] * int(1.5 * 400 / ratio))
+
+    count = lambda t: len(fake_tokenizer.encode(t))  # noqa: E731
+    arm = Overshooting()
+    text, truncated = _text_within_budget(arm, make_doc(['x']), 4.0, 100, fake_tokenizer, count)
+    assert count(text) <= 100 and not truncated and arm.asked[1] > 4.0
+    arm.compress_text = lambda doc, ratio: ' '.join(['w'] * 500)   # ignores the rate entirely
+    text, truncated = _text_within_budget(arm, make_doc(['x']), 4.0, 100, fake_tokenizer, count)
+    assert count(text) == 100 and truncated
+
+
+def test_paper_tables_from_report(tmp_path):
+    test_report_hypothesis_families(tmp_path)
+    subprocess.run([sys.executable, 'scripts/paper_tables.py', '--report', str(tmp_path / 'report.json'),
+                    '--primary-reader', 'strong'], check=True, capture_output=True)
+    paper = tmp_path / 'paper'
+    main = (paper / 'main_results.tex').read_text(encoding='utf-8')
+    import re
+    bold = [float(v) for v in re.findall(r'\\textbf\{([0-9.]+)\}', main)]
+    assert len(bold) == 2 and all(59.5 < v < 60.5 for v in bold)  # ours_ens (0.7 - 0.1) is the best compressor
+    assert 'oracle' in main
+    assert (paper / 'hypotheses.tex').read_text(encoding='utf-8').count('/') >= 7
+    for name in ('cells.csv', 'paired.csv', 'hypotheses.csv', 'retention.csv', 'by_depth.csv', 'retention.tex'):
+        assert (paper / name).stat().st_size > 0
+
+
+def _seed_run(tmp_path, s2_shift):
+    """ours_beta beats bm25 by 0.1 on both sources; seed 1 agrees, seed 2 is shifted by s2_shift on hotpotqa."""
+    rows = []
+    for source in ('uit_viquad', 'hotpotqa'):
+        for i in range(40):
+            rows.append(_hrow('r', 'full', 'full', i, 0.8, source))
+            rows.append(_hrow('r', 'bm25', 4.0, i, 0.4, source))
+            rows.append(_hrow('r', 'ours_beta', 4.0, i, 0.5 + 0.001 * (i % 3), source))
+            rows.append(_hrow('r', 'ours_beta_s1', 4.0, i, 0.52, source))
+            rows.append(_hrow('r', 'ours_beta_s2', 4.0, i, 0.48 + (s2_shift if source == 'hotpotqa' else 0.0), source))
+    (tmp_path / 'answers_r_shard0.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
+    subprocess.run([sys.executable, 'evaluate.py', 'report', '--out-dir', str(tmp_path), '--ours', 'ours_beta',
+                    '--primary-reader', 'r', '--n-boot', '300'], check=True, capture_output=True)
+    return json.loads((tmp_path / 'report.json').read_text(encoding='utf-8'))
+
+
+def test_report_seed_robustness(tmp_path):
+    report = _seed_run(tmp_path, s2_shift=-0.2)          # seed 2 falls below bm25 on hotpotqa
+    h1 = next(f for f in report['hypotheses'] if f['name'] == 'H1')
+    assert h1['n_supported'] == 2 and h1['n_seed_robust'] == 1
+    bad = next(t for t in h1['tests'] if t['source'] == 'hotpotqa')
+    assert not bad['seeds_agree'] and abs(bad['seed_diffs']['ours_beta_s2'] + 0.12) < 1e-9
+    seeds = {(r['source'], r['arm']): r for r in report['seeds']}
+    assert set(seeds[('uit_viquad', 'ours_beta')]['f1_by_seed']) == {'ours_beta', 'ours_beta_s1', 'ours_beta_s2'}
+    assert seeds[('hotpotqa', 'ours_beta')]['sd'] > seeds[('uit_viquad', 'ours_beta')]['sd']
+    assert 'Training-seed variation' in (tmp_path / 'report.md').read_text(encoding='utf-8')
+    # seed arms stay out of the paper's main table; they get their own
+    subprocess.run([sys.executable, 'scripts/paper_tables.py', '--report', str(tmp_path / 'report.json'),
+                    '--primary-reader', 'r'], check=True, capture_output=True)
+    assert r'ours\_beta\_s' not in (tmp_path / 'paper' / 'main_results.tex').read_text(encoding='utf-8')
+    assert (tmp_path / 'paper' / 'seeds.tex').read_text(encoding='utf-8').count('(3 seeds)') == 2
+
+
+def test_compare_runs(tmp_path):
+    (tmp_path / 'a').mkdir()
+    (tmp_path / 'b').mkdir()
+    _seed_run(tmp_path / 'a', 0.0)
+    _seed_run(tmp_path / 'b', -0.2)
+    out = tmp_path / 'cmp'
+    subprocess.run([sys.executable, 'scripts/compare_runs.py', '--primary-reader', 'r', '--out-dir', str(out),
+                    '--run', f"random={tmp_path / 'a' / 'report.json'}", '--run', f"hard={tmp_path / 'b' / 'report.json'}"],
+                   check=True, capture_output=True)
+    md = (out / 'compare.md').read_text(encoding='utf-8')
+    assert '| random (n) | hard (n) |' in md and '| H1 | 2/2 | 2/2 |' in md
+    rows = (out / 'compare.csv').read_text(encoding='utf-8').splitlines()
+    assert rows[0].startswith('source,ratio,arm,random_f1') and any(',bm25,' in r for r in rows)

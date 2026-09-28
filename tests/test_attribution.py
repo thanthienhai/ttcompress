@@ -110,3 +110,31 @@ def test_pooled_position_prior_detects_a_position_effect():
                                   informative=True, alpha=1.0, cv_r2=1.0, full_f1=1.0))
     prior = fit_position_prior(labels)
     assert prior[0] > 1.5 and position_r2(labels, prior) > 0.99
+
+
+def test_fit_n_uses_only_this_runs_documents(tmp_path):
+    """generate_labels.py fit --n: a raw dir shared with a larger run is cut to the first n documents,
+    and a re-fit with a smaller n leaves no stale records in the out dir."""
+    import json
+    import subprocess
+    import sys
+    from ttcompress.sources import first_n_docs
+    raw = tmp_path / 'raw'
+    docs = []
+    for i in range(12):
+        doc = make_doc([f'c{j}' for j in range(6)], gold=(1,), doc_id=f'hotpotqa_train_{i}', source='hotpotqa',
+                       hop='multi').to_dict()
+        docs.append(doc)
+        masks = generate_masks(6, 64, [0.5], seed=i)
+        f1 = [float(m[1]) for m in masks]
+        save_record(MaskOutcomes(doc=doc, reader='r', masks=masks, f1=f1, full_f1=1.0), str(raw))
+    out = tmp_path / 'fit'
+    for n in (8, 5):
+        subprocess.run([sys.executable, 'generate_labels.py', 'fit', '--raw-dir', str(raw), '--alpha', '1.0',
+                        '--n', str(n), '--out-dir', str(out)], check=True, capture_output=True)
+        fitted = sorted(p.stem for p in out.glob('*.json') if p.name != 'summary.json')
+        assert fitted == sorted(d['doc_id'] for d in first_n_docs(docs, n))
+    assert json.loads((out / 'summary.json').read_text(encoding='utf-8'))['n_requested'] == 5
+    bad = subprocess.run([sys.executable, 'generate_labels.py', 'fit', '--raw-dir', str(raw), '--alpha', '1.0',
+                          '--n', '20', '--out-dir', str(out)], capture_output=True, text=True)
+    assert bad.returncode != 0 and 'finish the labels stage' in bad.stderr

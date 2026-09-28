@@ -98,6 +98,22 @@ def _append_jsonl(path, rows):
 # select
 # ---------------------------------------------------------------------------
 
+def _text_within_budget(arm, doc, ratio, budget, tok, count, attempts=3):
+    """Text arms (LLMLingua-2) compress to a rate in THEIR tokenizer (XLM-R), so the result can overshoot
+    the budget counted in the reference tokenizer. Tighten the rate by the observed overshoot and retry;
+    if it still does not fit, cut the tail to the budget (flagged `truncated`, like a chunk arm whose best
+    chunk had to be cut). -> (text, truncated)"""
+    target = ratio
+    for _ in range(attempts):
+        text = arm.compress_text(doc, target)
+        n = count(text)
+        if n <= budget:
+            return text, False
+        target *= 1.02 * n / budget
+    ids = tok.encode(text, add_special_tokens=False)[:budget]
+    return tok.decode(ids), True
+
+
 def cmd_select(args):
     from transformers import AutoTokenizer
 
@@ -155,9 +171,10 @@ def cmd_select(args):
             if arm.kind == 'text':
                 for r in ratios:
                     t0 = time.time()
-                    text = arm.compress_text(d, r)
+                    budget = budget_for(full_tokens[d.doc_id], r)
+                    text, truncated = _text_within_budget(arm, d, r, budget, tok, count)
                     rows.append({**base, 'ratio': r, 'kept': [], 'text': text, 'kept_tokens': count(text),
-                                 'budget': budget_for(full_tokens[d.doc_id], r), 'gold_recall': None,
+                                 'budget': budget, 'truncated': truncated, 'gold_recall': None,
                                  'seconds': time.time() - t0})
                 continue
             t0 = time.time()
@@ -337,8 +354,11 @@ def cmd_report(args):
                                                         'stable': gap >= args.min_upgrade_gap})
 
     report['hypotheses'] = hypothesis_families(cell, rows, readers, sources, ratios, args)
+    report['seeds'] = seed_table(report['cells'])
     if args.labels_dir:
         report['cost'] = cost_tables(report['cells'], args)
+    if args.fit_dir:
+        report['label_quality'] = label_quality(args.fit_dir)
 
     # single-hop: gold recall and F1 by needle depth (quintiles of relative position)
     for (reader, source, ratio, arm), by_doc in sorted(cell.items()):
@@ -473,13 +493,64 @@ def hypothesis_families(cell, rows, readers, sources, ratios, args):
                         H4_VS, 'superiority', 0.0, args.n_boot)),
     ]
     out = []
+    variants = seed_variants(sorted({a for (_, _, _, a) in cell}))
     for name, claim, kind, margin, tests in fam:
         for t, h in zip(tests, holm_adjust([t['p'] for t in tests])):
             t['p_holm'] = h
             t['supported'] = h is not None and h < FAMILY_ALPHA
+            if 'reader' in t and variants.get(t['ours']):
+                _seed_check(t, cell, variants[t['ours']], kind, margin)
+        seeded = [t for t in tests if 'seeds_agree' in t]
         out.append({'name': name, 'claim': claim, 'kind': kind,
                     'margin': margin, 'n_tests': len(tests), 'n_supported': sum(t['supported'] for t in tests),
-                    'n_budget_mismatch': sum(bool(t.get('budget_mismatch')) for t in tests), 'tests': tests})
+                    'n_budget_mismatch': sum(bool(t.get('budget_mismatch')) for t in tests),
+                    # supported AND every other training seed's point estimate points the same way
+                    'n_seed_robust': sum(t['supported'] and t['seeds_agree'] for t in seeded) if seeded else None,
+                    'tests': tests})
+    return out
+
+
+SEED_ARM = re.compile(r'^(ours_beta|ours_ens)_s(\d+)$')
+
+
+def seed_variants(arms):
+    """{'ours_beta': ['ours_beta_s1', ...], ...}: the same pruner retrained with other seeds (EXTRA_SEEDS)."""
+    out = defaultdict(list)
+    for a in arms:
+        m = SEED_ARM.match(a)
+        if m:
+            out[m.group(1)].append(a)
+    return dict(out)
+
+
+def _seed_check(test, cell, variants, kind, margin):
+    """Point estimate of the same comparison for every other training seed, on that seed's common documents."""
+    diffs = {}
+    for v in variants:
+        a = cell.get((test['reader'], test['source'], test['ratio'], v))
+        b = cell.get((test['reader'], test['source'], test['ratio'], test['vs']))
+        common = sorted(set(a or {}) & set(b or {}))
+        if common:
+            diffs[v] = float(np.mean([a[d]['f1'] - b[d]['f1'] for d in common]))
+    holds = {'superiority': lambda d: d > 0, 'noninferiority': lambda d: d > -margin,
+             'equivalence': lambda d: abs(d) < margin}[kind]
+    test['seed_diffs'] = diffs
+    test['seeds_agree'] = bool(diffs) and all(holds(d) for d in diffs.values())
+
+
+def seed_table(cells):
+    """F1 of ours_beta / ours_ens per training seed, per reader x source x ratio: mean and SD across seeds,
+    to set against the effect sizes (a gap smaller than the seed SD is not a finding)."""
+    variants = seed_variants(sorted({c['arm'] for c in cells}))
+    by = {(c['reader'], c['source'], c['ratio'], c['arm']): c['f1']['mean'] for c in cells}
+    out = []
+    for base, vs in sorted(variants.items()):
+        for reader, source, ratio in sorted({k[:3] for k in by if k[3] == base}):
+            f1 = {a: by[(reader, source, ratio, a)] for a in [base] + vs if (reader, source, ratio, a) in by}
+            if len(f1) > 1:
+                vals = list(f1.values())
+                out.append({'arm': base, 'reader': reader, 'source': source, 'ratio': ratio, 'f1_by_seed': f1,
+                            'mean': float(np.mean(vals)), 'sd': float(np.std(vals, ddof=1))})
     return out
 
 
@@ -509,6 +580,24 @@ def cost_tables(cells, args):
             'select_ms': [{'source': s, 'arm': a, 'select_ms': float(np.mean(v))} for (s, a), v in sorted(select.items())]}
 
 
+def label_quality(fit_dir):
+    """Stage A diagnostics of this run's fits (METHOD_SPEC.md §3): additivity (cv R²), whether β finds the
+    evidence (gold recall@|gold|, MRR; ~1 on single-hop = β collapsed onto the answer span, H2b), position
+    share of label variance, and cross-reader agreement for ensembles (H3a)."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(fit_dir, '*', '*', '*', 'summary.json'))):
+        with open(path, encoding='utf-8') as f:
+            s = json.load(f)
+        label_set = os.path.dirname(path)
+        target_dir = os.path.dirname(label_set)
+        out.append({'reader': os.path.basename(os.path.dirname(target_dir)), 'target': os.path.basename(target_dir),
+                    'set': os.path.basename(label_set),
+                    **{k: s.get(k) for k in ('n_docs', 'n_informative', 'alpha', 'mean_full_f1', 'mean_cv_r2',
+                                             'gold_recall_at_g', 'gold_mrr', 'position_r2')},
+                    'cross_reader_spearman': s.get('cross_reader_spearman')})
+    return out
+
+
 def _fmt(m):
     lo, hi = m['ci95']
     return f"{m['mean']:.3f}" + (f" [{lo:.3f}, {hi:.3f}]" if lo is not None else '')
@@ -518,6 +607,8 @@ def _markdown(report) -> str:
     lines = ['# Evaluation report', '', 'Token F1 with 95% cluster-bootstrap CI; never pooled across sources.', '']
     lines += _hypotheses_markdown(report.get('hypotheses', []))
     lines += _cost_markdown(report.get('cost'))
+    lines += _label_quality_markdown(report.get('label_quality'))
+    lines += _seeds_markdown(report.get('seeds'))
     groups = defaultdict(list)
     for c in report['cells']:
         groups[(c['reader'], c['source'])].append(c)
@@ -566,10 +657,13 @@ def _hypotheses_markdown(families) -> list:
     if not families:
         return []
     lines = ['## Hypotheses (confirmatory; one-sided tests, Holm within each family, alpha 0.05)', '',
-             '| family | claim | tests | supported | budget-mismatched |', '|---|---|---|---|---|']
+             '| family | claim | tests | supported | supported, every seed agrees | budget-mismatched |',
+             '|---|---|---|---|---|---|']
     for f in families:
         status = 'not run' if not f['n_tests'] else f"{f['n_supported']}/{f['n_tests']}"
-        lines.append(f"| {f['name']} | {f['claim']} | {f['n_tests']} | {status} | {f['n_budget_mismatch']} |")
+        robust = '' if f.get('n_seed_robust') is None else f"{f['n_seed_robust']}/{f['n_tests']}"
+        lines.append(f"| {f['name']} | {f['claim']} | {f['n_tests']} | {status} | {robust} | "
+                     f"{f['n_budget_mismatch']} |")
     lines.append('')
     for f in families:
         if not f['n_tests']:
@@ -584,9 +678,41 @@ def _hypotheses_markdown(families) -> list:
             p = '' if t['p'] is None else f"{t['p']:.4f}"
             holm = '' if t['p_holm'] is None else f"{t['p_holm']:.4f}"
             ok = ('✓' if t['supported'] else '✗') + (' (budget ≠)' if t.get('budget_mismatch') else '')
+            if 'seeds_agree' in t:
+                ok += ' seeds ' + ('✓' if t['seeds_agree'] else '✗ ' + ', '.join(
+                    f"{d:+.3f}" for d in t['seed_diffs'].values()))
             lines.append(f"| {who} | {t['source']} | {t['ratio']} | {t['ours']} | {t['vs']} | {t['diff']:+.3f}{ci} | "
                          f"{p} | {holm} | {ok} |")
         lines.append('')
+    return lines
+
+
+def _seeds_markdown(rows) -> list:
+    if not rows:
+        return []
+    lines = ['## Training-seed variation (token F1 per seed; compare the SD with the effect sizes above)', '',
+             '| arm | reader | source | ratio | F1 per seed | mean ± SD |', '|---|---|---|---|---|---|']
+    for r in rows:
+        per = ', '.join(f"{a}: {v:.3f}" for a, v in r['f1_by_seed'].items())
+        lines.append(f"| {r['arm']} | {r['reader']} | {r['source']} | {r['ratio']} | {per} | "
+                     f"{r['mean']:.3f} ± {r['sd']:.3f} |")
+    lines.append('')
+    return lines
+
+
+def _label_quality_markdown(rows) -> list:
+    if not rows:
+        return []
+    num = lambda v, f='.3f': '' if v is None or v != v else format(v, f)  # noqa: E731
+    lines = ['## Label quality (Stage A, this run\'s fits)', '',
+             '| reader | target | set | docs (informative) | α | full F1 | cv R² | gold recall@g | gold MRR | '
+             'position R² | cross-reader ρ |', '|---|---|---|---|---|---|---|---|---|---|---|']
+    for r in rows:
+        rho = '; '.join(f"{k}: {v:.2f}" for k, v in (r['cross_reader_spearman'] or {}).items())
+        lines.append(f"| {r['reader']} | {r['target']} | {r['set']} | {r['n_docs']} ({r['n_informative']}) | "
+                     f"{num(r['alpha'], 'g')} | {num(r['mean_full_f1'])} | {num(r['mean_cv_r2'])} | "
+                     f"{num(r['gold_recall_at_g'])} | {num(r['gold_mrr'])} | {num(r['position_r2'])} | {rho} |")
+    lines.append('')
     return lines
 
 
@@ -660,6 +786,8 @@ def main():
     r.add_argument('--budget-tolerance', type=float, default=0.05,
                    help="a selection is over budget when kept_tokens > budget * (1 + this)")
     r.add_argument('--labels-dir', default=None, help="labels root (raw/<reader>/...) for the RQ1 cost table")
+    r.add_argument('--fit-dir', default=None, help="this run's fit dir (<reader|ensemble>/<target>/<set>/summary.json) "
+                                                    "for the label-quality table")
     r.set_defaults(func=cmd_report)
 
     args = ap.parse_args()

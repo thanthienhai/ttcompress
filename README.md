@@ -33,7 +33,11 @@ run_pipeline.sh        the whole thing on N GPUs, resumable
 pip install -r requirements.txt
 cp .env.example .env           # all settings + HF_TOKEN (a WRITE token) in one file; .env is gitignored
 
-# pilot first (~1/10 of the data, every stage): command-line variables override .env
+# smoke test on a new pod/image first: every stage on a few documents (-> runs/smoke, ~1 h of model
+# start-ups, never uploads) -- catches package installs, vLLM, XProvence / LLMLingua-2 and path problems
+SMOKE=1 ./run_pipeline.sh
+
+# pilot (~1/10 of the data, every stage): command-line variables override .env
 N_TRAIN=300 N_DEV=30 N_TEST=50 RUN_ROOT=/mnt/hps/anhm-paper/ttcompress/runs/pilot HF_RUN_NAME=pilot ./run_pipeline.sh
 
 # mid-scale go/no-go before the full run: does the gap to `embed` / `reranker` (the untrained backbone)
@@ -44,9 +48,18 @@ N_TRAIN=800 N_DEV=150 N_TEST=200 RUN_ROOT=/mnt/hps/anhm-paper/ttcompress/runs/mi
 ./run_pipeline.sh
 # re-evaluate without the published baselines (e.g. if XProvence's remote code fails on the cluster)
 STAGES="select answer report" EXTRA_ARMS= ./run_pipeline.sh
-# ablation with a different label/selection setting -> its own RUN_ROOT
-MEASURE_ARGS="--distractors hard" SELECT_ARGS="--distractors hard" RUN_ROOT=runs/hard ./run_pipeline.sh
+# distractor ablation (labels + evaluation): its own suffixed LABELS / RUN_ROOT, e.g. runs/main_distractors-hard
+DISTRACTORS=hard ./run_pipeline.sh
+MULTIHOP_PAD_CHARS=20000 ./run_pipeline.sh           # multi-hop docs padded with easy distractors
+
+# side by side (descriptive): distractor ablation, or the data-size curve mid -> full
+python scripts/compare_runs.py --primary-reader Qwen--Qwen3-8B --out-dir results/compare \
+  --run random=runs/main/results/eval_test/report.json --run hard=runs/main_distractors-hard/results/eval_test/report.json
 ```
+
+Training-seed robustness: `EXTRA_SEEDS="1 2"` (default) also trains `ours_beta` / `ours_ens` with seeds 1 and 2
+(4 more training runs); the report lists F1 per seed and, per hypothesis, how many supported tests hold for
+every seed. `EXTRA_SEEDS=none` turns it off.
 
 Stages: `preflight` (GPU count, imports, CPU unit tests) → `prefetch` (every dataset and model downloaded
 once, in one process; gated models fail here, not hours later) → `labels` → `fit` → `ensemble` → `train`
@@ -60,10 +73,12 @@ shard prints the tail of its log (`$RUN_ROOT/logs/<stage>_shard<k>.log`) and sto
 continues from what is on disk. Label and selection dirs record their settings and refuse to be resumed
 with different ones.
 
-Outputs: `labels/raw/<reader>/<source>_<split>/` (masks + outcomes per document),
-`labels/fit/<reader|ensemble>/<target>/<source>_<split>/` (labels + `summary.json` with label-quality
+Outputs: `labels/raw/<reader>/<source>_<split>/` (masks + outcomes per document; `LABELS` is shared by runs,
+documents are nested across N), `$RUN_ROOT/labels_fit/<reader|ensemble>/<target>/<source>_<split>/` (this
+run's labels, restricted to its N_TRAIN / N_DEV / ORACLE_N documents, + `summary.json` with label-quality
 diagnostics), `models/<pruner>/` (+ `train_log.json`), `results/eval_test/report.{json,md}` (hypothesis
-verdicts, RQ1 cost table, per-cell tables, paired differences, upgrade retention).
+verdicts, RQ1 cost table, label quality, per-cell tables, paired differences, upgrade retention) and
+`results/eval_test/paper/` (LaTeX tables + CSVs for plots, from `scripts/paper_tables.py`).
 
 Every stage skips work already on disk, so a crashed or pre-empted job is simply re-run.
 

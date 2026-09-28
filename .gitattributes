@@ -1,0 +1,3 @@
+# run on Linux clusters: a CRLF checkout on Windows (core.autocrlf=true) breaks bash with $'\r' errors
+*.sh text eol=lf
+.env.example text eol=lf

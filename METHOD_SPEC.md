@@ -136,19 +136,23 @@ gold recall by needle-depth quintile for single-hop.
 | position adjustment | `pruner_beta_primary_posadj`; `position_r2`; depth slices |
 | 1 reader vs ensemble | `ours_beta` vs `ours_ens`, incl. held-out reader |
 | single- vs multi-hop | per-source tables |
-| hard vs easy distractors | `--distractors hard` / `--multihop-pad-chars` at label and eval time |
+| hard vs easy distractors | `DISTRACTORS=hard` / `MULTIHOP_PAD_CHARS=<n>` (label and eval time, own suffixed dirs); `scripts/compare_runs.py` |
+| training seed | `EXTRA_SEEDS` (default 1 2): `ours_beta_s<k>`, `ours_ens_s<k>`; per-hypothesis "every seed agrees" count, seed SD table |
 | label cost | `seconds` per record, reader calls = Σ(K+1) |
 
 ## 7. Compute plan (4×H100)
 
 Label generation dominates: per reader ≈ Σ_docs (K+1) ≈ 3 sources × 3000 docs × 65 ≈ 0.6M generations
 (3 readers ≈ 1.8M), plus `oracle_beta` test labels: 5 sources × `ORACLE_N` × 65 ≈ 33k (primary reader). Throughput must be measured on the cluster with a pilot
-(`N_TRAIN=50 N_DEV=20 N_TEST=30 ./run_pipeline.sh`) before committing to N. Pruner training: five runs,
-one GPU each, a few hours. Evaluation: 5 sources × 500 docs × (arms × ratios) × 4 readers.
+(`N_TRAIN=50 N_DEV=20 N_TEST=30 ./run_pipeline.sh`) before committing to N (`SMOKE=1` first on a new pod/image). Pruner training:
+five runs + 2 × `EXTRA_SEEDS` seed reruns (nine by default), one GPU each, a few hours per batch of four. Evaluation: 5 sources × 500 docs × (arms × ratios) × 4 readers.
 
 ## 8. Known gaps / to verify on the cluster
 
-- `provence:` and `llmlingua2` arms use the APIs documented on their model cards; not executed locally.
+- `provence:` and `llmlingua2` arms: APIs checked against the released code (XProvence `process()` returns
+  nested `reranking_score` lists and needs spaCy `xx_sent_ud_sm`; LLMLingua-2's `rate` is counted in XLM-R
+  tokens, so `select` tightens the rate and finally cuts the tail to the budget, flagged `truncated`);
+  `run_pipeline.sh` installs their packages on demand. Not executed locally.
 - vLLM backend (`VLLMReader`) not executed locally (no GPU); HF backend is tested (batched ≡ sequential).
 - Baselines not implemented: RECOMP, EXIT, LongLLMLingua, CORE-RAG, ContextCite-at-inference (the
   "unamortized" reference: `oracle_beta` on test documents is its budget-matched equivalent, at K reader

@@ -160,9 +160,14 @@ def upload(args, owner: str) -> None:
         api.upload_folder(repo_id=repo_id, repo_type='dataset', folder_path=args.eval_dir, path_in_repo='eval',
                           commit_message=f"{commit}: eval", ignore_patterns=['*.tmp'])
     if args.labels_dir and os.path.isdir(args.labels_dir):
-        patterns = None if args.include_labels else ['**/summary.json', '**/measure_config.json']
+        # raw/ only: fits come from --fit-dir (a legacy shared labels/fit/ belongs to no single run)
+        patterns = ['raw/**'] if args.include_labels else ['raw/**/measure_config.json']
         api.upload_folder(repo_id=repo_id, repo_type='dataset', folder_path=args.labels_dir, path_in_repo='labels',
                           commit_message=f"{commit}: labels", allow_patterns=patterns, ignore_patterns=['*.tmp'])
+    if args.fit_dir and os.path.isdir(args.fit_dir):  # this run's fits (N-restricted), next to the shared raw/
+        patterns = None if args.include_labels else ['**/summary.json']
+        api.upload_folder(repo_id=repo_id, repo_type='dataset', folder_path=args.fit_dir, path_in_repo='labels/fit',
+                          commit_message=f"{commit}: fits", allow_patterns=patterns, ignore_patterns=['*.tmp'])
     card = _dataset_card(repo_id, args.eval_dir, args.run_name, args.include_labels).encode('utf-8')
     api.upload_file(repo_id=repo_id, repo_type='dataset', path_or_fileobj=card, path_in_repo='README.md',
                     commit_message=f"{commit}: card")
@@ -181,7 +186,8 @@ def main():
     ap.add_argument('--run-name', default='run')
     ap.add_argument('--models-dir', default='models')
     ap.add_argument('--eval-dir', default='results/eval_test')
-    ap.add_argument('--labels-dir', default=None)
+    ap.add_argument('--labels-dir', default=None, help="labels root (raw/ measurements, shared across runs)")
+    ap.add_argument('--fit-dir', default=None, help="this run's fit dir (uploaded as labels/fit)")
     ap.add_argument('--include-labels', action='store_true', help="also upload per-document labels and raw measurements")
     ap.add_argument('--private', dest='private', action='store_true', default=True)
     ap.add_argument('--public', dest='private', action='store_false')
