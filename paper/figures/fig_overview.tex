@@ -1,0 +1,74 @@
+% Figure 1: method overview (Stage A -> Stage B -> inference). \input from main.tex inside figure*.
+\begin{tikzpicture}[
+    font=\footnotesize,
+    node distance=3.2mm and 7mm,
+    box/.style={draw=#1!55, fill=white, rounded corners=2pt, align=center, text width=4.3cm,
+                inner sep=3pt, line width=0.4pt, text=inkP},
+    arr/.style={-{Stealth[length=3.5pt]}, line width=0.6pt, draw=inkS},
+    panel/.style={draw=#1!45, fill=#1!6, rounded corners=4pt, line width=0.5pt, inner sep=2.5mm},
+    ptitle/.style={font=\footnotesize\bfseries, text=inkP, align=center},
+    cost/.style={font=\scriptsize\itshape, text=inkS, align=center, text width=4.3cm},
+  ]
+  % ---------------- A: utility attribution (offline, training data only)
+  \node[box=vzblue] (a1) {Tài liệu: câu hỏi $q$, các đoạn $c_1,\dots,c_C$};
+  \node[box=vzblue, below=of a1, minimum height=2.05cm] (a2) {};
+  \node[anchor=north, text width=4.3cm, align=center, inner sep=0pt, text=inkP] at ($(a2.north)+(0,-1mm)$)
+    {$K\!\approx\!64$ mặt nạ ngẫu nhiên $m_k$\\[-0.5mm] {\scriptsize\color{inkS}(hàng: mặt nạ; ô màu: giữ)}};
+  \node[box=vzblue, below=of a2] (a3) {3 reader trả lời trên cùng các ngữ cảnh $d_{m_k}$:\\
+    $u_r(m_k)=\mathrm{F1}\big(R_r(q,d_{m_k}),\mathcal{A}\big)$};
+  \node[box=vzblue, below=of a3] (a4) {Ridge: $u_r(m)\approx\beta_0+\beta^{(r)\top}m$\\
+    z-score trong tài liệu $\to$ nhãn $y^{(r)}$, gộp $\bar y$};
+  % mask grid inside a2: 4 masks x 8 chunks, filled = chunk kept
+  \foreach \row/\bits in {0/{1,0,1,1,0,1,0,0}, 1/{0,1,1,0,1,0,1,1}, 2/{1,1,0,1,0,0,1,0}, 3/{0,0,1,1,1,1,0,1}} {
+    \foreach \bit [count=\col from 0] in \bits {
+      \ifnum\bit=1 \def\cellstyle{vzblue}\else \def\cellstyle{gridc}\fi
+      \fill[\cellstyle] ($(a2.south)+(-1.25cm+\col*3.2mm, 1.6mm+\row*2.3mm)$) rectangle ++(2.6mm,1.7mm);
+    }
+  }
+  \node[cost, below=2mm of a4] (acost) {$K{+}1$ lần gọi reader cho mỗi tài liệu,\\ chỉ trên dữ liệu huấn luyện};
+  \draw[arr] (a1) -- (a2);
+  \draw[arr] (a2) -- (a3);
+  \draw[arr] (a3) -- (a4);
+
+  % ---------------- B: distillation
+  \node[box=vzorange, right=of a1] (b1) {Một lượt đọc toàn bộ ngữ cảnh:\\
+    \texttt{[CLS]}\,$q$\,\texttt{[SEP]}\,$c_1\dots c_C$\,\texttt{[SEP]}};
+  \node[box=vzorange, below=of b1, minimum height=2.05cm] (b2) {Cross-encoder\\ {\scriptsize\texttt{bge-reranker-v2-m3}}\\
+    gộp trung bình theo đoạn\\ $\to$ điểm $s_1,\dots,s_C$};
+  \node[box=vzorange, below=of b2] (b3) {Mất mát so với nhãn $y$ (hoặc $\bar y$):\\
+    ListNet$(s,y)+0.5\cdot$MSE$(s,y)$};
+  \node[box=vzorange, below=of b3] (b4) {Chọn epoch theo NDCG@3 trên nhãn dev\\ (không gọi reader)};
+  \draw[arr] (b1) -- (b2);
+  \draw[arr] (b2) -- (b3);
+  \draw[arr] (b3) -- (b4);
+  \draw[arr] (a4.east) -- ++(3.5mm,0) |- (b3.west);   % labels feed the loss
+
+  % ---------------- C: inference
+  \node[box=vzaqua, right=of b1] (c1) {Tài liệu mới $(q, c_1,\dots,c_C)$};
+  \node[box=vzaqua, below=of c1, minimum height=2.05cm] (c2) {Bộ tỉa đã huấn luyện:\\ một lượt encoder $\to$ $s_1,\dots,s_C$};
+  \node[box=vzaqua, below=of c2, minimum height=2.05cm] (c3) {};
+  \node[anchor=north, text width=4.3cm, align=center, inner sep=0pt, text=inkP] at ($(c3.north)+(0,-1mm)$)
+    {Giữ các đoạn điểm cao nhất vừa\\ ngân sách $B$, theo thứ tự gốc\\[-0.5mm]
+    {\scriptsize\color{inkS}(ô màu: đoạn được giữ)}};
+  \node[box=vzaqua, below=of c3] (c4) {Reader bất kỳ, kể cả reader\\ không tham gia sinh nhãn};
+  % kept (colored) / dropped (gray) chunks inside c3
+  \foreach \kept [count=\col from 0] in {1,0,0,1,0,1,0,0} {
+    \ifnum\kept=1 \def\cellstyle{vzaqua}\else \def\cellstyle{gridc}\fi
+    \fill[\cellstyle] ($(c3.south)+(-1.25cm+\col*3.2mm, 2.2mm)$) rectangle ++(2.6mm,2.4mm);
+  }
+  \node[cost, below=2mm of c4] (ccost) {một lượt encoder cho mỗi tài liệu};
+  \draw[arr] (c1) -- (c2);
+  \draw[arr] (c2) -- (c3);
+  \draw[arr] (c3) -- (c4);
+  \draw[arr] (b4.east) -- ++(3.5mm,0) |- (c2.west);   % the trained pruner
+
+  % ---------------- panels (behind) with titles
+  \begin{scope}[on background layer]
+    \node[panel=vzblue, fit=(a1)(a4)(acost)] (pa) {};
+    \node[panel=vzorange, fit=(a1.north -| b1)(b1)(b4)(acost.south -| b1)] (pb) {};
+    \node[panel=vzaqua, fit=(a1.north -| c1)(c1)(c4)(ccost)(acost.south -| c1)] (pc) {};
+  \end{scope}
+  \node[ptitle, above=0.5mm of pa.north] {A. Đo mức đóng góp (ngoại tuyến)};
+  \node[ptitle, above=0.5mm of pb.north] {B. Chưng cất vào bộ tỉa};
+  \node[ptitle, above=0.5mm of pc.north] {C. Suy luận};
+\end{tikzpicture}

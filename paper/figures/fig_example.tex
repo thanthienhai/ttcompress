@@ -1,0 +1,44 @@
+% Figure 2: why answer-span labels and relevance are proxies (illustrative values, not measurements).
+% Emphasis form: the utility column is the point (blue), the two proxies are context (gray / marks).
+\begin{tikzpicture}[
+    font=\scriptsize,
+    para/.style={anchor=north west, text width=3.05cm, align=left, inner sep=0pt, text=inkP},
+    head/.style={font=\scriptsize\bfseries, text=inkS, align=center, anchor=south},
+  ]
+  \def\rowh{9.5mm}
+  \def\barh{2.4mm}
+  \def\barmax{1.05cm}
+  % column x positions
+  \def\xspan{3.75cm}
+  \def\xrel{4.35cm}
+  \def\xbeta{5.95cm}
+
+  \node[anchor=south west, text width=7.3cm, align=left, inner sep=0pt, font=\footnotesize, text=inkP]
+    at (0, 0.8cm) {\textbf{Câu hỏi:} Đạo diễn của phim \emph{Mùi đu đủ xanh} sinh năm nào?\quad
+    \textbf{Đáp án:} 1962};
+  \node[head] at (\xspan, 0.05cm) {Chứa\\ đáp án};
+  \node[head] at ($(\xrel,0.05cm)+(0.5*\barmax,0)$) {Độ liên quan\\ (reranker)};
+  \node[head] at ($(\xbeta,0.05cm)+(0.5*\barmax,0)$) {Mức đóng góp\\ $\beta$ (của chúng tôi)};
+  \draw[axisc, line width=0.4pt] (0,0) -- (7.3cm,0);
+
+  % rows: text / contains answer / relevance / beta
+  \foreach \i/\txt/\hasans/\rel/\bval in {
+      1/{\textbf{P1} (cầu nối). \emph{Mùi đu đủ xanh} (1993) là phim của đạo diễn Trần Anh Hùng.}/0/0.85/0.90,
+      2/{\textbf{P2}. Trần Anh Hùng sinh năm 1962, là đạo diễn người Pháp gốc Việt.}/1/0.40/0.95,
+      3/{\textbf{P3}. \emph{Mùi đu đủ xanh} đoạt giải Caméra d'Or tại Cannes năm 1993.}/0/0.90/0.05,
+      4/{\textbf{P4}. Đà Lạt là thành phố thuộc tỉnh Lâm Đồng.}/0/0.05/0.02} {
+    \pgfmathsetlengthmacro{\ytop}{-1.5mm-(\i-1)*\rowh}
+    \pgfmathsetlengthmacro{\ymid}{\ytop-3.2mm}
+    \node[para] at (0, \ytop) {\txt};
+    \ifnum\hasans=1
+      \node[text=inkP, font=\small] at (\xspan, \ymid) {\checkmark};
+    \else
+      \node[text=inkM] at (\xspan, \ymid) {--};
+    \fi
+    % baselines, then bars (square at the baseline, rounded data end)
+    \draw[axisc, line width=0.4pt] (\xrel, \ymid-2mm) -- (\xrel, \ymid+2mm);
+    \draw[axisc, line width=0.4pt] (\xbeta, \ymid-2mm) -- (\xbeta, \ymid+2mm);
+    \fill[inkM, rounded corners=0.7pt] (\xrel, \ymid-0.5*\barh) rectangle ++(\rel*\barmax, \barh);
+    \fill[vzblue, rounded corners=0.7pt] (\xbeta, \ymid-0.5*\barh) rectangle ++(\bval*\barmax, \barh);
+  }
+\end{tikzpicture}

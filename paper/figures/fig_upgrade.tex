@@ -1,0 +1,26 @@
+% Figure 3: upgrade retention (eq. ur) as a dumbbell per compressor; illustrative values.
+% One hue, two shades (weak = light, strong = dark), validated as an ordinal pair on white.
+\begin{tikzpicture}[font=\scriptsize, x=9.3cm, y=1cm]
+  \def\xmin{0.30}
+  \def\xmax{0.75}
+  \def\lab{-0.215}   % left edge of the row labels, in x units relative to \xmin
+  % recessive vertical grid + tick labels
+  \foreach \t in {0.3,0.4,0.5,0.6,0.7} {
+    \draw[gridc, line width=0.4pt] (\t-\xmin, -2.45) -- (\t-\xmin, 0.35);
+    \node[text=inkM, anchor=north] at (\t-\xmin, -2.45) {\t};
+  }
+  \node[text=inkS, anchor=north] at (0.5*\xmax-0.5*\xmin, -2.75) {F1};
+  % rows: label / weak / strong / retention
+  \foreach \y/\name/\w/\s/\ur in {0/Toàn ngữ cảnh/0.40/0.70/1, -1/Bộ nén A/0.37/0.64/0.9, -2/Bộ nén B/0.35/0.41/0.2} {
+    \node[anchor=east, text=inkP] at (-0.012, \y) {\name};
+    \draw[axisc, line width=1.4pt, line cap=round] (\w-\xmin, \y) -- (\s-\xmin, \y);
+    \fill[vzblueL, draw=white, line width=0.8pt] (\w-\xmin, \y) circle (1.35mm);
+    \fill[vzblueD, draw=white, line width=0.8pt] (\s-\xmin, \y) circle (1.35mm);
+    \node[anchor=west, text=inkS] at (\xmax-\xmin+0.012, \y) {$\mathrm{UR}=\ur$};
+  }
+  % legend
+  \fill[vzblueL] (0.02, 0.6) circle (1.1mm);
+  \node[anchor=west, text=inkS] at (0.032, 0.6) {reader yếu $W$};
+  \fill[vzblueD] (0.27, 0.6) circle (1.1mm);
+  \node[anchor=west, text=inkS] at (0.282, 0.6) {reader mạnh $S$};
+\end{tikzpicture}
