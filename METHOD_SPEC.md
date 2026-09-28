@@ -24,50 +24,57 @@
 
 ## 1. Research questions and hypotheses
 
+Three research questions, one hypothesis each. Vietnamese is an evaluation dimension (every result is per
+source, three of the five sources are Vietnamese), not a research question of its own.
+
 - **RQ1 (amortization).** A pruner distilled from F1-utility attribution keeps downstream F1 at fixed token
   budgets (1/4, 1/8) while costing one encoder pass instead of K≈64 reader calls.
-  *H1:* `ours_beta` beats `bm25`, `embed`, `reranker` (its untrained backbone), `lead`, `random` at both ratios on every source (paired Δ F1 > 0,
-  CI excludes 0), and gets within a small margin of `oracle_beta`.
+  *H1:* `ours_beta` beats every non-oracle compressor — `bm25`, `embed`, `reranker` (its untrained backbone),
+  `lead`, `random` and every published compressor that was run — at both ratios on every source, and stays
+  within 0.05 F1 of `oracle_beta` (the unamortized attribution).
 - **RQ2 (survival test).** Utility labels beat answer-span supervision.
-  *H2a:* on multi-hop (VIMQA, HotpotQA, 2Wiki), `ours_beta` > `span_sup` and > `oracle_span` (the answer-span
-  oracle misses bridge paragraphs). *H2b:* on single-hop, `ours_beta` ≈ `span_sup` is the expected outcome
+  *H2:* on multi-hop (VIMQA, HotpotQA, 2Wiki), `ours_beta` > `span_sup` and > `oracle_span` (the answer-span
+  oracle misses bridge paragraphs); on single-hop, `ours_beta` ≈ `span_sup` is the expected outcome
   (β collapses onto the needle — measured directly by `gold_recall_at_g` in Stage A summaries); a win there
   is a bonus, not a requirement.
-  **Decision rule (from the proposal):** if H2a fails, move the paper's weight to RQ3.
-- **RQ3 (reader-agnostic).** *H3a:* labels from different readers agree (cross-reader Spearman of β in
-  `ensemble/summary.json`) but not perfectly. *H3b:* `ours_ens` (ensemble labels) retains more of the
-  weak→strong reader upgrade than `ours_beta` (single reader), including for the **held-out** reader
-  (Qwen3-32B by default) that produced no labels. Upgrade retention per arXiv 2606.21807.
-- **RQ4 (multilingual / Vietnamese).** *H4:* on Vietnamese (syllable-level token F1) `ours_*` beats
-  XProvence zero-shot and LLMLingua-2 at matched budgets. If XProvence is already strong, the contribution
-  shifts to the benchmark + cross-reader analysis (proposal §Recommendation).
+  **Decision rule (from the proposal):** if the multi-hop part fails, move the paper's weight to RQ3.
+- **RQ3 (reader-agnostic).** *H3:* `ours_ens` (ensemble labels) retains more of the weak→strong reader
+  upgrade than `ours_beta` (single reader), including for the **held-out** reader (Qwen3-32B by default)
+  that produced no labels. Upgrade retention per arXiv 2606.21807. Cross-reader agreement of β (Spearman in
+  `ensemble/summary.json`) is reported descriptively.
+
+On the Vietnamese sources the comparison with XProvence and LLMLingua-2 is part of H1. If XProvence is
+already strong there, the contribution shifts to the benchmark + cross-reader analysis (proposal
+§Recommendation).
 
 Everything is reported **per source** (never pooled across sources or languages): the previous run showed a
 sign flip between pools.
 
-**Confirmatory tests** (`evaluate.py report`, "Hypotheses" section; fixed before the full run). Each
-hypothesis is its own family of one-sided paired cluster-bootstrap tests on the primary (label) reader,
-Holm-corrected within the family at α = 0.05; the full paired table is exploratory.
+**Confirmatory tests** (`evaluate.py report`, "Hypotheses" section; fixed before the full run). Each row is
+its own family of one-sided paired cluster-bootstrap tests on the primary (label) reader, Holm-corrected
+within the family at α = 0.05; the full paired table is exploratory.
 
-| family | test | per source × ratio |
-|---|---|---|
-| H1 | superiority, `ours_beta` − {`bm25`, `embed`, `reranker`, `lead`, `random`} > 0 | all sources |
-| H1-oracle | non-inferiority, `ours_beta` − `oracle_beta` > −0.05 (`ORACLE_MARGIN`), on the `ORACLE_N` labeled test docs | all sources |
-| H2a | superiority vs `span_sup`, `oracle_span` | multi-hop |
-| H2b | equivalence (TOST) vs `span_sup`, margin ±0.02 (`EQUIV_MARGIN`) | single-hop |
-| H3b / H3b-heldout | superiority of retention(`ours_ens`) − retention(`ours_beta`), same docs, reader pairs with full-context gap ≥ 0.05 (`MIN_UPGRADE_GAP`); pairs with the held-out reader are a separate family | all sources |
-| H4 | superiority of `ours_beta`, `ours_ens` vs `xprovence`, `llmlingua2` | Vietnamese sources |
+| hypothesis | family | test | per source × ratio |
+|---|---|---|---|
+| H1 | H1 | superiority, `ours_beta` − Y > 0 for Y in {`bm25`, `embed`, `reranker`, `lead`, `random`} and every published compressor that was run (`provence`, `xprovence`, `recomp`, `exit`, `llmlingua`, `longllmlingua`, `llmlingua2`) | all sources |
+| H1 | H1-oracle | non-inferiority, `ours_beta` − `oracle_beta` > −0.05 (`ORACLE_MARGIN`), on the `ORACLE_N` labeled test docs | all sources |
+| H2 | H2a | superiority vs `span_sup`, `oracle_span` | multi-hop |
+| H2 | H2b | equivalence (TOST) vs `span_sup`, margin ±0.02 (`EQUIV_MARGIN`) | single-hop |
+| H3 | H3 / H3-heldout | superiority of retention(`ours_ens`) − retention(`ours_beta`), same docs, reader pairs with full-context gap ≥ 0.05 (`MIN_UPGRADE_GAP`); pairs with the held-out reader are a separate family | all sources |
+
+H1's cheap baselines and published compressors are one family on purpose: they are the same claim ("beats
+every non-oracle compressor"), and Holm over all of them together is the stricter test.
 
 `reranker` is in H1 because it is the pruner's own backbone: beating it is what shows the attribution labels
 add something. A test whose two arms differ by > 10% in realized tokens is flagged `budget ≠` (text arms
-compress to a rate, not a hard budget). H3a is descriptive (`cross_reader_spearman`); RQ1's cost claim is
+compress to a rate, not a hard budget). RQ1's cost claim is
 the "Cost" table (label reader calls and seconds per document vs selection ms per document).
 
 ## 2. Data (`ttcompress/sources.py`)
 
 | source | lang | hop | chunks | train | dev / test |
 |---|---|---|---|---|---|
-| `uit_viquad` | vi | single | needle paragraph + distractor paragraphs to 30k chars, needle depth uniform | official train | official validation hashed **by title** 50/50 |
+| `uit_viquad` | vi | single | needle paragraph + distractor paragraphs to 30k chars, needle depth uniform | official train minus the dev titles | dev = 10% of the official **train** titles (hashed by title); test = the whole official validation (19 articles). v1 split the 19 validation titles 11/8, leaving an 8-article test set |
 | `xquad_vi` | vi | single | same construction | — (eval only) | hashed **by passage** 20/80 |
 | `vimqa` | vi | multi | 10 titled paragraphs (native) | official train | official validation / test |
 | `hotpotqa` | en | multi | 10 titled paragraphs (distractor setting) | official train | official validation hashed by id 50/50 |
@@ -86,7 +93,10 @@ agreement for the full release).
 For each (document, reader): K masks, each chunk kept i.i.d. with p ∈ {0.5, 0.25} (cycled),
 K = clamp(⌈C+1⌉, 64, 256); masks are seeded by the document id, so **every reader sees identical masks**.
 The reader answers each masked context (plus the full context, stored as `full_f1`); outcomes are token F1
-(the method) and the teacher-forced answer log-prob (ablation). Ridge regression (intercept unpenalized,
+(the method) and, for the primary reader's train/dev labels only, the teacher-forced answer log-prob
+(ablation; timed apart as `seconds_logprob`, so the cost table's `seconds` is the F1 labels' cost). Answer
+budgets: 64 new tokens single-hop, 48 multi-hop. `measure_config.json` records every setting that changes a
+record (masks, outcomes, budgets, prompt version, data version, backend) and a resumed run must match it. Ridge regression (intercept unpenalized,
 one global α chosen by 5-fold CV MSE on **dev** measurements) gives β; the pseudo-label is the
 within-document z-score of β.
 
@@ -116,8 +126,26 @@ Budget = ⌈full_tokens / ratio⌉ in a fixed reference tokenizer; every chunk a
 chunks that fit, in original order. Arms: `full`, `lead`, `random`, `bm25`, `embed` (bge-m3),
 `reranker` (bge-reranker-v2-m3 zero-shot: the pruner's backbone before attribution training),
 `oracle_span`, `oracle_support`, `oracle_beta` (upper bound: Stage A labels of the first `ORACLE_N`=100 test
-documents per source, primary reader; `ORACLE_N=0` disables it), `pruner:<ckpt>` (any number),
-`provence:<hf id>` (Provence / XProvence as budget-matched rerankers), `llmlingua2`.
+documents per source, primary reader; `ORACLE_N=0` disables it), `pruner:<ckpt>` (any number).
+Published compressors (`EXTRA_ARMS`), all held to the same budget:
+
+| arm | method | unit | notes |
+|---|---|---|---|
+| `provence:<hf id>` | Provence (EN) / XProvence (multilingual) | chunk | reranking score of the released model |
+| `recomp` | RECOMP extractive | sentence | NQ checkpoint for single-hop, HotpotQA for multi-hop; dot product, mean pooling |
+| `exit` | EXIT | sentence | Gemma-2B-it + released LoRA, P(Yes) given query + containing paragraph; bf16 |
+| `llmlingua` | LLMLingua | token | `llmlingua` 0.2.2, small LM Qwen2.5-7B-Instruct (multilingual) |
+| `longllmlingua` | LongLLMLingua | token | same LM, README settings (question-aware ranking, `reorder_context=sort`) |
+| `llmlingua2` | LLMLingua-2 | token | XLM-R large, MeetingBank |
+
+Sentence arms rank sentences by their score and keep them greedily under the budget (a chunk's title is
+kept once per touched chunk); the papers' own cut-offs (top-1/2 sentences, P(Yes) ≥ 0.5) are replaced by the
+shared budget. Text arms compress to a rate and are tightened / cut to the budget. EXIT, RECOMP and Provence
+are English models: on Vietnamese they are zero-shot. `llmlingua`/`longllmlingua` need transformers ≤ 4.47.1
+(microsoft/LLMLingua#210): `run_pipeline.sh` installs transformers 4.46.3 + llmlingua into `LLMLINGUA_SITE`
+and runs these two arms in a second select pass with it on PYTHONPATH (the pass reuses the written
+documents, so it never imports `datasets`). Not included: RECOMP abstractive, CompAct (abstractive, output
+length not controllable), CORE-RAG (no released checkpoint), Selective Context (English/Chinese only).
 Selections are computed once and answered by every reader (fixed compressor ⇒ upgrade retention is
 meaningful).
 
@@ -136,7 +164,7 @@ gold recall by needle-depth quintile for single-hop.
 | position adjustment | `pruner_beta_primary_posadj`; `position_r2`; depth slices |
 | 1 reader vs ensemble | `ours_beta` vs `ours_ens`, incl. held-out reader |
 | single- vs multi-hop | per-source tables |
-| hard vs easy distractors | `DISTRACTORS=hard` / `MULTIHOP_PAD_CHARS=<n>` (label and eval time, own suffixed dirs); `scripts/compare_runs.py` |
+| hard vs easy distractors | `DISTRACTORS=hard` / `MULTIHOP_PAD_CHARS=<n>` (label and eval time, own suffixed dirs; only the sources an ablation changes are re-measured, the others' raw labels are read from the main run); `scripts/compare_runs.py`. `xquad_vi` has no titles, so `hard` equals `random` there |
 | training seed | `EXTRA_SEEDS` (default 1 2): `ours_beta_s<k>`, `ours_ens_s<k>`; per-hypothesis "every seed agrees" count, seed SD table |
 | label cost | `seconds` per record, reader calls = Σ(K+1) |
 
@@ -154,8 +182,11 @@ five runs + 2 × `EXTRA_SEEDS` seed reruns (nine by default), one GPU each, a fe
   tokens, so `select` tightens the rate and finally cuts the tail to the budget, flagged `truncated`);
   `run_pipeline.sh` installs their packages on demand. Not executed locally.
 - vLLM backend (`VLLMReader`) not executed locally (no GPU); HF backend is tested (batched ≡ sequential).
-- Baselines not implemented: RECOMP, EXIT, LongLLMLingua, CORE-RAG, ContextCite-at-inference (the
-  "unamortized" reference: `oracle_beta` on test documents is its budget-matched equivalent, at K reader
-  calls per document).
+- `recomp`, `exit`, `llmlingua`, `longllmlingua`: checked locally on CPU (real RECOMP checkpoint under
+  transformers 5; llmlingua arms with a tiny Qwen2 LM through the pinned site dir, 5.6k-token document);
+  the Gemma-2B EXIT checkpoint (gated) and GPU speed are not checked.
+- Not implemented: CORE-RAG (no checkpoint), CompAct / RECOMP abstractive (no length control),
+  ContextCite-at-inference (the "unamortized" reference: `oracle_beta` on test documents is its
+  budget-matched equivalent, at K reader calls per document).
 - Novelty re-check right before submission (keywords from the proposal: "F1 surrogate pseudo-label
   pruner", "amortized attribution compression").

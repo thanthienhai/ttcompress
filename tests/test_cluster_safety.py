@@ -78,3 +78,66 @@ def test_select_refuses_a_different_document_set_in_one_out_dir(tmp_path):
                           '--n', '1', '--arms', 'lead', '--budget-tokenizer', TINY_CAUSAL_LM,
                           '--out-dir', str(tmp_path)], capture_output=True, env=ENV, text=True, encoding='utf-8')
     assert res.returncode != 0 and 'use a new --out-dir' in res.stderr
+
+
+def test_append_after_a_torn_line_repairs_the_file(tmp_path):
+    from evaluate import _append_jsonl
+    p = tmp_path / 'x.jsonl'
+    p.write_text('{"a": 1}\n{"a": 2}\n{"a": ', encoding='utf-8')     # killed mid-append
+    _append_jsonl(str(p), [{'a': 3}])
+    assert _read_jsonl(str(p)) == [{'a': 1}, {'a': 2}, {'a': 3}]  # no glued line, no crash on the next read
+    _append_jsonl(str(p), [{'a': 4}])
+    assert [r['a'] for r in _read_jsonl(str(p))] == [1, 2, 3, 4]
+
+
+def _select_args(out_dir, arms, ratios):
+    import argparse
+    return argparse.Namespace(split='test', budget_tokenizer=TINY_CAUSAL_LM, sources='hotpotqa', n=1, num_shards=1,
+                              shard=0, haystack_chars=30000, distractors='random', multihop_pad_chars=0, arms=arms,
+                              ratios=ratios, oracle_beta_dir=None, device='cpu', out_dir=str(out_dir), flush_every=25,
+                              retry_failed=False)
+
+
+def _written_select_dir(tmp_path):
+    """A select dir whose documents were already written (select reuses them: no dataset download)."""
+    doc = make_doc(['Paris is in France.', 'Berlin is in Germany.', 'Rome is in Italy.'], doc_id='d0',
+                   source='hotpotqa', hop='multi')
+    meta = {'split': 'test', 'budget_tokenizer': TINY_CAUSAL_LM, 'sources': 'hotpotqa', 'n': 1, 'num_shards': 1,
+            'haystack_chars': 30000, 'distractors': 'random', 'multihop_pad_chars': 0}
+    (tmp_path / 'select_config.json').write_text(json.dumps(meta), encoding='utf-8')
+    (tmp_path / 'documents_shard0.jsonl').write_text(json.dumps(doc.to_dict()) + '\n', encoding='utf-8')
+
+
+def test_reselect_with_an_extra_ratio_adds_only_the_missing_rows(tmp_path):
+    os.environ.setdefault('HF_HUB_OFFLINE', '1')
+    from evaluate import cmd_select
+    _written_select_dir(tmp_path)
+    cmd_select(_select_args(tmp_path, 'lead', '4'))
+    cmd_select(_select_args(tmp_path, 'lead', '4,8'))
+    keys = [(r['doc_id'], r['arm'], r['ratio']) for r in _read_jsonl(str(tmp_path / 'selections_shard0.jsonl'))]
+    assert sorted(keys) == [('d0', 'lead', 4.0), ('d0', 'lead', 8.0)]
+
+
+def test_a_failing_published_compressor_is_recorded_not_fatal(tmp_path, monkeypatch):
+    os.environ.setdefault('HF_HUB_OFFLINE', '1')
+    import evaluate
+    from ttcompress.selection import Arm
+
+    class Broken:
+        def compress(self, doc, ratio):
+            raise RuntimeError('compressor exploded')
+
+    real = evaluate.make_arm
+    monkeypatch.setattr(evaluate, 'make_arm', lambda spec, *a: Arm(spec, 'text', text_compressor=Broken())
+                        if spec == 'llmlingua2' else real(spec, *a))
+    _written_select_dir(tmp_path)
+    evaluate.cmd_select(_select_args(tmp_path, 'lead,llmlingua2', '4'))
+    rows = _read_jsonl(str(tmp_path / 'selections_shard0.jsonl'))
+    assert [r['arm'] for r in rows] == ['lead']
+    fails = _read_jsonl(str(tmp_path / 'select_failures_shard0.jsonl'))
+    assert fails[0]['arm'] == 'llmlingua2' and 'exploded' in fails[0]['error']
+    evaluate.cmd_select(_select_args(tmp_path, 'lead,llmlingua2', '4'))      # resume: not retried by default
+    assert len(_read_jsonl(str(tmp_path / 'select_failures_shard0.jsonl'))) == 1
+    with pytest.raises(RuntimeError):                                        # our own arms still fail loudly
+        monkeypatch.setattr(evaluate, 'make_arm', lambda spec, *a: Arm(spec, 'text', text_compressor=Broken()))
+        evaluate.cmd_select(_select_args(tmp_path, 'mine=lead', '8'))

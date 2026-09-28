@@ -23,12 +23,14 @@ import os
 import sys
 
 # display order; arms absent from the report are skipped
-ARM_ORDER = ['lead', 'random', 'bm25', 'embed', 'reranker', 'xprovence', 'llmlingua2', 'span_sup',
-             'abl_logprob', 'abl_posadj', 'ours_beta', 'ours_ens']
+ARM_ORDER = ['lead', 'random', 'bm25', 'embed', 'reranker', 'provence', 'xprovence', 'recomp', 'exit', 'llmlingua',
+             'longllmlingua', 'llmlingua2', 'span_sup', 'abl_logprob', 'abl_posadj', 'ours_beta', 'ours_ens']
 REFERENCE_ARMS = ['full', 'oracle_span', 'oracle_support', 'oracle_beta']   # upper bounds, never bolded
 TEX_NAME = {'ours_beta': r'\textsc{Ours}-$\beta$', 'ours_ens': r'\textsc{Ours}-ens', 'span_sup': 'span-sup',
             'abl_logprob': r'abl.\ log-prob', 'abl_posadj': r'abl.\ pos-adj', 'llmlingua2': 'LLMLingua-2',
-            'xprovence': 'XProvence', 'bm25': 'BM25', 'embed': 'bge-m3', 'reranker': 'bge-reranker',
+            'xprovence': 'XProvence', 'provence': 'Provence', 'recomp': 'RECOMP', 'exit': 'EXIT',
+            'llmlingua': 'LLMLingua', 'longllmlingua': 'LongLLMLingua', 'bm25': 'BM25', 'embed': 'bge-m3',
+            'reranker': 'bge-reranker',
             'oracle_span': r'oracle$_\text{span}$', 'oracle_support': r'oracle$_\text{support}$',
             'oracle_beta': r'oracle$_\beta$'}
 

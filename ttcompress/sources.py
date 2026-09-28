@@ -3,9 +3,11 @@
 Sources (all public, pulled from the HuggingFace hub at runtime):
 
   single-hop, Vietnamese, synthetic haystack (needle paragraph + distractor paragraphs):
-    uit_viquad   taidng/UIT-ViQuAD2.0      train = official train; dev/test = official
-                                           validation hashed BY TITLE (the official test
-                                           split ships no answers)
+    uit_viquad   taidng/UIT-ViQuAD2.0      test = the whole official validation (19 articles;
+                                           the official test ships no answers); dev = 10% of
+                                           the official train articles hashed BY TITLE, the
+                                           rest is train. (v1 split the 19 validation titles
+                                           11/8 into dev/test: an 8-article test set.)
     xquad_vi     xquad / xquad.vi          no train (eval-only in the literature);
                                            dev/test hashed BY CONTEXT
   multi-hop, native distractor setting (10 titled paragraphs, 2+ supporting):
@@ -50,6 +52,14 @@ AVAILABLE_SPLITS['xquad_vi'] = ('dev', 'test')
 YES_NO_ANSWERS = {'yes', 'no', 'đúng', 'không', 'sai', 'có'}
 DEFAULT_HAYSTACK_CHARS = 30000
 SPLIT_SALT = 'ttcompress-split-v1'
+UIT_DEV_FRACTION = 0.1
+# Bumped when a source's documents change for the same (split, n); generate_labels.py measure records it and
+# refuses a label dir measured on another version (fit picks records by key, so stale ones would leak in).
+DATA_VERSION = {'uit_viquad': 2}
+
+
+def data_version(source: str) -> int:
+    return DATA_VERSION.get(source, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +183,7 @@ def _squad_rows_to_docs(rows: List[dict], chosen: List[dict], source: str, split
 
 def _uit_rows(split: str) -> List[dict]:
     from datasets import load_dataset
-    official = 'train' if split == 'train' else 'validation'
+    official = 'validation' if split == 'test' else 'train'
     rows = []
     for row in load_dataset('taidng/UIT-ViQuAD2.0', split=official):
         if row['is_impossible'] or not row['answers'] or not row['answers']['text']:
@@ -181,7 +191,7 @@ def _uit_rows(split: str) -> List[dict]:
         answers = list(dict.fromkeys(t for t in row['answers']['text'] if t.strip()))
         if not answers or is_yes_no(answers[0]):
             continue
-        if split != 'train' and dev_or_test(f"uit:{row['title']}", 0.5) != split:
+        if split != 'test' and (hash_unit(f"uit-dev:{row['title']}") < UIT_DEV_FRACTION) != (split == 'dev'):
             continue
         rows.append({'id': row['id'], 'title': row['title'], 'context': row['context'],
                      'question': row['question'], 'answers': answers, 'cluster': f"uit:{row['title']}"})
@@ -299,6 +309,9 @@ def load_documents(
         raise ValueError(f"{source} has no {split!r} split (available: {AVAILABLE_SPLITS[source]})")
 
     if source in ('uit_viquad', 'xquad_vi'):
+        if distractors == 'hard' and source == 'xquad_vi':
+            # XQuAD ships no titles: there is no "same article" pool, so hard == random here (METHOD_SPEC §6)
+            print("[WARN] xquad_vi has no article titles: --distractors hard falls back to random distractors")
         rows = _uit_rows(split) if source == 'uit_viquad' else _xquad_vi_rows(split)
         chosen = take_n(rows, n, key=lambda r: r['id'])
         return _squad_rows_to_docs(rows, chosen, source, split, haystack_chars, distractors)

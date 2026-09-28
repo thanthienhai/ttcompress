@@ -126,3 +126,72 @@ def test_oracle_beta_reads_several_label_dirs(tmp_path):
         dirs.append(str(d))
     table = load_beta_table(','.join(dirs))
     assert table == {'uit_viquad-1': [0.1, 0.9], 'hotpotqa-1': [0.7, 0.2]}
+
+
+# --- sentence arms (RECOMP / EXIT) ------------------------------------------
+
+def test_split_sentences_and_titled_units():
+    from ttcompress.selection import sentence_units, split_sentences
+    assert split_sentences('Hà Nội là thủ đô. Nó ở miền Bắc! Đúng không?\nDòng mới') == \
+        ['Hà Nội là thủ đô.', 'Nó ở miền Bắc!', 'Đúng không?', 'Dòng mới']
+    doc = make_doc(['Paris\nParis is in France. It is big.', 'Berlin\nBerlin is in Germany.'], hop='multi')
+    units = sentence_units(doc)
+    assert [(u.chunk, u.text) for u in units] == \
+        [(0, 'Paris is in France.'), (0, 'It is big.'), (1, 'Berlin is in Germany.')]
+    # single-hop chunks have no title line: a newline there is just a sentence break
+    assert [u.text for u in sentence_units(make_doc(['a b.\nc d.']))] == ['a b.', 'c d.']
+
+
+def test_select_sentences_keeps_titles_order_and_budget(fake_tokenizer):
+    from ttcompress.selection import select_sentences, sentence_units
+    count = lambda t: len(fake_tokenizer.encode(t))  # noqa: E731
+    doc = make_doc(['Paris\nParis is in France. It is big.', 'Berlin\nBerlin is in Germany.'], hop='multi')
+    units = sentence_units(doc)
+    # best sentence is the Berlin one, then 'It is big.'; budget 8 words fits Berlin (1 title + 4) + nothing else
+    sel = select_sentences(doc, units, [0.1, 0.5, 0.9], count, budget=8, tokenizer=fake_tokenizer)
+    assert sel.text == 'Berlin\nBerlin is in Germany.' and sel.kept == [1] and sel.kept_tokens == 5
+    sel = select_sentences(doc, units, [0.1, 0.5, 0.9], count, budget=9, tokenizer=fake_tokenizer)
+    assert sel.text == 'Paris\nIt is big.\n\nBerlin\nBerlin is in Germany.' and sel.kept == [0, 1]
+    assert sel.kept_tokens <= 9 and not sel.truncated
+    tiny = select_sentences(doc, units, [0.1, 0.5, 0.9], count, budget=2, tokenizer=fake_tokenizer)
+    assert tiny.truncated and tiny.kept_tokens == 2 and tiny.kept == [1]
+
+
+def test_recomp_arm_scores_every_sentence():
+    import os
+    os.environ.setdefault('HF_HUB_OFFLINE', '1')
+    arm = make_arm(f'recomp:{TINY_ENCODER}', device='cpu')
+    doc = make_doc(['Paris\nParis is in France. It is big.', 'Berlin\nBerlin is in Germany.'], hop='multi')
+    units, scores = arm.sentence_scores(doc)
+    assert arm.kind == 'sentence' and len(units) == len(scores) == 3
+    assert all(isinstance(s, float) for s in scores)
+
+
+def test_exit_scores_are_probabilities_independent_of_batching():
+    import os
+
+    import pytest
+    from huggingface_hub import try_to_load_from_cache
+    os.environ.setdefault('HF_HUB_OFFLINE', '1')
+    from tests.conftest import TINY_CAUSAL_LM
+    from ttcompress.selection import ExitScorer, sentence_units
+    if not isinstance(try_to_load_from_cache(TINY_CAUSAL_LM, 'config.json'), str):
+        pytest.skip(f'{TINY_CAUSAL_LM} not in the HF cache (preflight runs offline)')
+    scorer = ExitScorer(adapter=None, base=TINY_CAUSAL_LM, device='cpu', batch_size=3)
+    doc = make_doc(['Paris\nParis is in France. It is a very big and old city.', 'Berlin\nBerlin is in Germany.'],
+                   question='Where is Paris?', hop='multi')
+    units = sentence_units(doc)
+    batched = scorer.score_sentences(doc, units)
+    scorer.batch_size = 1
+    single = scorer.score_sentences(doc, units)
+    assert all(0.0 <= s <= 1.0 for s in batched)
+    assert np.allclose(batched, single, atol=1e-4)   # left padding must not change a prompt's score
+
+
+def test_llmlingua_arms_refuse_a_transformers_they_break_on(monkeypatch):
+    import pytest
+    import transformers
+    monkeypatch.setattr(transformers, '__version__', '4.48.0')
+    for spec in ('llmlingua', 'longllmlingua:some/lm'):
+        with pytest.raises(RuntimeError, match='transformers<=4.47.1'):
+            make_arm(spec, device='cpu')

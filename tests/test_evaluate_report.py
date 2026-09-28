@@ -51,7 +51,7 @@ def _hrow(reader, arm, ratio, doc, f1, source, kept=200):
             'cluster_id': f'{source}-c{doc // 2}', 'needle_relpos': 0.5 if hop == 'single' else None,
             'num_chunks': 10, 'full_tokens': 800, 'kept_tokens': 800 if ratio == 'full' else kept, 'budget': 200,
             'gold_recall': 1.0, 'seconds': 0.01, 'reader': reader, 'answer': '', 'em': 0.0, 'f1': f1,
-            'answer_recall': f1}
+            'answer_recall': f1, 'n_gold': (1 if doc % 3 == 0 else 2) if hop == 'multi' else 1}
 
 
 def test_report_hypothesis_families(tmp_path):
@@ -82,17 +82,22 @@ def test_report_hypothesis_families(tmp_path):
     report = json.loads((tmp_path / 'report.json').read_text(encoding='utf-8'))
     fam = {f['name']: f for f in report['hypotheses']}
 
-    assert fam['H1']['n_tests'] == 2 and fam['H1']['n_supported'] == 2          # vs bm25, 2 sources
+    # one family over cheap baselines and published compressors, only arms that were run (bm25, llmlingua2)
+    assert {t['vs'] for t in fam['H1']['tests']} == {'bm25', 'llmlingua2'}
+    assert fam['H1']['n_tests'] == 4 and fam['H1']['n_supported'] == 4          # 2 arms x 2 sources
+    assert fam['H1']['n_budget_mismatch'] == 2                                  # llmlingua2 overshoots its budget
     assert fam['H1-oracle']['n_supported'] == 2 and all(t['n'] == 20 for t in fam['H1-oracle']['tests'])
     assert [t['source'] for t in fam['H2a']['tests']] == ['hotpotqa'] * 2 and fam['H2a']['n_supported'] == 2
     assert [t['source'] for t in fam['H2b']['tests']] == ['uit_viquad'] and fam['H2b']['n_supported'] == 1
     # weak->strong and weak->heldout, strong->heldout: two sources each; the held-out pairs are their own family
-    assert fam['H3b']['n_tests'] == 2 and fam['H3b']['n_supported'] == 2
-    assert fam['H3b']['tests'][0]['diff'] > 0.4
-    assert fam['H3b-heldout']['n_tests'] == 4
-    h4 = fam['H4']['tests']
-    assert {t['source'] for t in h4} == {'uit_viquad'} and all(t['budget_mismatch'] for t in h4)
-    assert fam['H4']['n_budget_mismatch'] == 2
+    assert fam['H3']['n_tests'] == 2 and fam['H3']['n_supported'] == 2
+    assert fam['H3']['tests'][0]['diff'] > 0.4
+    assert fam['H3-heldout']['n_tests'] == 4
+    assert set(fam) == {'H1', 'H1-oracle', 'H2a', 'H2b', 'H3', 'H3-heldout'}
+    # exploratory slice: multi-hop documents with >= 2 supporting paragraphs (2 of every 3 here)
+    ms = report['h2a_multi_support']
+    assert {(x['source'], x['vs']) for x in ms} == {('hotpotqa', 'span_sup'), ('hotpotqa', 'oracle_span')}
+    assert all(x['n'] == 40 and x['diff'] > 0 for x in ms)
     over = [c for c in report['cells'] if c['arm'] == 'llmlingua2']
     assert all(c['over_budget_rate'] == 1.0 for c in over)
     assert all('stable' in u and 'gap' in u for u in report['upgrade_retention'])
@@ -148,7 +153,7 @@ def test_paper_tables_from_report(tmp_path):
     bold = [float(v) for v in re.findall(r'\\textbf\{([0-9.]+)\}', main)]
     assert len(bold) == 2 and all(59.5 < v < 60.5 for v in bold)  # ours_ens (0.7 - 0.1) is the best compressor
     assert 'oracle' in main
-    assert (paper / 'hypotheses.tex').read_text(encoding='utf-8').count('/') >= 7
+    assert (paper / 'hypotheses.tex').read_text(encoding='utf-8').count('/') >= 6   # supported/n, one per family
     for name in ('cells.csv', 'paired.csv', 'hypotheses.csv', 'retention.csv', 'by_depth.csv', 'retention.tex'):
         assert (paper / name).stat().st_size > 0
 
@@ -199,3 +204,17 @@ def test_compare_runs(tmp_path):
     assert '| random (n) | hard (n) |' in md and '| H1 | 2/2 | 2/2 |' in md
     rows = (out / 'compare.csv').read_text(encoding='utf-8').splitlines()
     assert rows[0].startswith('source,ratio,arm,random_f1') and any(',bm25,' in r for r in rows)
+
+
+def test_paper_figures_from_report(tmp_path):
+    import pytest
+    pytest.importorskip('matplotlib')
+    test_report_hypothesis_families(tmp_path)
+    out = tmp_path / 'figs'
+    res = subprocess.run([sys.executable, 'scripts/paper_figures.py', '--report', str(tmp_path / 'report.json'),
+                          '--primary-reader', 'strong', '--out-dir', str(out)], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    for name in ('pareto', 'retention', 'depth'):          # the synthetic run has single-hop depth bins too
+        assert (out / f'{name}.pdf').stat().st_size > 1000
+    report = json.loads((tmp_path / 'report.json').read_text(encoding='utf-8'))
+    assert report['heldout_readers'] == ['heldout']     # figures star the held-out pairs from the report itself

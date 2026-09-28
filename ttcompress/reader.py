@@ -30,13 +30,25 @@ PROMPTS = {
     'en': ("Answer the question based on the context below. Reply with the short answer only "
            "(a phrase), no explanation.\n\n### Context:\n{context}\n\n### Question:\n{question}\n\n### Answer:"),
 }
-MAX_NEW_TOKENS = {'single': 32, 'multi': 48}
+# single-hop 64: 8.5% of UIT-ViQuAD gold answers exceed 32 Qwen tokens, and a truncated answer caps F1
+MAX_NEW_TOKENS = {'single': 64, 'multi': 48}
+# bumped whenever prompts, answer cleaning or budgets change; generate_labels.py measure records it, so a
+# label dir is never extended with answers produced differently
+PROMPT_VERSION = 2
 _THINK_RE = re.compile(r'<think>.*?</think>', flags=re.DOTALL)
 
 
 def reader_tag(model_name: str) -> str:
     """Filesystem-safe name for a reader, used as a directory level."""
     return model_name.strip('/').replace('/', '--')
+
+
+def dtype_kwargs(torch_dtype) -> dict:
+    """`dtype=` replaced `torch_dtype=` in transformers 4.56; an older version would ignore the new
+    name and silently load an 8B model in fp32."""
+    import transformers
+    major, minor = (int(re.match(r'\d+', x).group()) for x in transformers.__version__.split('.')[:2])
+    return {('dtype' if (major, minor) >= (4, 56) else 'torch_dtype'): torch_dtype}
 
 
 def resolve_device(device: str) -> str:
@@ -96,8 +108,16 @@ class Reader:
             except TypeError:
                 return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         # base model: plain completion prompt; the BOS token is added here because prompts are
-        # tokenized with add_special_tokens=False (chat templates already carry it)
-        return (tok.bos_token or '') + user + ' '
+        # tokenized with add_special_tokens=False (chat templates already carry it). No trailing space: a
+        # Llama-3 tokenizer would end the prompt on a bare ' ' token the model never saw before an answer;
+        # the answer's own leading space belongs to its first token (see answer_target)
+        return (tok.bos_token or '') + user
+
+    def answer_target(self, answer: str) -> List[int]:
+        """Token ids of the gold answer as the model would continue the prompt: a base model writes
+        ' <answer>' after '...Answer:', a chat model starts a fresh assistant turn."""
+        text = answer if self.is_chat else ' ' + answer
+        return self.tokenizer.encode(text, add_special_tokens=False) or [self.tokenizer.eos_token_id]
 
     def count_tokens(self, text: str) -> int:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
@@ -114,7 +134,6 @@ class HFReader(Reader):
     def __init__(self, model_name: str, device: str = 'cuda', dtype: str = 'bfloat16', batch_size: int = 8,
                  max_prompt_tokens: Optional[int] = None):
         import torch
-        import transformers
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.name = model_name
@@ -125,12 +144,8 @@ class HFReader(Reader):
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.device = resolve_device(device)
         torch_dtype = getattr(torch, dtype) if self.device != 'cpu' else torch.float32
-        # `dtype=` replaced `torch_dtype=` in transformers 4.56; an older version would ignore the new
-        # name and silently load an 8B reader in fp32
-        major, minor = (int(re.match(r'\d+', x).group()) for x in transformers.__version__.split('.')[:2])
-        dtype_kw = 'dtype' if (major, minor) >= (4, 56) else 'torch_dtype'
         self.model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True,
-                                                          **{dtype_kw: torch_dtype})
+                                                          **dtype_kwargs(torch_dtype))
         self.model.to(self.device).eval()
 
     def _encode(self, text: str, reserve: int = 0) -> List[int]:
@@ -185,7 +200,7 @@ class HFReader(Reader):
         import torch
         pairs = []
         for p, a in zip(prompts, answers):
-            ans = self.tokenizer.encode(a, add_special_tokens=False) or [self.tokenizer.eos_token_id]
+            ans = self.answer_target(a)
             pairs.append((self._encode(p, reserve=len(ans)), ans))
         order = sorted(range(len(pairs)), key=lambda i: len(pairs[i][0]) + len(pairs[i][1]))
         out: List[float] = [float('nan')] * len(pairs)
@@ -249,7 +264,7 @@ class VLLMReader(Reader):
         params = SamplingParams(temperature=0.0, max_tokens=1, prompt_logprobs=0)
         batch, spans = [], []
         for p, a in zip(prompts, answers):
-            ans = self.tokenizer.encode(a, add_special_tokens=False) or [self.tokenizer.eos_token_id]
+            ans = self.answer_target(a)
             ids = self._fit(p, len(ans) + 1)
             batch.append(TokensPrompt(prompt_token_ids=ids + ans))
             spans.append((len(ids), ans))

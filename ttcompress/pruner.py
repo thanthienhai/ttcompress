@@ -38,13 +38,55 @@ class Window:
     chunk_ids: List[int]       # local slot -> global chunk index
 
 
+def _find(seq: Sequence[int], sub: Sequence[int], start: int = 0) -> int:
+    for i in range(start, len(seq) - len(sub) + 1):
+        if list(seq[i:i + len(sub)]) == list(sub):
+            return i
+    return -1
+
+
+def pair_template(tokenizer):
+    """(head, middle, tail): the special tokens the tokenizer puts around a (query, passage) pair --
+    <s> | </s></s> | </s> for XLM-R / bge-reranker-v2-m3, [CLS] | [SEP] | [SEP] for BERT -- read off an
+    encoded ('a', 'b') pair (build_inputs_with_special_tokens is gone in transformers 5). None if the
+    tokenizer has no pair template."""
+    cached = getattr(tokenizer, '_ttc_pair_template', 0)
+    if cached != 0:
+        return cached
+    tmpl = None
+    try:
+        a = tokenizer.encode('a', add_special_tokens=False)
+        b = tokenizer.encode('b', add_special_tokens=False)
+        pair = list(tokenizer('a', 'b')['input_ids'])
+        ia = _find(pair, a)
+        ib = _find(pair, b, ia + len(a)) if ia >= 0 else -1
+        if ia >= 0 and ib >= 0:
+            tmpl = (pair[:ia], pair[ia + len(a):ib], pair[ib + len(b):])
+    except Exception:  # noqa: BLE001 -- any tokenizer without a pair encoding: single-sequence format
+        tmpl = None
+    try:
+        tokenizer._ttc_pair_template = tmpl
+    except AttributeError:
+        pass
+    return tmpl
+
+
 def pack_windows(tokenizer, question: str, chunks: Sequence[str], max_len: int = 4096,
-                 max_query_tokens: int = 96, max_chunk_tokens: int = 512) -> List[Window]:
+                 max_query_tokens: int = 96, max_chunk_tokens: int = 512, pair_format: bool = True) -> List[Window]:
+    """pair_format: frame each window the way the backbone saw (query, passage) pairs in its cross-encoder
+    training (bge-reranker-v2-m3: <s> q </s></s> chunks </s>, like the reranker baseline's input). False = the
+    pre-2026-09-28 single-sequence frame <s> q </s> chunks </s>, kept for checkpoints trained with it
+    (PrunerScorer reads `pair_format` from pruner_config.json)."""
     cls_id = tokenizer.cls_token_id if tokenizer.cls_token_id is not None else tokenizer.bos_token_id
     sep_id = tokenizer.sep_token_id if tokenizer.sep_token_id is not None else tokenizer.eos_token_id
     q = tokenizer.encode(question, add_special_tokens=False)[:max_query_tokens]
-    prefix = [cls_id] + q + [sep_id]
-    capacity = max_len - len(prefix) - 1  # trailing sep
+    tmpl = pair_template(tokenizer) if pair_format else None
+    if tmpl:
+        head, middle, tail = tmpl
+        prefix, suffix = list(head) + q + list(middle), list(tail)
+    else:
+        prefix, suffix = [cls_id] + q + [sep_id], [sep_id]
+    capacity = max_len - len(prefix) - len(suffix)
     if capacity < 8:
         raise ValueError(f"max_len={max_len} leaves no room for chunks after a {len(prefix)}-token question")
     per_chunk = [tokenizer.encode(c, add_special_tokens=False)[:min(max_chunk_tokens, capacity)] or [sep_id]
@@ -55,7 +97,7 @@ def pack_windows(tokenizer, question: str, chunks: Sequence[str], max_len: int =
 
     def flush():
         if ids:
-            windows.append(Window(prefix + body + [sep_id], [-1] * len(prefix) + slots + [-1], list(ids)))
+            windows.append(Window(prefix + body + suffix, [-1] * len(prefix) + slots + [-1] * len(suffix), list(ids)))
 
     for gi, toks in enumerate(per_chunk):
         if len(body) + len(toks) > capacity:
@@ -188,15 +230,20 @@ class PrunerScorer:
         with open(os.path.join(path, CONFIG_FILE), encoding='utf-8') as f:
             cfg = json.load(f)
         self.max_len = max_len or cfg.get('max_len', 4096)
+        self.pair_format = bool(cfg.get('pair_format', False))   # checkpoints from before the flag: old frame
         self.device = resolve_device(device)
         self.tokenizer = AutoTokenizer.from_pretrained(path)
         self.model = ChunkPruner.from_pretrained(path).to(self.device).eval()
         self.max_len = effective_max_len(self.model.encoder.config, self.max_len)
-        if self.device != 'cpu':
-            self.model.to(getattr(torch, dtype))
+        # fp32 weights + autocast, exactly as train_pruner.py scores dev: casting the whole model to bf16
+        # would give test different numerics (and more near-ties) than the dev metric the epoch was chosen on
+        self.autocast_dtype = getattr(torch, dtype) if self.device != 'cpu' else None
         self.pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
 
     @torch.no_grad()
     def score_chunks(self, question: str, chunks: Sequence[str]) -> List[float]:
-        windows = pack_windows(self.tokenizer, question, chunks, self.max_len)
-        return document_scores(self.model, windows, len(chunks), self.pad_id, self.device).float().cpu().tolist()
+        windows = pack_windows(self.tokenizer, question, chunks, self.max_len, pair_format=self.pair_format)
+        with torch.autocast(device_type='cuda', dtype=self.autocast_dtype or torch.bfloat16,
+                            enabled=self.autocast_dtype is not None):
+            scores = document_scores(self.model, windows, len(chunks), self.pad_id, self.device)
+        return scores.float().cpu().tolist()

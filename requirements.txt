@@ -7,7 +7,12 @@ scipy
 pandas
 pyarrow
 pytest
+# paper figures (scripts/paper_figures.py); 'outside' legend locations need >= 3.7
+matplotlib>=3.7
 # label generation / evaluation at scale (one process per GPU)
 vllm>=0.6 ; platform_system == "Linux"
-# baselines: llmlingua2 arm (EXTRA_ARMS in .env.example); provence: arms load with trust_remote_code
+# baselines (EXTRA_ARMS in .env.example; run_pipeline.sh installs them on demand): llmlingua2 arm; exit arm
+# (LoRA adapter); provence: arms load with trust_remote_code. llmlingua/longllmlingua need transformers<=4.47.1
+# and run from a separate site dir (LLMLINGUA_SITE in run_pipeline.sh).
 llmlingua
+peft

@@ -214,7 +214,8 @@ class MaskOutcomes:
     full_f1: float = float('nan')
     full_logprob: Optional[float] = None
     full_answer: str = ''
-    seconds: float = 0.0
+    seconds: float = 0.0             # F1 labels: the document's share of its batch's generation wall-clock
+    seconds_logprob: float = 0.0     # the log-prob ablation's extra pass, kept apart from `seconds`
 
 
 @dataclass

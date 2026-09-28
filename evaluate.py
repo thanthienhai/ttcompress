@@ -41,10 +41,11 @@ from ttcompress.metrics import (
     upgrade_retention_array,
 )
 from ttcompress.reader import MAX_NEW_TOKENS, load_reader, reader_tag
-from ttcompress.selection import Selection, budget_for, make_arm, select_by_scores
+from ttcompress.selection import Selection, budget_for, make_arm, select_by_scores, select_sentences
 from ttcompress.sources import load_documents, parse_source_list
 
-_PREFIXES = ('pruner:', 'provence:', 'embed:', 'reranker:', 'llmlingua2:')
+_PREFIXES = ('pruner:', 'provence:', 'embed:', 'reranker:', 'llmlingua2:', 'llmlingua:', 'longllmlingua:',
+             'recomp:', 'exit:')
 
 
 def parse_arms(spec: str):
@@ -88,10 +89,41 @@ def _shard_index(path):
     return int(re.search(r'_shard(\d+)\.jsonl$', path).group(1))
 
 
+def _repair_torn_tail(path):
+    """A process killed mid-append leaves a last line without its newline. _read_jsonl drops it, but an
+    append after it would glue the next row onto the fragment: a corrupt line mid-file that every later read
+    refuses. Cut the file back to its last newline before appending."""
+    if not os.path.exists(path):
+        return
+    with open(path, 'rb+') as f:
+        f.seek(0, os.SEEK_END)
+        end = f.tell()
+        if end == 0:
+            return
+        f.seek(end - 1)
+        if f.read(1) == b'\n':
+            return
+        pos = end
+        while pos > 0:
+            step = min(65536, pos)
+            f.seek(pos - step)
+            block = f.read(step)
+            nl = block.rfind(b'\n')
+            if nl >= 0:
+                pos = pos - step + nl + 1
+                break
+            pos -= step
+        f.truncate(pos)
+        print(f"[WARN] {path}: cut a torn last line ({end - pos} bytes) before appending")
+
+
 def _append_jsonl(path, rows):
+    _repair_torn_tail(path)
     with open(path, 'a', encoding='utf-8') as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
+        f.flush()
+        os.fsync(f.fileno())
 
 
 # ---------------------------------------------------------------------------
@@ -114,14 +146,57 @@ def _text_within_budget(arm, doc, ratio, budget, tok, count, attempts=3):
     return tok.decode(ids), True
 
 
+# published compressors (third-party code): a failure on one document is recorded, not fatal
+PUBLISHED_ARMS = ('provence', 'recomp', 'exit', 'llmlingua', 'longllmlingua', 'llmlingua2')
+
+
+def _arm_rows(arm, d, label, ratios, full_tokens, lengths, tok, count):
+    """Selection rows of one document for the given ratios ('full' for the full arm)."""
+    base = {'doc_id': d.doc_id, 'arm': label, 'source': d.source, 'language': d.language, 'hop': d.hop,
+            'cluster_id': d.cluster_id, 'needle_relpos': d.metadata.get('needle_relpos'),
+            'num_chunks': d.num_chunks, 'n_gold': len(d.gold_chunks), 'full_tokens': full_tokens}
+    rows = []
+    if arm.kind == 'full':
+        return [{**base, 'ratio': 'full', 'kept': list(range(d.num_chunks)), 'text': d.text(),
+                 'kept_tokens': full_tokens, 'budget': full_tokens, 'gold_recall': 1.0, 'seconds': 0.0}]
+    if arm.kind == 'text':
+        for r in ratios:
+            t0 = time.time()
+            budget = budget_for(full_tokens, r)
+            text, truncated = _text_within_budget(arm, d, r, budget, tok, count)
+            rows.append({**base, 'ratio': r, 'kept': [], 'text': text, 'kept_tokens': count(text), 'budget': budget,
+                         'truncated': truncated, 'gold_recall': None, 'seconds': time.time() - t0})
+        return rows
+    if arm.kind == 'sentence':
+        t0 = time.time()
+        units, scores = arm.sentence_scores(d)
+        seconds = time.time() - t0
+        for r in ratios:
+            sel = select_sentences(d, units, scores, count, budget_for(full_tokens, r), tok)
+            # `kept` = chunks touched by a kept sentence; a partly kept chunk is not whole evidence,
+            # so gold-chunk recall is not defined for sentence arms (like text arms)
+            rows.append({**base, 'ratio': r, 'kept': sel.kept, 'text': sel.text, 'kept_tokens': sel.kept_tokens,
+                         'budget': sel.budget, 'truncated': sel.truncated, 'gold_recall': None, 'seconds': seconds})
+        return rows
+    t0 = time.time()
+    scores = arm.scores(d)
+    seconds = time.time() - t0
+    if scores is None:  # e.g. oracle_beta without labels for this document
+        return rows
+    for r in ratios:
+        sel: Selection = select_by_scores(d, scores, lengths, budget_for(full_tokens, r), tok)
+        # a chunk cut to the budget is not counted as kept evidence
+        rows.append({**base, 'ratio': r, 'kept': sel.kept, 'text': sel.text, 'kept_tokens': sel.kept_tokens,
+                     'budget': sel.budget, 'truncated': sel.truncated,
+                     'gold_recall': 0.0 if sel.truncated else gold_chunk_recall(sel.kept, d.gold_chunks),
+                     'seconds': seconds})
+    return rows
+
+
 def cmd_select(args):
     from transformers import AutoTokenizer
 
     os.makedirs(args.out_dir, exist_ok=True)
-    docs = []
-    for src in parse_source_list(args.sources):
-        docs.extend(load_documents(src, args.split, args.n, args.haystack_chars, args.distractors,
-                                   args.multihop_pad_chars))
     ratios = [float(r) for r in args.ratios.split(',')]
     # the document set and its shard assignment must be identical across resumed runs,
     # otherwise documents would be duplicated or dropped between shard files
@@ -129,7 +204,8 @@ def cmd_select(args):
             'num_shards': args.num_shards, 'haystack_chars': args.haystack_chars, 'distractors': args.distractors,
             'multihop_pad_chars': args.multihop_pad_chars}
     config_path = os.path.join(args.out_dir, 'select_config.json')
-    if os.path.exists(config_path):
+    matched = os.path.exists(config_path)
+    if matched:
         with open(config_path, encoding='utf-8') as f:
             on_disk = json.load(f)
         if on_disk != meta:
@@ -137,12 +213,21 @@ def cmd_select(args):
                              f"(arms/ratios may change between runs, the document set may not)")
     else:
         _write_json_atomic(config_path, meta)
-    docs = [d for i, d in enumerate(docs) if i % args.num_shards == args.shard]
     doc_path = os.path.join(args.out_dir, f'documents_shard{args.shard}.jsonl')
-    tmp = f'{doc_path}.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        f.writelines(json.dumps(d.to_dict(), ensure_ascii=False) + '\n' for d in docs)
-    os.replace(tmp, doc_path)
+    if matched and os.path.exists(doc_path):
+        # same settings => same documents: reuse the shard written by the first select. This also lets the
+        # llmlingua arms run with an old transformers on PYTHONPATH without importing `datasets`.
+        docs = [QADocument.from_dict(d) for d in _read_jsonl(doc_path)]
+    else:
+        docs = []
+        for src in parse_source_list(args.sources):
+            docs.extend(load_documents(src, args.split, args.n, args.haystack_chars, args.distractors,
+                                       args.multihop_pad_chars))
+        docs = [d for i, d in enumerate(docs) if i % args.num_shards == args.shard]
+        tmp = f'{doc_path}.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.writelines(json.dumps(d.to_dict(), ensure_ascii=False) + '\n' for d in docs)
+        os.replace(tmp, doc_path)
     sel_path = os.path.join(args.out_dir, f'selections_shard{args.shard}.jsonl')
     done = {(r['doc_id'], r['arm'], r['ratio']) for r in _read_jsonl(sel_path)}
 
@@ -152,45 +237,43 @@ def cmd_select(args):
     full_tokens = {d.doc_id: count(d.text()) for d in docs}
     print(f"{len(docs)} documents in shard {args.shard}/{args.num_shards} ({args.split}); {len(done)} selections on disk")
 
+    fail_path = os.path.join(args.out_dir, f'select_failures_shard{args.shard}.jsonl')
+    failed = {(r['doc_id'], r['arm']) for r in _read_jsonl(fail_path)} if not args.retry_failed else set()
     for label, spec in parse_arms(args.arms):
-        wanted = [('full',)] if spec == 'full' else [(r,) for r in ratios]
-        pending = [d for d in docs if any((d.doc_id, label, w[0]) not in done for w in wanted)]
+        wanted = ['full'] if spec == 'full' else ratios
+        # only the missing (doc, ratio) rows: a re-select with an extra ratio must not duplicate the others
+        need = {d.doc_id: [r for r in wanted if (d.doc_id, label, r) not in done] for d in docs}
+        pending = [d for d in docs if need[d.doc_id] and (d.doc_id, label) not in failed]
         if not pending:
             continue
         arm = make_arm(spec, args.device, args.oracle_beta_dir)
-        rows, t_arm = [], time.time()
-        for d in pending:
-            base = {'doc_id': d.doc_id, 'arm': label, 'source': d.source, 'language': d.language, 'hop': d.hop,
-                    'cluster_id': d.cluster_id, 'needle_relpos': d.metadata.get('needle_relpos'),
-                    'num_chunks': d.num_chunks, 'full_tokens': full_tokens[d.doc_id]}
-            if arm.kind == 'full':
-                rows.append({**base, 'ratio': 'full', 'kept': list(range(d.num_chunks)), 'text': d.text(),
-                             'kept_tokens': full_tokens[d.doc_id], 'budget': full_tokens[d.doc_id],
-                             'gold_recall': 1.0, 'seconds': 0.0})
-                continue
-            if arm.kind == 'text':
-                for r in ratios:
-                    t0 = time.time()
-                    budget = budget_for(full_tokens[d.doc_id], r)
-                    text, truncated = _text_within_budget(arm, d, r, budget, tok, count)
-                    rows.append({**base, 'ratio': r, 'kept': [], 'text': text, 'kept_tokens': count(text),
-                                 'budget': budget, 'truncated': truncated, 'gold_recall': None,
-                                 'seconds': time.time() - t0})
-                continue
-            t0 = time.time()
-            scores = arm.scores(d)
-            seconds = time.time() - t0
-            if scores is None:  # e.g. oracle_beta without labels for this document
-                continue
-            for r in ratios:
-                sel: Selection = select_by_scores(d, scores, lengths[d.doc_id], budget_for(full_tokens[d.doc_id], r), tok)
-                # a chunk cut to the budget is not counted as kept evidence
-                rows.append({**base, 'ratio': r, 'kept': sel.kept, 'text': sel.text, 'kept_tokens': sel.kept_tokens,
-                             'budget': sel.budget, 'truncated': sel.truncated,
-                             'gold_recall': 0.0 if sel.truncated else gold_chunk_recall(sel.kept, d.gold_chunks),
-                             'seconds': seconds})
-        _append_jsonl(sel_path, rows)
-        print(f"  {label}: {len(rows)} selections in {time.time() - t_arm:.1f}s", flush=True)
+        tolerant = spec.partition(':')[0] in PUBLISHED_ARMS   # third-party compressors
+        if arm.kind != 'full':
+            # untimed warm-up: the first call pays model start-up (CUDA kernels, caches, lazy imports), which
+            # would otherwise land in one document's time in the RQ1 cost table
+            try:
+                _arm_rows(arm, pending[0], label, wanted[:1], full_tokens[pending[0].doc_id],
+                          lengths[pending[0].doc_id], tok, count)
+            except Exception:  # noqa: BLE001 -- the timed call below records (or raises) the same failure
+                if not tolerant:
+                    raise
+        rows, n_rows, n_failed, t_arm = [], 0, 0, time.time()
+        for i, d in enumerate(pending):
+            try:
+                rows.extend(_arm_rows(arm, d, label, need[d.doc_id], full_tokens[d.doc_id], lengths[d.doc_id],
+                                      tok, count))
+            except Exception as exc:  # noqa: BLE001 -- a published compressor's own failure on one document
+                if not tolerant:
+                    raise
+                n_failed += 1
+                _append_jsonl(fail_path, [{'doc_id': d.doc_id, 'arm': label, 'error': f'{type(exc).__name__}: {exc}'}])
+                print(f"  [WARN] {label} failed on {d.doc_id}: {type(exc).__name__}: {exc}", flush=True)
+            if len(rows) >= args.flush_every * len(wanted) or i == len(pending) - 1:
+                _append_jsonl(sel_path, rows)   # progress survives a crash late in a slow arm
+                n_rows += len(rows)
+                rows = []
+        print(f"  {label}: {n_rows} selections in {time.time() - t_arm:.1f}s"
+              + (f"; {n_failed} documents failed (see {fail_path})" if n_failed else ''), flush=True)
         del arm
         try:
             import torch
@@ -280,7 +363,8 @@ def cmd_report(args):
     for r in rows:
         cell[(r['reader'], r['source'], _ratio_key(r['ratio']), r['arm'])][r['doc_id']] = r
     report = {'readers': readers, 'arms': arms, 'ours': ours, 'cells': [], 'paired': [], 'upgrade_retention': [],
-              'by_depth': []}
+              'by_depth': [], 'heldout_readers': [h for h in (args.heldout_readers or '').split(',') if h],
+              'n_boot': args.n_boot}
 
     for (reader, source, ratio, arm), by_doc in sorted(cell.items()):
         docs = sorted(by_doc)
@@ -354,6 +438,7 @@ def cmd_report(args):
                                                         'stable': gap >= args.min_upgrade_gap})
 
     report['hypotheses'] = hypothesis_families(cell, rows, readers, sources, ratios, args)
+    report['h2a_multi_support'] = multi_support_slice(cell, readers, rows, ratios, args)
     report['seeds'] = seed_table(report['cells'])
     if args.labels_dir:
         report['cost'] = cost_tables(report['cells'], args)
@@ -399,8 +484,9 @@ def _retention_ci(arr: np.ndarray, clusters, n_boot: int, seed: int = 42):
 # whose arms were not run comes out empty ("not run").
 
 H1_BASELINES = ('bm25', 'embed', 'reranker', 'lead', 'random')
+# published compressors (EXTRA_ARMS labels); only those that were run are tested
+H1_PUBLISHED = ('provence', 'xprovence', 'recomp', 'exit', 'llmlingua', 'longllmlingua', 'llmlingua2')
 H2A_VS = ('span_sup', 'oracle_span')
-H4_VS = ('xprovence', 'llmlingua2')
 FAMILY_ALPHA = 0.05
 
 
@@ -466,10 +552,12 @@ def hypothesis_families(cell, rows, readers, sources, ratios, args):
     heldout = {h for h in (args.heldout_readers or '').split(',') if h}
     every = lambda m: True  # noqa: E731
     fam = [
-        ('H1', 'ours_beta > each cheap baseline (bm25, embed, reranker, lead, random), every source and ratio',
-         'superiority', 0.0,
-         _paired_family(cell, main, meta, every, ratios, ['ours_beta'], H1_BASELINES, 'superiority', 0.0,
-                        args.n_boot)),
+        # one family: the cheap baselines and the published compressors are the same claim ("beats every
+        # non-oracle compressor"), so Holm corrects over all of them together
+        ('H1', 'ours_beta > each non-oracle compressor (bm25, embed, reranker, lead, random and every published '
+               'compressor that was run), every source and ratio', 'superiority', 0.0,
+         _paired_family(cell, main, meta, every, ratios, ['ours_beta'], H1_BASELINES + H1_PUBLISHED, 'superiority',
+                        0.0, args.n_boot)),
         ('H1-oracle', f'ours_beta within {args.oracle_margin} F1 of oracle_beta (non-inferiority; '
                       f'oracle_beta covers the ORACLE_N labeled test docs)', 'noninferiority', args.oracle_margin,
          _paired_family(cell, main, meta, every, ratios, ['ours_beta'], ['oracle_beta'], 'noninferiority',
@@ -481,16 +569,13 @@ def hypothesis_families(cell, rows, readers, sources, ratios, args):
          'equivalence', args.equiv_margin,
          _paired_family(cell, main, meta, lambda m: m['hop'] == 'single', ratios, ['ours_beta'], ['span_sup'],
                         'equivalence', args.equiv_margin, args.n_boot)),
-        ('H3b', f'retention(ours_ens) > retention(ours_beta), label-reader pairs with full-context gap '
+        ('H3', f'retention(ours_ens) > retention(ours_beta), label-reader pairs with full-context gap '
                 f'>= {args.min_upgrade_gap}', 'superiority', 0.0,
          _retention_family(cell, meta, readers, ratios, 'ours_ens', 'ours_beta', heldout, False,
                            args.min_upgrade_gap, args.n_boot)),
-        ('H3b-heldout', 'same, pairs involving the held-out reader', 'superiority', 0.0,
+        ('H3-heldout', 'same, pairs involving the held-out reader', 'superiority', 0.0,
          _retention_family(cell, meta, readers, ratios, 'ours_ens', 'ours_beta', heldout, True,
                            args.min_upgrade_gap, args.n_boot)),
-        ('H4', 'Vietnamese sources: ours_beta and ours_ens > XProvence and LLMLingua-2', 'superiority', 0.0,
-         _paired_family(cell, main, meta, lambda m: m['language'] == 'vi', ratios, ['ours_beta', 'ours_ens'],
-                        H4_VS, 'superiority', 0.0, args.n_boot)),
     ]
     out = []
     variants = seed_variants(sorted({a for (_, _, _, a) in cell}))
@@ -508,6 +593,39 @@ def hypothesis_families(cell, rows, readers, sources, ratios, args):
                     'n_seed_robust': sum(t['supported'] and t['seeds_agree'] for t in seeded) if seeded else None,
                     'tests': tests})
     return out
+
+
+def multi_support_slice(cell, readers, rows, ratios, args):
+    """Exploratory: H2a's comparisons on multi-hop documents with >= 2 supporting paragraphs only. About half
+    of VIMQA's questions have a single supporting paragraph, where the answer-span label already covers the
+    evidence and H2a's mechanism (bridge paragraphs) cannot act. Not a confirmatory family."""
+    meta = {r['source']: r['hop'] for r in rows}
+    main = [args.primary_reader] if args.primary_reader in readers else readers
+    tests = []
+    for reader, source, ratio, vs in itertools.product(main, sorted(meta), ratios, H2A_VS):
+        a, b = cell.get((reader, source, ratio, 'ours_beta')), cell.get((reader, source, ratio, vs))
+        if meta[source] != 'multi' or not (a and b):
+            continue
+        common = sorted(d for d in set(a) & set(b) if (a[d].get('n_gold') or 0) >= 2)
+        if len(common) < 2:
+            continue
+        res = paired_bootstrap_test([a[d]['f1'] for d in common], [b[d]['f1'] for d in common],
+                                    [a[d]['cluster_id'] for d in common], 'superiority', 0.0, args.n_boot)
+        tests.append({'reader': reader, 'source': source, 'ratio': ratio, 'vs': vs, **res, 'n': len(common)})
+    return tests
+
+
+def _multi_support_markdown(tests) -> list:
+    if not tests:
+        return []
+    lines = ['## H2a on multi-hop documents with >= 2 supporting paragraphs (exploratory)', '',
+             '| reader | source | ratio | ours_beta vs | n | Δ F1 [95% CI] | p (one-sided) |', '|---|---|---|---|---|---|---|']
+    for t in tests:
+        lo, hi = t['ci95']
+        ci = '' if lo is None else f" [{lo:+.3f}, {hi:+.3f}]"
+        p = '' if t['p'] is None else f"{t['p']:.4f}"
+        lines.append(f"| {t['reader']} | {t['source']} | {t['ratio']} | {t['vs']} | {t['n']} | {t['diff']:+.3f}{ci} | {p} |")
+    return lines + ['']
 
 
 SEED_ARM = re.compile(r'^(ours_beta|ours_ens)_s(\d+)$')
@@ -560,7 +678,9 @@ def cost_tables(cells, args):
     wall-clock on one process), next to per-document selection time of every arm."""
     from ttcompress.attribution import record_paths
     labels = []
-    for reader_dir in sorted(glob.glob(os.path.join(args.labels_dir, 'raw', '*'))):
+    # a comma list: an ablation run's own labels plus the main run's (for the sources it did not re-measure)
+    roots = [d for d in args.labels_dir.split(',') if d]
+    for reader_dir in sorted(p for root in roots for p in glob.glob(os.path.join(root, 'raw', '*'))):
         for split_dir in sorted(glob.glob(os.path.join(reader_dir, '*'))):
             secs, calls = [], []
             for p in record_paths(split_dir):
@@ -583,7 +703,7 @@ def cost_tables(cells, args):
 def label_quality(fit_dir):
     """Stage A diagnostics of this run's fits (METHOD_SPEC.md §3): additivity (cv R²), whether β finds the
     evidence (gold recall@|gold|, MRR; ~1 on single-hop = β collapsed onto the answer span, H2b), position
-    share of label variance, and cross-reader agreement for ensembles (H3a)."""
+    share of label variance, and cross-reader agreement for ensembles (descriptive, RQ3)."""
     out = []
     for path in sorted(glob.glob(os.path.join(fit_dir, '*', '*', '*', 'summary.json'))):
         with open(path, encoding='utf-8') as f:
@@ -606,6 +726,7 @@ def _fmt(m):
 def _markdown(report) -> str:
     lines = ['# Evaluation report', '', 'Token F1 with 95% cluster-bootstrap CI; never pooled across sources.', '']
     lines += _hypotheses_markdown(report.get('hypotheses', []))
+    lines += _multi_support_markdown(report.get('h2a_multi_support', []))
     lines += _cost_markdown(report.get('cost'))
     lines += _label_quality_markdown(report.get('label_quality'))
     lines += _seeds_markdown(report.get('seeds'))
@@ -630,7 +751,10 @@ def _markdown(report) -> str:
         fmt = lambda v: '' if v is None else f"{v:.3f}"  # noqa: E731
         lines += ['## Paired differences (ours − other, token F1)', '',
                   f"{len(tested)} tests, one family. Below 0.05: raw p {n_sig['p']}, BH q {n_sig['q_bh']}, "
-                  f"Holm p {n_sig['p_holm']}. Quote q (FDR) or Holm p, not raw p.", '',
+                  f"Holm p {n_sig['p_holm']}. Quote BH q (FDR), not raw p. A bootstrap p is at least "
+                  f"1/(n_boot+1), so over {len(tested)} tests Holm cannot fall below "
+                  f"{min(1.0, len(tested) / (report.get('n_boot', 5000) + 1)):.3f}: here it is only a floor "
+                  f"check (the confirmatory families are small enough for Holm).", '',
                   '| reader | source | ratio | ours | vs | Δ F1 [95% CI] | p | q (BH) | p (Holm) |',
                   '|---|---|---|---|---|---|---|---|---|']
         for p in report['paired']:
@@ -755,6 +879,9 @@ def main():
     s.add_argument('--shard', type=int, default=0)
     s.add_argument('--num-shards', type=int, default=1)
     s.add_argument('--out-dir', required=True)
+    s.add_argument('--flush-every', type=int, default=25, help="append selections every N documents")
+    s.add_argument('--retry-failed', action='store_true',
+                   help="retry (document, arm) pairs recorded in select_failures_shard*.jsonl")
     s.set_defaults(func=cmd_select)
 
     a = sub.add_parser('answer')
@@ -777,15 +904,16 @@ def main():
     r.add_argument('--ours', default='', help="comma list of arm labels to compare against every other arm")
     r.add_argument('--n-boot', type=int, default=5000)
     r.add_argument('--primary-reader', default=None,
-                   help="reader tag for H1/H2/H4 (the label reader of ours_beta); default: every reader")
-    r.add_argument('--heldout-readers', default='', help="comma list of reader tags that produced no labels (H3b)")
+                   help="reader tag for H1/H2 (the label reader of ours_beta); default: every reader")
+    r.add_argument('--heldout-readers', default='', help="comma list of reader tags that produced no labels (H3-heldout)")
     r.add_argument('--equiv-margin', type=float, default=0.02, help="H2b equivalence margin (token F1)")
     r.add_argument('--oracle-margin', type=float, default=0.05, help="H1 non-inferiority margin to oracle_beta")
     r.add_argument('--min-upgrade-gap', type=float, default=0.05,
-                   help="minimum full-context weak->strong F1 gap for a retention ratio to be read (H3b)")
+                   help="minimum full-context weak->strong F1 gap for a retention ratio to be read (H3)")
     r.add_argument('--budget-tolerance', type=float, default=0.05,
                    help="a selection is over budget when kept_tokens > budget * (1 + this)")
-    r.add_argument('--labels-dir', default=None, help="labels root (raw/<reader>/...) for the RQ1 cost table")
+    r.add_argument('--labels-dir', default=None,
+                   help="labels root(s), comma list (raw/<reader>/...), for the RQ1 cost table")
     r.add_argument('--fit-dir', default=None, help="this run's fit dir (<reader|ensemble>/<target>/<set>/summary.json) "
                                                     "for the label-quality table")
     r.set_defaults(func=cmd_report)

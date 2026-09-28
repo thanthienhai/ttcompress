@@ -16,6 +16,21 @@ def _tok():
     return AutoTokenizer.from_pretrained(TINY_ENCODER)
 
 
+def test_pack_windows_use_the_backbone_pair_frame():
+    """RoBERTa / XLM-R cross-encoders read <s> q </s></s> passage </s>: the pruner frames windows the same way;
+    pair_format=False keeps the old single-sequence frame for old checkpoints."""
+    from ttcompress.pruner import pair_template
+    tok = _tok()
+    head, middle, tail = pair_template(tok)
+    assert head == [tok.cls_token_id] and middle == [tok.sep_token_id] * 2 and tail == [tok.sep_token_id]
+    q = tok.encode('hỏi', add_special_tokens=False)
+    new = pack_windows(tok, 'hỏi', ['một hai ba'], max_len=64)[0]
+    old = pack_windows(tok, 'hỏi', ['một hai ba'], max_len=64, pair_format=False)[0]
+    assert list(new.input_ids[:len(q) + 3]) == [tok.cls_token_id] + q + [tok.sep_token_id] * 2
+    assert list(old.input_ids[:len(q) + 2]) == [tok.cls_token_id] + q + [tok.sep_token_id]
+    assert len(new.input_ids) == len(old.input_ids) + 1 and new.chunk_slot.count(0) == old.chunk_slot.count(0)
+
+
 def test_pack_windows_spans_are_exact_and_every_chunk_appears_once():
     tok = _tok()
     chunks = [f'đoạn văn số {i} ' * (3 + i % 5) for i in range(30)]
@@ -40,10 +55,14 @@ def test_forward_scores_one_value_per_chunk_and_roundtrips(tmp_path):
     with torch.no_grad():
         scores = document_scores(model, windows, len(chunks), tok.pad_token_id, 'cpu')
     assert scores.shape == (len(chunks),)
-    model.save_pretrained(str(tmp_path), tok, extra={'max_len': 32})
+    model.save_pretrained(str(tmp_path), tok, extra={'max_len': 32, 'pair_format': True})   # as train_pruner.py
     scorer = PrunerScorer(str(tmp_path), device='cpu')
     again = scorer.score_chunks('hỏi', chunks)
     assert torch.allclose(scores, torch.tensor(again), atol=1e-5)
+    # a checkpoint without the flag (trained before it existed) is scored in its own, old frame
+    model.save_pretrained(str(tmp_path), tok, extra={'max_len': 32})
+    old = PrunerScorer(str(tmp_path), device='cpu')
+    assert not old.pair_format and len(old.score_chunks('hỏi', chunks)) == len(chunks)
 
 
 def test_training_step_moves_scores_toward_the_label():
@@ -69,9 +88,10 @@ def test_listnet_is_minimized_by_matching_order():
     assert listnet_loss(target * 3, target) < listnet_loss(-target * 3, target)
 
 
-def test_listnet_mse_gradient_balance_is_chunk_count_invariant():
-    """listnet (sum) + w_mse * mse (mean): the loss values drift apart with C,
-    the gradients they send do not -- the mse share stays within a narrow band."""
+def test_listnet_mse_gradient_balance_for_smooth_and_spiky_targets():
+    """listnet (sum) + w_mse * mse (mean). For smooth (Gaussian) z-targets the gradient share of mse stays
+    ~1 at any C; for spiky targets (one needle, the real single-hop case) it falls with C -- the documented
+    behaviour in pruner_training.py, not a balance guarantee."""
     import torch.nn.functional as F
     torch.manual_seed(0)
     ratios = {}
@@ -86,6 +106,28 @@ def test_listnet_mse_gradient_balance_is_chunk_count_invariant():
             vals.append(float(g_mse / g_listnet))
         ratios[C] = sum(vals) / len(vals)
     assert all(0.7 < r < 1.4 for r in ratios.values()), ratios
+    spiky = {}
+    for C in (2, 10, 40):
+        t = torch.full((C,), -1.0)
+        t[0] = 1.0
+        t = (t - t.mean()) / (t.std() + 1e-6)
+        s = torch.zeros(C, requires_grad=True)
+        g_listnet = torch.autograd.grad(listnet_loss(s, t), s)[0].norm()
+        g_mse = torch.autograd.grad(0.5 * F.mse_loss(s, t), s)[0].norm()
+        spiky[C] = float(g_mse / g_listnet)
+    assert spiky[2] > spiky[10] > spiky[40], spiky
+
+
+def test_ranking_metrics_refuse_non_finite_scores():
+    """A NaN model must not score like `lead` (argsort keeps document order) and win model selection."""
+    import math
+    from ttcompress.pruner_training import TrainExample, ranking_metrics
+    ex = TrainExample(doc_id='d', source='hotpotqa', question='q', chunks=['a', 'b', 'c', 'd'], target=[1.0, 0.0, 0.0, 0.0],
+                      gold=[0], beta_z=[1.0, 0.0, 0.0, 0.0])
+    ok = ranking_metrics([3.0, 1.0, 0.0, -1.0], ex)
+    assert ok['ndcg@3_beta'] > 0.99 and ok['gold_recall@25%'] == 1.0
+    bad = ranking_metrics([float('nan')] * 4, ex)
+    assert all(math.isnan(v) for v in bad.values())
 
 
 def test_accumulation_groups_average_over_their_own_documents():

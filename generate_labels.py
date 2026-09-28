@@ -35,7 +35,8 @@ from ttcompress.attribution import (
 )
 from ttcompress.metrics import spearman, token_f1
 from ttcompress.reader import MAX_NEW_TOKENS, load_reader, reader_tag
-from ttcompress.sources import SOURCES, first_n_docs, load_documents
+from ttcompress.reader import PROMPT_VERSION
+from ttcompress.sources import HOP, SOURCES, data_version, first_n_docs, load_documents
 
 
 def add_document_args(p):
@@ -55,8 +56,6 @@ def cmd_measure(args):
     todo = [d for d in docs if not os.path.exists(os.path.join(out_dir, f'{d.doc_id}.json'))]
     print(f"{args.source}/{args.split} shard {args.shard}/{args.num_shards}: {len(docs)} docs, "
           f"{len(docs) - len(todo)} already measured, {len(todo)} to go -> {out_dir}")
-    if not todo:
-        return
     keep_rates = [float(x) for x in args.keep_rates.split(',')]
     outcomes = set(args.outcomes.split(','))
     # a resumed run must measure with exactly the settings the records on disk were measured with.
@@ -64,11 +63,20 @@ def cmd_measure(args):
     # (masks_for_document) and the document set is hash-chosen and nested across --n, so a label dir
     # may be extended with a different GPU count (pilot -> mid -> full share labels/raw). Guarded by
     # tests/test_attribution.py::test_masks_do_not_depend_on_sharding.
+    # everything that changes a record: document set (data_version), masks, prompt/answer handling, backend
+    # only the document settings that act on this source (load_documents ignores the others), so a distractor
+    # ablation run reads the unchanged sources' labels from the main run instead of refusing them
+    single = HOP[args.source] == 'single'
     config = {'keep_rates': keep_rates, 'k_min': args.k_min, 'k_per_chunk': args.k_per_chunk, 'k_max': args.k_max,
-              'outcomes': sorted(outcomes), 'haystack_chars': args.haystack_chars, 'distractors': args.distractors,
-              'multihop_pad_chars': args.multihop_pad_chars, 'max_new_tokens': args.max_new_tokens}
+              'outcomes': sorted(outcomes), 'haystack_chars': args.haystack_chars if single else None,
+              'distractors': args.distractors if single else None,
+              'multihop_pad_chars': None if single else args.multihop_pad_chars,
+              'max_new_tokens': args.max_new_tokens or MAX_NEW_TOKENS[docs[0].hop if docs else 'single'],
+              'data_version': data_version(args.source), 'prompt_version': PROMPT_VERSION,
+              'backend': args.backend, 'dtype': args.dtype, 'max_model_len': args.max_model_len}
     os.makedirs(out_dir, exist_ok=True)
     config_path = os.path.join(out_dir, 'measure_config.json')
+    # checked even when every document is on disk: a finished dir from other settings must not be fitted
     if os.path.exists(config_path):
         with open(config_path, encoding='utf-8') as f:
             on_disk = json.load(f)
@@ -80,6 +88,8 @@ def cmd_measure(args):
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
         os.replace(tmp, config_path)
+    if not todo:
+        return
     reader = load_reader(args.reader_model, args.backend, args.device, args.dtype, args.batch_size, args.max_model_len,
                          args.tp, args.gpu_memory_utilization)
 
@@ -103,10 +113,12 @@ def cmd_measure(args):
             idx = [i for i, o in enumerate(owners) if group[o].hop == hop]
             for i, a in zip(idx, reader.generate([prompts[i] for i in idx], args.max_new_tokens or MAX_NEW_TOKENS[hop])):
                 answers[i] = a
-        logprobs = None
-        if 'logprob' in outcomes:
+        elapsed = time.time() - start          # the F1 labels' cost (the RQ1 cost table reads it)
+        logprobs, lp_elapsed = None, 0.0
+        if 'logprob' in outcomes:               # ablation only: timed apart so it never inflates `seconds`
+            t_lp = time.time()
             logprobs = reader.answer_logprob(prompts, [group[o].answers[0] for o in owners])
-        elapsed = time.time() - start
+            lp_elapsed = time.time() - t_lp
         total_calls += len(prompts)
 
         cursor = 0
@@ -119,6 +131,7 @@ def cmd_measure(args):
                 doc=d.to_dict(), reader=reader_tag(args.reader_model), masks=per_doc_masks[di], f1=f1[:-1],
                 logprob=lp[:-1] if lp else None, full_f1=f1[-1], full_logprob=lp[-1] if lp else None,
                 full_answer=ans[-1], seconds=elapsed * n / len(prompts),
+                seconds_logprob=lp_elapsed * n / len(prompts),
             ), out_dir)
             cursor += n
         done = g + len(group)
@@ -247,8 +260,9 @@ def main():
     m.add_argument('--max-model-len', type=int, default=None)
     m.add_argument('--tp', type=int, default=1, help="vLLM tensor parallel size (GPUs visible to this process)")
     m.add_argument('--gpu-memory-utilization', type=float, default=0.9)
-    m.add_argument('--max-new-tokens', type=int, default=None, help="default: per hop type (32 single / 48 multi)")
-    m.add_argument('--outcomes', default='f1,logprob', help="f1 is always measured; add logprob for the ablation")
+    m.add_argument('--max-new-tokens', type=int, default=None, help="default: per hop type (reader.MAX_NEW_TOKENS)")
+    m.add_argument('--outcomes', default='f1', help="f1 is always measured; f1,logprob for the log-prob ablation "
+                                                     "(run_pipeline.sh: primary reader, train/dev only)")
     m.add_argument('--keep-rates', default='0.5,0.25', help="Bernoulli keep probabilities, cycled over masks")
     m.add_argument('--k-min', type=int, default=64)
     m.add_argument('--k-per-chunk', type=float, default=1.0)

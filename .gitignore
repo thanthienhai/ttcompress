@@ -13,6 +13,8 @@ wheels/
 
 # Virtual environments
 .venv/
+.llmlingua_site/
+.baseline_site/
 venv/
 env/
 ENV/

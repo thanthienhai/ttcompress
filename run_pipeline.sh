@@ -38,7 +38,7 @@ load_env_file() {
 [[ -f .env ]] && load_env_file .env
 
 # SMOKE=1: every stage on a handful of documents, to surface cluster-side failures (package installs, vLLM,
-# XProvence / LLMLingua-2 APIs, paths, permissions) in about an hour -- dominated by model start-ups --
+# baseline APIs (EXTRA_ARMS), paths, permissions) in about an hour -- dominated by model start-ups --
 # instead of hours into a long run. Overrides the sizes from .env, writes to <parent of RUN_ROOT>/smoke,
 # never uploads. Its labels land in the shared LABELS: same settings, nested documents, reused later.
 if [[ "${SMOKE:-0}" == 1 ]]; then
@@ -52,7 +52,9 @@ fi
 
 NUM_GPUS=${NUM_GPUS:-4}
 BACKEND=${BACKEND:-vllm}
-STAGES=${STAGES:-"preflight prefetch labels fit ensemble train select answer report upload"}
+# upload is not a default stage: it pushes ~100k files and left the 4xH100 pod idle ~2.5 h in the pilot.
+# Run it on its own, from a CPU pod: STAGES=upload bash run_pipeline.sh
+STAGES=${STAGES:-"preflight prefetch labels fit ensemble train select answer report"}
 # Label readers (the first one is the primary reader).
 LABEL_READERS=${LABEL_READERS:-"Qwen/Qwen3-8B Qwen/Qwen3-1.7B aisingapore/Llama-SEA-LION-v3-8B"}
 # Evaluation readers: the label readers plus one NEVER used for labels (held-out, RQ3).
@@ -71,7 +73,7 @@ RATIOS=${RATIOS:-"4,8"}
 ORACLE_N=${ORACLE_N:-100}
 (( ORACLE_N <= N_TEST )) || ORACLE_N=$N_TEST
 # report: equivalence margin (H2b), non-inferiority margin to oracle_beta (H1), minimum full-context
-# weak->strong F1 gap for an upgrade-retention ratio to be read (H3b)
+# weak->strong F1 gap for an upgrade-retention ratio to be read (H3)
 EQUIV_MARGIN=${EQUIV_MARGIN:-0.02}
 ORACLE_MARGIN=${ORACLE_MARGIN:-0.05}
 MIN_UPGRADE_GAP=${MIN_UPGRADE_GAP:-0.05}
@@ -80,13 +82,27 @@ GPU_MEM=${GPU_MEM:-0.90}
 DOCS_PER_CALL=${DOCS_PER_CALL:-16}
 BACKBONE=${BACKBONE:-BAAI/bge-reranker-v2-m3}
 EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-m3}
+# llmlingua / longllmlingua arms need transformers<=4.47.1 (microsoft/LLMLingua#210), the vLLM image ships 5.x:
+# that transformers + llmlingua are installed into this directory and put on PYTHONPATH for those arms only.
+LLMLINGUA_SITE=${LLMLINGUA_SITE:-$PWD/.llmlingua_site}
+LEGACY_ARM_RE='^([^=]*=)?(llmlingua|longllmlingua)(:.*)?$'
+# Baseline packages go into the image's environment when its python has pip. An image whose venv has no pip
+# (the 2026-09-28 smoke image) gets them here instead, installed with the system pip3 for the venv's Python
+# version; this dir is on PYTHONPATH for the select stage only, never for the vLLM stages.
+BASELINE_SITE=${BASELINE_SITE:-$PWD/.baseline_site}
+# "recomp, exit" must not hide arms from has_arm while evaluate.parse_arms (which strips spaces) runs them
+EXTRA_ARMS=${EXTRA_ARMS:-}
+EXTRA_ARMS=${EXTRA_ARMS// /}
 RUN_ROOT=${RUN_ROOT:-.}
 # Distractor ablation (METHOD_SPEC.md §6): DISTRACTORS=hard (single-hop haystacks padded from the needle's own
 # article) and/or MULTIHOP_PAD_CHARS=<n> (multi-hop documents lengthened with easy distractors), applied to
 # labels AND evaluation. Labels, fits, models and results get their own suffixed directories, so the
-# ablation never mixes with the main run (the label dirs would refuse mixed settings anyway).
+# ablation never mixes with the main run (the label dirs would refuse mixed settings anyway) -- except the
+# raw labels of the sources an ablation does not change (DISTRACTORS: single-hop only; MULTIHOP_PAD_CHARS:
+# multi-hop only), which are read from the main run's LABELS instead of being measured again (raw_root).
 DISTRACTORS=${DISTRACTORS:-}
 MULTIHOP_PAD_CHARS=${MULTIHOP_PAD_CHARS:-}
+LABELS_MAIN=${LABELS:-$RUN_ROOT/labels}
 ABLATION=${DISTRACTORS:+_distractors-$DISTRACTORS}${MULTIHOP_PAD_CHARS:+_pad-$MULTIHOP_PAD_CHARS}
 if [[ -n "$ABLATION" ]]; then
   RUN_ROOT="$RUN_ROOT$ABLATION"
@@ -100,6 +116,16 @@ fi
 # smaller run's). FIT: ridge fits + ensembles, cheap, PER RUN and restricted to this run's N_TRAIN / N_DEV /
 # ORACLE_N documents -- a shared fit dir would train a small-N run on whatever a larger run measured.
 LABELS=${LABELS:-$RUN_ROOT/labels}
+SINGLE_HOP_SOURCES=$(python -c "from ttcompress.sources import HOP; print(' '.join(s for s, h in HOP.items() if h == 'single'))")
+raw_root() {  # raw_root <source>: where this run's Stage A records of <source> live (the main run's unless
+              # the ablation changes that source's documents)
+  local single=0; [[ " $SINGLE_HOP_SOURCES " == *" $1 "* ]] && single=1
+  if { (( single )) && [[ -n "$DISTRACTORS" ]]; } || { (( ! single )) && [[ -n "$MULTIHOP_PAD_CHARS" ]]; }; then
+    echo "$LABELS/raw"
+  else
+    echo "$LABELS_MAIN/raw"
+  fi
+}
 FIT=${FIT:-$RUN_ROOT/labels_fit}
 MODELS=${MODELS:-$RUN_ROOT/models}
 EVAL_DIR=${EVAL_DIR:-$RUN_ROOT/results/eval_test}
@@ -140,6 +166,14 @@ first() { echo "$1"; }
 PRIMARY_MODEL=$(first $LABEL_READERS)
 PRIMARY=$(tag "$PRIMARY_MODEL")
 has_stage() { [[ " $STAGES " == *" $1 "* ]]; }
+# A from-scratch smoke run (preflight in STAGES) starts from an empty smoke dir: a previous smoke with another
+# GPU count would otherwise make select refuse its num_shards and train skip its finished runs. Only the
+# smoke's own RUN_ROOT is removed; its labels live in the shared LABELS and are kept (SMOKE_KEEP=1: keep all).
+if [[ "${SMOKE:-0}" == 1 && "${SMOKE_KEEP:-0}" != 1 ]] && has_stage preflight \
+   && [[ "$(basename "$RUN_ROOT")" == smoke* && -d "$RUN_ROOT" ]]; then
+  echo "== SMOKE: removing the previous smoke run $RUN_ROOT (labels in $LABELS are kept)"
+  rm -rf -- "$RUN_ROOT"
+fi
 tp_for() { if [[ "$1" =~ $LARGE_READER_PATTERN ]]; then echo "$TP_LARGE"; else echo 1; fi; }
 mkdir -p "$LOGS"
 # Physical GPU ids: honour a scheduler-provided CUDA_VISIBLE_DEVICES (Slurm etc.), else 0..NUM_GPUS-1.
@@ -174,31 +208,136 @@ run_sharded() {
   done
   (( failed == 0 )) || { echo "!! stage $name failed; fix and re-run (finished work is kept)"; exit 1; }
 }
+# Job pool: at most POOL_N jobs at once; a job starts as soon as a slot frees (the training stage uses the
+# slot as its GPU). A failed job stops the pipeline with the tail of its log.
+pool_start() { POOL_N=$1; POOL_PID=(); POOL_NAME=(); POOL_LOG=(); }
+pool_reap() {  # pool_reap <slot>
+  local s=$1
+  [[ -n "${POOL_PID[$s]:-}" ]] || return 0
+  if ! wait "${POOL_PID[$s]}"; then
+    echo "!! ${POOL_NAME[$s]} FAILED -- last lines of ${POOL_LOG[$s]}:"; tail -n 25 "${POOL_LOG[$s]}"; exit 1
+  fi
+  POOL_PID[$s]=""
+}
+pool_slot() {  # sets POOL_SLOT to a free slot, reaping a finished job
+  local s
+  while true; do
+    for ((s = 0; s < POOL_N; s++)); do
+      if [[ -z "${POOL_PID[$s]:-}" ]] || ! kill -0 "${POOL_PID[$s]}" 2>/dev/null; then
+        pool_reap "$s"; POOL_SLOT=$s; return
+      fi
+    done
+    sleep 1
+  done
+}
+pool_run() {  # pool_run <name> <log> <cmd...>: waits for a free slot, then starts cmd there
+  local name=$1 log=$2; shift 2
+  pool_slot
+  "$@" > "$log" 2>&1 &
+  POOL_PID[$POOL_SLOT]=$!; POOL_NAME[$POOL_SLOT]=$name; POOL_LOG[$POOL_SLOT]=$log
+}
+pool_wait() { local s; for ((s = 0; s < POOL_N; s++)); do pool_reap "$s"; done; }
+CPU_JOBS=${CPU_JOBS:-$(( $(nproc 2>/dev/null || echo 4) < 8 ? $(nproc 2>/dev/null || echo 4) : 8 ))}
+
+# Background shards / training runs ignore SIGINT in a non-interactive shell: without this, Ctrl-C (or a
+# failed stage) leaves them holding the GPUs and the relaunch runs out of memory.
+stop_children() { local p; p=$(jobs -p); [[ -z "$p" ]] || kill $p 2>/dev/null || true; }
+trap 'stop_children' EXIT
+trap 'stop_children; exit 130' INT TERM
 
 # Published-compressor arms need packages the vLLM image does not ship: llmlingua2 -> `llmlingua`;
 # provence:/XProvence -> `spacy` + its multilingual sentence model `xx_sent_ud_sm` (loaded when the
 # remote modeling code is imported). Installed on demand with the image's torch / transformers / vllm /
 # numpy / tokenizers pinned as constraints, so pip fails instead of swapping the CUDA build vLLM needs.
-pip_pinned() {  # pip_pinned <package...>
-  local pins; pins=$(mktemp)
-  python -m pip freeze 2>/dev/null | grep -iE '^(torch|transformers|vllm|numpy|tokenizers)==' > "$pins" || true
-  if ! python -m pip install --quiet "$@" -c "$pins"; then
-    echo "!! pip install $* failed (conflicts with pinned: $(paste -sd' ' "$pins"));"
-    echo "   install by hand or drop the arm from EXTRA_ARMS"; rm -f "$pins"; exit 1
+has_pip() { python -m pip --version >/dev/null 2>&1; }
+bpy() { PYTHONPATH="$BASELINE_SITE${PYTHONPATH:+:$PYTHONPATH}" python "$@"; }   # python + baseline packages
+image_pins() {  # the image's versions of what vLLM needs, as pip constraints (importlib: works without pip)
+  python - <<'PY'
+import importlib.metadata as m
+for p in ('torch', 'transformers', 'vllm', 'numpy', 'tokenizers'):
+    try:
+        print(f'{p}=={m.version(p)}')
+    except m.PackageNotFoundError:
+        pass
+PY
+}
+pip_target() {  # pip_target <dir> <pip install args...>: into a directory, with whichever pip exists
+  local dir=$1; shift
+  if has_pip; then
+    python -m pip install --quiet --upgrade --target "$dir" "$@"
+  elif command -v pip3 >/dev/null 2>&1; then
+    # the system pip3 may belong to another Python: ask for wheels of the venv's version
+    pip3 install --quiet --upgrade --target "$dir" --only-binary=:all: \
+      --python-version "$(python -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')" "$@"
+  else
+    echo "!! $(command -v python) has no pip and there is no pip3 on PATH"; return 1
+  fi
+}
+# pip_pinned <pip install args...>: into the image env (image pins as constraints, so pip fails instead of
+# swapping the CUDA build vLLM needs), or into BASELINE_SITE when the image's python has no pip. Packages that
+# depend on torch (peft, accelerate, llmlingua) are installed --no-deps: into a --target dir pip would
+# otherwise download its own torch and shadow the image's.
+pip_pinned() {
+  local pins rc=0; pins=$(mktemp); image_pins > "$pins"
+  if has_pip; then
+    python -m pip install --quiet "$@" -c "$pins" || rc=$?
+  else
+    echo "   (no pip in $(command -v python): installing into $BASELINE_SITE with the system pip3)"
+    pip_target "$BASELINE_SITE" "$@" -c "$pins" || rc=$?
+  fi
+  if (( rc )); then
+    echo "!! pip install $* failed (pinned: $(paste -sd' ' "$pins")); install by hand or drop the arm from EXTRA_ARMS"
+    rm -f "$pins"; exit 1
   fi
   rm -f "$pins"
 }
+has_arm() {  # has_arm <arm name>: EXTRA_ARMS has it, bare or labeled, with or without ':<arg>'
+  local re=",([^=,]*=)?$1(:[^,]*)?,"
+  [[ ",${EXTRA_ARMS:-}," =~ $re ]]
+}
+llmlingua_site_ok() {
+  PYTHONPATH="$LLMLINGUA_SITE" python -c "import transformers, llmlingua; assert transformers.__version__ == '4.46.3'" 2>/dev/null
+}
 ensure_baseline_deps() {
-  if [[ ",${EXTRA_ARMS:-}," == *llmlingua2* ]] && ! python -c "import llmlingua" 2>/dev/null; then
+  if has_arm llmlingua2 && ! bpy -c "import llmlingua" 2>/dev/null; then
     echo "== installing llmlingua (EXTRA_ARMS has llmlingua2)"
-    pip_pinned llmlingua
-    python -c "import llmlingua" || { echo "!! llmlingua installed but does not import"; exit 1; }
+    pip_pinned --no-deps llmlingua accelerate nltk joblib click tiktoken
+    bpy -c "import llmlingua" || { echo "!! llmlingua installed but does not import"; exit 1; }
   fi
-  if [[ ",${EXTRA_ARMS:-}" == *provence:* ]] && ! python -c "import spacy; spacy.load('xx_sent_ud_sm')" 2>/dev/null; then
+  if has_arm provence && ! bpy -c "import spacy; spacy.load('xx_sent_ud_sm')" 2>/dev/null; then
     echo "== installing spacy + xx_sent_ud_sm (EXTRA_ARMS has a provence: arm)"
     pip_pinned spacy
-    python -m spacy download xx_sent_ud_sm || { echo "!! spacy model xx_sent_ud_sm download failed"; exit 1; }
-    python -c "import spacy; spacy.load('xx_sent_ud_sm')" || { echo "!! xx_sent_ud_sm does not load"; exit 1; }
+    # the model wheel directly: `spacy download` shells out to `python -m pip`, which a pip-less venv lacks
+    local url; url=$(bpy -c "import spacy; v = spacy.about.__version__.split('.'); t = f'xx_sent_ud_sm-{v[0]}.{v[1]}.0'; print(f'https://github.com/explosion/spacy-models/releases/download/{t}/{t}-py3-none-any.whl')")
+    pip_pinned --no-deps "$url" || true
+    bpy -c "import spacy; spacy.load('xx_sent_ud_sm')" 2>/dev/null || bpy -m spacy download xx_sent_ud_sm \
+      || { echo "!! spacy model xx_sent_ud_sm could not be installed ($url)"; exit 1; }
+    bpy -c "import spacy; spacy.load('xx_sent_ud_sm')" || { echo "!! xx_sent_ud_sm does not load"; exit 1; }
+  fi
+  if has_arm provence && ! bpy -c "import nltk; nltk.data.find('tokenizers/punkt_tab')" 2>/dev/null; then
+    echo "== installing nltk + punkt (English Provence splits sentences with nltk)"
+    bpy -c "import nltk" 2>/dev/null || pip_pinned --no-deps nltk joblib click
+    # nltk.download reports failure by returning False: raise, then check the data really is there
+    bpy -c "import nltk; nltk.download('punkt_tab', quiet=True, raise_on_error=True); nltk.download('punkt', quiet=True, raise_on_error=True); nltk.data.find('tokenizers/punkt_tab')" \
+      || { echo "!! nltk punkt download failed"; exit 1; }
+  fi
+  if has_arm exit && ! bpy -c "import peft" 2>/dev/null; then
+    echo "== installing peft (EXTRA_ARMS has exit: Gemma-2B + LoRA adapter)"
+    pip_pinned --no-deps peft accelerate
+    bpy -c "import peft" || { echo "!! peft installed but does not import"; exit 1; }
+  fi
+  if has_arm llmlingua || has_arm longllmlingua; then
+    if ! llmlingua_site_ok; then
+      # --no-deps: torch, numpy, safetensors, ... come from the image; only what must differ is installed here
+      echo "== installing transformers 4.46.3 + llmlingua 0.2.2 into $LLMLINGUA_SITE (llmlingua/longllmlingua arms)"
+      pip_target "$LLMLINGUA_SITE" --no-deps "transformers==4.46.3" "tokenizers==0.20.3" "huggingface_hub==0.26.5" \
+        "accelerate==1.1.1" "llmlingua==0.2.2" tiktoken nltk joblib click \
+        || { echo "!! could not install into $LLMLINGUA_SITE"; exit 1; }
+      llmlingua_site_ok || { echo "!! $LLMLINGUA_SITE does not import transformers 4.46.3 + llmlingua"; exit 1; }
+    fi
+    # llmlingua reports lengths with tiktoken's gpt-3.5-turbo encoding: fetch it once, not in every shard
+    PYTHONPATH="$LLMLINGUA_SITE" python -c "import tiktoken; tiktoken.encoding_for_model('gpt-3.5-turbo')" \
+      || { echo "!! tiktoken encoding download failed"; exit 1; }
   fi
 }
 
@@ -217,6 +356,13 @@ if sys.argv[1] == 'vllm':
     print(f"vllm {vllm.__version__}")
 PY
   python -m pytest -q -x tests/test_attribution.py tests/test_selection_metrics.py tests/test_evaluate_report.py
+  # every package version of this run, for reproducing it (the image, the baseline and llmlingua sites)
+  { echo "# $(date -u +%FT%TZ) $(python --version 2>&1) $(command -v python)"
+    for site in "" "$BASELINE_SITE" "$LLMLINGUA_SITE"; do
+      echo "## ${site:-image}"
+      PYTHONPATH="$site" python -c "import importlib.metadata as m, sys; print('\n'.join(sorted({f'{d.metadata[\"Name\"]}=={d.version}' for d in m.distributions(**({\"path\": [sys.argv[1]]} if sys.argv[1] else {}))})))" "$site" 2>/dev/null || true
+    done; } > "$LOGS/environment.txt"
+  echo "   package versions -> $LOGS/environment.txt"
   ensure_baseline_deps  # an optional baseline must not fail hours later at select
   if has_stage upload; then  # a missing or read-only token should fail now, not after training
     python scripts/upload_hf.py --check ${HF_NAMESPACE:+--namespace "$HF_NAMESPACE"}
@@ -225,11 +371,11 @@ fi
 
 if has_stage prefetch; then
   echo "== prefetch (single process; avoids N processes racing on the HF cache)"
-  # + hub ids of provence:/embed:/reranker: arms in EXTRA_ARMS (llmlingua2 downloads its own model)
-  extra_models=$(echo "${EXTRA_ARMS:-}" | tr ',' '\n' | sed -nE 's/^([^=]*=)?(provence|embed|reranker):(.+)$/\3/p')
-  all_models=$(echo "$LABEL_READERS $EVAL_READERS $BACKBONE $EMBED_MODEL $extra_models" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
+  # --arms adds the hub ids the EXTRA_ARMS baselines load (ttcompress.selection.arm_models)
+  all_models=$(echo "$LABEL_READERS $EVAL_READERS $BACKBONE $EMBED_MODEL" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
   all_sources=$(echo "$TRAIN_SOURCES ${EVAL_SOURCES//,/ }" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
-  python scripts/prefetch.py --sources "$all_sources" --models "$all_models" 2>&1 | tee -a "$LOGS/prefetch.log"
+  python scripts/prefetch.py --sources "$all_sources" --models "$all_models" --arms "${EXTRA_ARMS:-}" 2>&1 \
+    | tee -a "$LOGS/prefetch.log"
 fi
 
 if has_stage labels; then
@@ -238,11 +384,15 @@ if has_stage labels; then
     for src in $TRAIN_SOURCES; do
       for split in train dev; do
         n=$N_TRAIN; [[ $split == dev ]] && n=$N_DEV
-        echo "== labels: $reader $src/$split (n=$n, tp=$tp)"
+        # the log-prob pass (a second full prefill) only where it is trained: pruner_logprob_primary.
+        # After $MEASURE_ARGS, so it wins over an --outcomes left in an older .env.
+        outcomes=f1; [[ "$reader" == "$PRIMARY_MODEL" ]] && outcomes=f1,logprob
+        echo "== labels: $reader $src/$split (n=$n, tp=$tp, outcomes=$outcomes)"
         run_sharded "labels_$(tag "$reader")_${src}_$split" "$tp" \
           python generate_labels.py measure --source "$src" --split "$split" --n "$n" \
           --reader-model "$reader" --backend "$BACKEND" --max-model-len "$MAX_MODEL_LEN" --tp "$tp" \
-          --gpu-memory-utilization "$GPU_MEM" --docs-per-call "$DOCS_PER_CALL" --out-root "$LABELS/raw" $MEASURE_ARGS
+          --gpu-memory-utilization "$GPU_MEM" --docs-per-call "$DOCS_PER_CALL" --out-root "$(raw_root "$src")" $MEASURE_ARGS \
+          --outcomes "$outcomes"
       done
     done
   done
@@ -253,51 +403,60 @@ if has_stage labels; then
       run_sharded "labels_${PRIMARY}_${src}_test" "$tp" \
         python generate_labels.py measure --source "$src" --split test --n "$ORACLE_N" \
         --reader-model "$PRIMARY_MODEL" --backend "$BACKEND" --max-model-len "$MAX_MODEL_LEN" --tp "$tp" \
-        --gpu-memory-utilization "$GPU_MEM" --docs-per-call "$DOCS_PER_CALL" --out-root "$LABELS/raw" $MEASURE_ARGS
+        --gpu-memory-utilization "$GPU_MEM" --docs-per-call "$DOCS_PER_CALL" --out-root "$(raw_root "$src")" $MEASURE_ARGS \
+        --outcomes f1
     done
   fi
 fi
 
 if has_stage fit; then
+  # independent CPU jobs (alpha comes from the raw dev measurements, not from another fit): run them together
+  mkdir -p "$LOGS/fit"
+  pool_start "$CPU_JOBS"
   for reader in $LABEL_READERS; do
     r=$(tag "$reader")
-    for target in f1 logprob; do
+    targets=f1; [[ "$reader" == "$PRIMARY_MODEL" ]] && targets="f1 logprob"
+    for target in $targets; do
       for src in $TRAIN_SOURCES; do
         for split in train dev; do
           echo "== fit: $r $target $src/$split"
-          python generate_labels.py fit --raw-dir "$LABELS/raw/$r/${src}_$split" --target "$target" \
-            --alpha-from "$LABELS/raw/$r/${src}_dev" --out-dir "$FIT/$r/$target/${src}_$split" \
-            --n "$([[ $split == dev ]] && echo "$N_DEV" || echo "$N_TRAIN")" --alpha-n "$N_DEV" \
-            >> "$LOGS/fit.log" 2>&1 || { echo "!! fit failed:"; tail -n 25 "$LOGS/fit.log"; exit 1; }
+          pool_run "fit $r $target $src/$split" "$LOGS/fit/${r}_${target}_${src}_$split.log" \
+            env OMP_NUM_THREADS=1 python generate_labels.py fit --raw-dir "$(raw_root "$src")/$r/${src}_$split" \
+            --target "$target" --alpha-from "$(raw_root "$src")/$r/${src}_dev" --out-dir "$FIT/$r/$target/${src}_$split" \
+            --n "$([[ $split == dev ]] && echo "$N_DEV" || echo "$N_TRAIN")" --alpha-n "$N_DEV"
         done
       done
     done
   done
   if (( ORACLE_N > 0 )); then
     pooled_dev=""
-    for s in $TRAIN_SOURCES; do pooled_dev="$pooled_dev,$LABELS/raw/$PRIMARY/${s}_dev"; done
+    for s in $TRAIN_SOURCES; do pooled_dev="$pooled_dev,$(raw_root "$s")/$PRIMARY/${s}_dev"; done
     for src in ${EVAL_SOURCES//,/ }; do
       # alpha from the source's own dev labels; eval-only sources (xquad_vi, 2wiki) pool the train-source dev labels
       alpha_from=${pooled_dev#,}
-      [[ " $TRAIN_SOURCES " == *" $src "* ]] && alpha_from="$LABELS/raw/$PRIMARY/${src}_dev"
+      [[ " $TRAIN_SOURCES " == *" $src "* ]] && alpha_from="$(raw_root "$src")/$PRIMARY/${src}_dev"
       echo "== fit (oracle_beta): $PRIMARY f1 $src/test"
-      python generate_labels.py fit --raw-dir "$LABELS/raw/$PRIMARY/${src}_test" --target f1 \
-        --alpha-from "$alpha_from" --out-dir "$FIT/$PRIMARY/f1/${src}_test" --n "$ORACLE_N" --alpha-n "$N_DEV" \
-        >> "$LOGS/fit.log" 2>&1 || { echo "!! fit failed:"; tail -n 25 "$LOGS/fit.log"; exit 1; }
+      pool_run "fit oracle $src" "$LOGS/fit/${PRIMARY}_f1_${src}_test.log" \
+        env OMP_NUM_THREADS=1 python generate_labels.py fit --raw-dir "$(raw_root "$src")/$PRIMARY/${src}_test" \
+        --target f1 --alpha-from "$alpha_from" --out-dir "$FIT/$PRIMARY/f1/${src}_test" --n "$ORACLE_N" --alpha-n "$N_DEV"
     done
   fi
+  pool_wait
 fi
 
 if has_stage ensemble; then
+  mkdir -p "$LOGS/ensemble"
+  pool_start "$CPU_JOBS"
   for src in $TRAIN_SOURCES; do
     for split in train dev; do
       dirs=""
       for reader in $LABEL_READERS; do dirs="$dirs,$FIT/$(tag "$reader")/f1/${src}_$split"; done
       echo "== ensemble: $src/$split"
-      python generate_labels.py ensemble --fit-dirs "${dirs#,}" --out-dir "$FIT/ensemble/f1/${src}_$split" \
-        >> "$LOGS/ensemble.log" 2>&1 || { echo "!! ensemble failed:"; tail -n 25 "$LOGS/ensemble.log"; exit 1; }
+      pool_run "ensemble $src/$split" "$LOGS/ensemble/${src}_$split.log" \
+        env OMP_NUM_THREADS=1 python generate_labels.py ensemble --fit-dirs "${dirs#,}" --out-dir "$FIT/ensemble/f1/${src}_$split"
     done
   done
+  pool_wait
 fi
 
 label_dirs() {  # label_dirs <reader-tag-or-ensemble> <target> <split>
@@ -318,31 +477,20 @@ if has_stage train; then
   for seed in $EXTRA_SEEDS; do  # name | source | reader | target | extra | seed
     RUNS+=("pruner_beta_primary_s$seed|beta|$PRIMARY|f1||$seed" "pruner_beta_ensemble_s$seed|ensemble|ensemble|f1||$seed")
   done
-  pids=(); names=(); g=0
-  flush_train() {
-    local failed=0
-    for i in "${!pids[@]}"; do
-      if ! wait "${pids[$i]}"; then
-        failed=1; echo "!! train ${names[$i]} FAILED:"; tail -n 25 "$LOGS/train_${names[$i]}.log"
-      fi
-    done
-    pids=(); names=()
-    (( failed == 0 )) || exit 1
-  }
+  # one run per GPU; the next run starts as soon as any GPU frees (9 runs on 4 GPUs: no 1-GPU last wave)
+  pool_start "$NUM_GPUS"
   for run in "${RUNS[@]}"; do
     IFS='|' read -r name source reader target extra seed <<< "$run"
     if [[ -f "$MODELS/$name/train_log.json" ]]; then echo "== train $name: done, skipping"; continue; fi
-    echo "== train $name (GPU $g) -> $LOGS/train_$name.log"
+    pool_slot
+    echo "== train $name (GPU ${GPU_IDS[$POOL_SLOT]}) -> $LOGS/train_$name.log"
     # shellcheck disable=SC2086
-    CUDA_VISIBLE_DEVICES=${GPU_IDS[$g]} python train_pruner.py --label-source "$source" \
+    pool_run "train $name" "$LOGS/train_$name.log" \
+      env CUDA_VISIBLE_DEVICES="${GPU_IDS[$POOL_SLOT]}" python train_pruner.py --label-source "$source" \
       --train-labels "$(label_dirs "$reader" "$target" train)" --dev-labels "$(label_dirs "$reader" "$target" dev)" \
-      --backbone "$BACKBONE" --grad-checkpointing $extra $TRAIN_ARGS ${seed:+--seed "$seed"} --out-dir "$MODELS/$name" \
-      > "$LOGS/train_$name.log" 2>&1 &
-    pids+=($!); names+=("$name")
-    g=$(( (g + 1) % NUM_GPUS ))
-    if (( g == 0 )); then flush_train; fi
+      --backbone "$BACKBONE" --grad-checkpointing $extra $TRAIN_ARGS ${seed:+--seed "$seed"} --out-dir "$MODELS/$name"
   done
-  flush_train
+  pool_wait
 fi
 
 if has_stage select; then
@@ -356,7 +504,7 @@ if has_stage select; then
     ARMS="$ARMS,ours_beta_s$seed=pruner:$MODELS/pruner_beta_primary_s$seed"
     ARMS="$ARMS,ours_ens_s$seed=pruner:$MODELS/pruner_beta_ensemble_s$seed"
   done
-  ARMS="$ARMS${EXTRA_ARMS:+,$EXTRA_ARMS}"   # e.g. EXTRA_ARMS="xprovence=provence:naver/xprovence-reranker-bgem3-v1,llmlingua2"
+  ARMS="$ARMS${EXTRA_ARMS:+,$EXTRA_ARMS}"   # published compressors, see .env.example
   oracle_flags=()
   if (( ORACLE_N > 0 )); then
     oracle_dirs=""
@@ -374,9 +522,20 @@ if has_stage select; then
       echo "!! $ckpt is not a finished pruner checkpoint; run the train stage first (logs: $LOGS/train_*.log)"; exit 1
     fi
   done
-  echo "== select ($ARMS)"
-  run_sharded select 1 python evaluate.py select --sources "$EVAL_SOURCES" --split test --n "$N_TEST" \
-    --arms "$ARMS" --ratios "$RATIOS" --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" ${oracle_flags[@]+"${oracle_flags[@]}"} $SELECT_ARGS
+  # llmlingua / longllmlingua run in a second pass with the old transformers on PYTHONPATH; it reuses the
+  # documents_shard files the first pass wrote (same settings), so it never imports `datasets`
+  main_arms=$(echo "$ARMS" | tr ',' '\n' | { grep -vE "$LEGACY_ARM_RE" || true; } | paste -sd, -)
+  legacy_arms=$(echo "$ARMS" | tr ',' '\n' | { grep -E "$LEGACY_ARM_RE" || true; } | paste -sd, -)
+  echo "== select ($main_arms)"
+  run_sharded select 1 env PYTHONPATH="$BASELINE_SITE${PYTHONPATH:+:$PYTHONPATH}" python evaluate.py select \
+    --sources "$EVAL_SOURCES" --split test --n "$N_TEST" \
+    --arms "$main_arms" --ratios "$RATIOS" --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" ${oracle_flags[@]+"${oracle_flags[@]}"} $SELECT_ARGS
+  if [[ -n "$legacy_arms" ]]; then
+    echo "== select with transformers 4.46.3 from $LLMLINGUA_SITE ($legacy_arms)"
+    run_sharded select_llmlingua 1 env PYTHONPATH="$LLMLINGUA_SITE${PYTHONPATH:+:$PYTHONPATH}" python evaluate.py select \
+      --sources "$EVAL_SOURCES" --split test --n "$N_TEST" --arms "$legacy_arms" --ratios "$RATIOS" \
+      --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" $SELECT_ARGS
+  fi
 fi
 
 if has_stage answer; then
@@ -395,11 +554,17 @@ if has_stage report; then
   for reader in $EVAL_READERS; do [[ " $LABEL_READERS " == *" $reader "* ]] || heldout="$heldout,$(tag "$reader")"; done
   python evaluate.py report --out-dir "$EVAL_DIR" --ours ours_beta,ours_ens --primary-reader "$PRIMARY" \
     --heldout-readers "${heldout#,}" --equiv-margin "$EQUIV_MARGIN" --oracle-margin "$ORACLE_MARGIN" \
-    --min-upgrade-gap "$MIN_UPGRADE_GAP" --labels-dir "$LABELS" --fit-dir "$FIT" > "$LOGS/report.log" 2>&1 \
+    --min-upgrade-gap "$MIN_UPGRADE_GAP" --labels-dir "$(echo "$LABELS,$LABELS_MAIN" | tr ',' '\n' | awk '!seen[$0]++' | paste -sd, -)" --fit-dir "$FIT" > "$LOGS/report.log" 2>&1 \
     || { tail -n 25 "$LOGS/report.log"; exit 1; }
   python scripts/paper_tables.py --report "$EVAL_DIR/report.json" --primary-reader "$PRIMARY" >> "$LOGS/report.log" 2>&1 \
     || { tail -n 25 "$LOGS/report.log"; exit 1; }
-  echo "report: $EVAL_DIR/report.md (paper tables + CSVs: $EVAL_DIR/paper/)"
+  if python -c "import matplotlib" 2>/dev/null; then   # figures are optional: they can be drawn locally from report.json
+    python scripts/paper_figures.py --report "$EVAL_DIR/report.json" --primary-reader "$PRIMARY" >> "$LOGS/report.log" 2>&1 \
+      || { tail -n 25 "$LOGS/report.log"; exit 1; }
+  else
+    echo "   (no matplotlib: run scripts/paper_figures.py --report $EVAL_DIR/report.json locally for the figures)"
+  fi
+  echo "report: $EVAL_DIR/report.md (paper tables + CSVs + figures: $EVAL_DIR/paper/)"
 fi
 
 if has_stage upload; then
@@ -407,7 +572,7 @@ if has_stage upload; then
   upload_flags=(--prefix "$HF_REPO_PREFIX" --run-name "$HF_RUN_NAME" --models-dir "$MODELS" --eval-dir "$EVAL_DIR"
                 --labels-dir "$LABELS" --fit-dir "$FIT")
   [[ -n "$HF_NAMESPACE" ]] && upload_flags+=(--namespace "$HF_NAMESPACE")
-  [[ "$HF_PRIVATE" == true ]] || upload_flags+=(--public)
+  [[ "${HF_PRIVATE,,}" =~ ^(false|0|no)$ ]] && upload_flags+=(--public)   # anything else stays private
   [[ "$HF_UPLOAD_LABELS" == true ]] && upload_flags+=(--include-labels)
   python scripts/upload_hf.py "${upload_flags[@]}" 2>&1 | tee -a "$LOGS/upload.log"
 fi

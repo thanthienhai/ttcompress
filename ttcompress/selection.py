@@ -5,8 +5,10 @@ gets budget = ceil(full_tokens / ratio) for the same document and ratio.
 Chunk arms return per-chunk scores; `select_by_scores` keeps the best chunks
 that fit (greedy by score, original order preserved). If not even the best
 chunk fits, it is kept truncated to the budget, so no arm ever gets an empty
-context. Text arms (LLMLingua-2) compress the string themselves at
-rate = 1/ratio; their realized token count is recorded, never assumed.
+context. Sentence arms (RECOMP, EXIT) score sentences and are selected the
+same way over sentences (`select_sentences`). Text arms (LLMLingua family)
+compress the string themselves at rate = 1/ratio; their realized token count
+is recorded, never assumed.
 
 Arms (name -> what it is):
   full             no compression (reference ceiling, ratio ignored)
@@ -21,7 +23,14 @@ Arms (name -> what it is):
   oracle_beta      Stage A attribution of the test document (upper bound; needs --oracle-beta-dir)
   pruner:<path>    our distilled pruner (any number of checkpoints)
   provence:<hf_id> Provence / XProvence reranking score per chunk (naver/...)
+  recomp[:<hf_id>] RECOMP extractive compressor, sentence-level (NQ / HotpotQA checkpoint by hop)
+  exit[:<adapter>] EXIT sentence classifier (Gemma-2B-it + LoRA), sentence-level
+  llmlingua[:<lm>]      LLMLingua token-level compression (needs transformers<=4.47.1)
+  longllmlingua[:<lm>]  LongLLMLingua, question-aware (needs transformers<=4.47.1)
   llmlingua2       LLMLingua-2 token-level compression
+Not included, because their output length cannot be set to a budget: RECOMP abstractive, CompAct,
+CORE-RAG (no released checkpoint). Selective Context is English/Chinese-only and superseded by the
+LLMLingua family.
 """
 from __future__ import annotations
 
@@ -65,6 +74,84 @@ def select_by_scores(doc: QADocument, scores: Sequence[float], lengths: Sequence
     best = order[0]
     ids = tokenizer.encode(doc.chunks[best], add_special_tokens=False)[:budget]
     return Selection([best], tokenizer.decode(ids), len(ids), budget, sum(lengths), truncated=True)
+
+
+# ---------------------------------------------------------------------------
+# sentence units (RECOMP / EXIT select sentences, not chunks)
+# ---------------------------------------------------------------------------
+
+_SENT_END = re.compile(r'(?<=[.!?…])\s+(?=\S)')
+
+
+def split_sentences(text: str) -> List[str]:
+    """Rule-based splitter (terminal punctuation or newline), language-agnostic so Vietnamese and
+    English documents are cut the same way; every sentence arm shares it."""
+    return [s.strip() for line in text.split('\n') for s in _SENT_END.split(line) if s.strip()]
+
+
+def chunk_title(doc: QADocument, i: int) -> str:
+    """Multi-hop chunks are 'Title\\nparagraph' (sources.multihop_row_to_doc); the title is kept once per
+    touched chunk so a kept sentence never loses the entity it is about."""
+    chunk = doc.chunks[i]
+    return chunk.split('\n', 1)[0].strip() if doc.hop == 'multi' and '\n' in chunk else ''
+
+
+@dataclass
+class SentenceUnit:
+    chunk: int
+    text: str
+
+
+def sentence_units(doc: QADocument) -> List[SentenceUnit]:
+    units = []
+    for i, chunk in enumerate(doc.chunks):
+        body = chunk.split('\n', 1)[1] if chunk_title(doc, i) else chunk
+        units.extend(SentenceUnit(i, s) for s in split_sentences(body))
+    return units
+
+
+def units_text(doc: QADocument, units: Sequence[SentenceUnit], keep: Sequence[int]) -> str:
+    by_chunk: Dict[int, List[str]] = {}
+    for j in sorted(set(keep)):
+        by_chunk.setdefault(units[j].chunk, []).append(units[j].text)
+    parts = []
+    for i in sorted(by_chunk):
+        title = chunk_title(doc, i)
+        body = ' '.join(by_chunk[i])
+        parts.append(f'{title}\n{body}' if title else body)
+    return '\n\n'.join(parts)
+
+
+def select_sentences(doc: QADocument, units: Sequence[SentenceUnit], scores: Sequence[float], count,
+                     budget: int, tokenizer) -> Selection:
+    """Greedy by score under the budget, like select_by_scores, but over sentences; kept sentences are
+    re-assembled in original order (title + sentences per chunk). The cost of a sentence is its own
+    tokens plus its chunk's title the first time the chunk is touched; the assembled text is recounted
+    and the weakest kept sentence dropped until it fits, so separators never push it over the budget.
+    `kept` lists the touched chunks."""
+    lengths = [count(u.text) for u in units]
+    title_len = {i: count(chunk_title(doc, i)) for i in {u.chunk for u in units}}
+    order = sorted(range(len(units)), key=lambda j: (-scores[j], j))
+    keep, opened, used = [], set(), 0
+    for j in order:
+        c = units[j].chunk
+        cost = lengths[j] + (0 if c in opened else title_len[c])
+        if used + cost <= budget:
+            keep.append(j)
+            opened.add(c)
+            used += cost
+    full_tokens = count(doc.text())
+    while keep:
+        text = units_text(doc, units, keep)
+        n = count(text)
+        if n <= budget:
+            return Selection(sorted({units[j].chunk for j in keep}), text, n, budget, full_tokens)
+        keep.pop()  # `keep` is in score order: drop the weakest
+    if not units:  # no sentence at all (empty document): fall back to the first chunk, cut
+        units, order = [SentenceUnit(0, doc.chunks[0])], [0]
+    best = order[0]
+    ids = tokenizer.encode(units_text(doc, units, [best]), add_special_tokens=False)[:budget]
+    return Selection([units[best].chunk], tokenizer.decode(ids), len(ids), budget, full_tokens, truncated=True)
 
 
 # ---------------------------------------------------------------------------
@@ -180,14 +267,148 @@ class ProvenceScorer:
         return [float(s[0] if isinstance(s, (list, tuple)) else s) for s in scores]
 
 
+class RecompScorer:
+    """RECOMP extractive compressor (Xu et al., 2024; carriex/recomp run_extractive_compressor.py): a
+    Contriever-initialised encoder shared by question and sentence, mean pooling over the attention mask,
+    raw dot product (no normalisation, no prefix). The released checkpoints are task-specific, so by
+    default single-hop documents use the NQ one and multi-hop the HotpotQA one; `recomp:<hf_id>` forces
+    one. The paper keeps the top 1-2 sentences; here sentences are ranked under the shared budget.
+    English uncased vocabulary: Vietnamese is scored zero-shot."""
+
+    DEFAULT = {'single': 'fangyuan/nq_extractive_compressor', 'multi': 'fangyuan/hotpotqa_extractive_compressor'}
+
+    def __init__(self, model_name: Optional[str] = None, device: str = 'cuda', max_len: int = 512,
+                 batch_size: int = 64):
+        import torch
+        from .reader import resolve_device
+        self.torch, self.device = torch, resolve_device(device)
+        self.model_name, self.max_len, self.batch_size = model_name, max_len, batch_size
+        self._loaded: Dict[str, tuple] = {}
+
+    def _model(self, name: str):
+        if name not in self._loaded:
+            from transformers import AutoModel, AutoTokenizer
+            self._loaded[name] = (AutoTokenizer.from_pretrained(name),
+                                  AutoModel.from_pretrained(name).to(self.device).eval())
+        return self._loaded[name]
+
+    def _embed(self, name: str, texts: Sequence[str]):
+        torch = self.torch
+        tok, model = self._model(name)
+        out = []
+        with torch.no_grad():
+            for start in range(0, len(texts), self.batch_size):
+                enc = tok(list(texts[start:start + self.batch_size]), padding=True, truncation=True,
+                          max_length=self.max_len, return_tensors='pt').to(self.device)
+                hidden = model(**enc).last_hidden_state.float()
+                mask = enc['attention_mask'][..., None].float()
+                out.append((hidden * mask).sum(dim=1) / mask.sum(dim=1))
+        return torch.cat(out)
+
+    def score_sentences(self, doc: QADocument, units: Sequence[SentenceUnit]) -> List[float]:
+        name = self.model_name or self.DEFAULT[doc.hop]
+        q = self._embed(name, [doc.question])[0]
+        return (self._embed(name, [u.text for u in units]) @ q).cpu().tolist()
+
+
+class ExitScorer:
+    """EXIT (Hwang et al., 2025; ThisIsHwang/EXIT compressors/baselines/exit/{core,compressor}.py):
+    Gemma-2B-it with the released LoRA adapter reads the query, the sentence's containing document and the
+    sentence, and the score is P(Yes) from a softmax over the "Yes"/"No" logits at the next position. The
+    paper keeps sentences with P(Yes) >= 0.5; here they are ranked under the shared budget. bf16 instead
+    of the paper's 4-bit NF4 (a quantisation choice for speed, not part of the method). Explicit position
+    ids, so left padding does not shift a prompt's positions. English-only model: Vietnamese is scored
+    zero-shot. The base model is gated (accept the Gemma license on huggingface.co)."""
+
+    PROMPT = ('<start_of_turn>user\nQuery:\n{query}\nFull context:\n{context}\nSentence:\n{sentence}\n'
+              'Is this sentence useful in answering the query? Answer only "Yes" or "No".<end_of_turn>\n'
+              '<start_of_turn>model\n')
+    DEFAULT_ADAPTER = 'doubleyyh/exit-gemma-2b'
+    BASE = 'google/gemma-2b-it'
+
+    def __init__(self, adapter: Optional[str] = DEFAULT_ADAPTER, base: str = BASE, device: str = 'cuda',
+                 batch_size: int = 16):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from .reader import dtype_kwargs, resolve_device
+        self.torch, self.device, self.batch_size = torch, resolve_device(device), batch_size
+        self.tokenizer = AutoTokenizer.from_pretrained(base)
+        self.tokenizer.padding_side = 'left'
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        dtype = torch.bfloat16 if self.device != 'cpu' else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(base, **dtype_kwargs(dtype))
+        if adapter:
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
+        self.model = model.to(self.device).eval()
+        self.yes_id = self.tokenizer.encode('Yes', add_special_tokens=False)[0]
+        self.no_id = self.tokenizer.encode('No', add_special_tokens=False)[0]
+
+    def score_sentences(self, doc: QADocument, units: Sequence[SentenceUnit]) -> List[float]:
+        torch = self.torch
+        prompts = [self.PROMPT.format(query=doc.question, context=doc.chunks[u.chunk], sentence=u.text)
+                   for u in units]
+        order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))  # similar lengths per batch
+        scores = [0.0] * len(prompts)
+        with torch.no_grad():
+            for start in range(0, len(order), self.batch_size):
+                idx = order[start:start + self.batch_size]
+                enc = self.tokenizer([prompts[i] for i in idx], padding=True, return_tensors='pt').to(self.device)
+                pos = (enc['attention_mask'].cumsum(-1) - 1).clamp(min=0)
+                logits = self.model(**enc, position_ids=pos).logits[:, -1, :]
+                p_yes = torch.softmax(logits[:, [self.yes_id, self.no_id]].float(), dim=-1)[:, 0]
+                for i, p in zip(idx, p_yes.cpu().tolist()):
+                    scores[i] = p
+        return scores
+
+
+LLMLINGUA_MAX_TRANSFORMERS = '4.47.1'
+
+
+class LLMLinguaCompressor:
+    """LLMLingua (Jiang et al., 2023) and question-aware LongLLMLingua (Jiang et al., 2024) through the
+    `llmlingua` package (0.2.2), LongLLMLingua with the settings its README recommends. The chunks are
+    passed as the package's document list; the question conditions LongLLMLingua but is not part of the
+    returned text. Both need `transformers<=4.47.1`: their perplexity loop feeds past_key_values back as
+    legacy tuples, which later versions reject (microsoft/LLMLingua#210). run_pipeline.sh runs these arms
+    with such a transformers on PYTHONPATH. The small LM defaults to Qwen2.5-7B-Instruct instead of the
+    package's English Llama-2-7B, so the Vietnamese sources get a multilingual compressor."""
+
+    DEFAULT_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
+
+    def __init__(self, model_name: str = DEFAULT_MODEL, long: bool = False, device: str = 'cuda'):
+        import transformers
+        from packaging.version import Version
+        if Version(transformers.__version__) > Version(LLMLINGUA_MAX_TRANSFORMERS):
+            raise RuntimeError(f"llmlingua/longllmlingua arms need transformers<={LLMLINGUA_MAX_TRANSFORMERS} "
+                               f"(found {transformers.__version__}); run_pipeline.sh installs one on PYTHONPATH "
+                               f"for these arms (see LLMLINGUA_SITE)")
+        from llmlingua import PromptCompressor
+        from .reader import resolve_device
+        self.long = long
+        self.compressor = PromptCompressor(model_name=model_name, device_map=resolve_device(device))
+
+    def compress(self, doc: QADocument, ratio: float) -> str:
+        kwargs = dict(instruction='', question='', rate=1.0 / ratio)
+        if self.long:
+            kwargs.update(question=doc.question, concate_question=False, rank_method='longllmlingua',
+                          condition_in_question='after_condition', reorder_context='sort',
+                          dynamic_context_compression_ratio=0.3, condition_compare=True, context_budget='+100')
+        return self.compressor.compress_prompt(list(doc.chunks), **kwargs)['compressed_prompt']
+
+
+LLMLINGUA2_DEFAULT = 'microsoft/llmlingua-2-xlm-roberta-large-meetingbank'
+
+
 class LLMLingua2Compressor:
-    def __init__(self, model_name: str = 'microsoft/llmlingua-2-xlm-roberta-large-meetingbank', device: str = 'cuda'):
+    def __init__(self, model_name: str = LLMLINGUA2_DEFAULT, device: str = 'cuda'):
         from llmlingua import PromptCompressor
         from .reader import resolve_device
         self.compressor = PromptCompressor(model_name=model_name, use_llmlingua2=True, device_map=resolve_device(device))
 
-    def compress(self, text: str, ratio: float) -> str:
-        return self.compressor.compress_prompt(text, rate=1.0 / ratio, force_tokens=['\n'])['compressed_prompt']
+    def compress(self, doc: QADocument, ratio: float) -> str:
+        return self.compressor.compress_prompt(doc.text(), rate=1.0 / ratio, force_tokens=['\n'])['compressed_prompt']
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +416,8 @@ class LLMLingua2Compressor:
 # ---------------------------------------------------------------------------
 
 class Arm:
-    """name, kind ('chunk' | 'text' | 'full'); chunk arms implement scores(doc)."""
+    """name, kind ('chunk' | 'sentence' | 'text' | 'full'); chunk arms implement scores(doc), sentence
+    arms sentence_scores(doc), text arms compress_text(doc, ratio)."""
 
     def __init__(self, name: str, kind: str, scorer=None, text_compressor=None, table: Optional[Dict] = None):
         self.name, self.kind = name, kind
@@ -222,8 +444,12 @@ class Arm:
             return list(beta) if beta is not None and len(beta) == C else None
         return self._scorer.score_chunks(doc.question, doc.chunks)
 
+    def sentence_scores(self, doc: QADocument):
+        units = sentence_units(doc)
+        return units, (self._scorer.score_sentences(doc, units) if units else [])
+
     def compress_text(self, doc: QADocument, ratio: float) -> str:
-        return self._text.compress(doc.text(), ratio)
+        return self._text.compress(doc, ratio)
 
 
 def load_beta_table(label_dirs: str) -> Dict[str, List[float]]:
@@ -231,6 +457,20 @@ def load_beta_table(label_dirs: str) -> Dict[str, List[float]]:
     from .attribution import load_chunk_labels, record_paths
     paths = [p for d in label_dirs.split(',') if d for p in record_paths(d)]
     return {lab.doc['doc_id']: lab.beta for lab in (load_chunk_labels(p) for p in paths)}
+
+
+def arm_models(spec: str) -> List[str]:
+    """Hub ids an arm downloads, so scripts/prefetch.py can fetch them once before the shards start
+    (and a gated one fails in the first minute)."""
+    name, _, arg = spec.partition(':')
+    defaults = {'embed': ['BAAI/bge-m3'], 'reranker': ['BAAI/bge-reranker-v2-m3'], 'llmlingua2': [LLMLINGUA2_DEFAULT],
+                'llmlingua': [LLMLinguaCompressor.DEFAULT_MODEL], 'longllmlingua': [LLMLinguaCompressor.DEFAULT_MODEL],
+                'recomp': sorted(RecompScorer.DEFAULT.values()), 'provence': []}
+    if name == 'exit':
+        return [ExitScorer.BASE, arg or ExitScorer.DEFAULT_ADAPTER]
+    if name in defaults:
+        return [arg] if arg else defaults[name]
+    return []
 
 
 def make_arm(spec: str, device: str = 'cuda', oracle_beta_dir: Optional[str] = None) -> Arm:
@@ -254,6 +494,15 @@ def make_arm(spec: str, device: str = 'cuda', oracle_beta_dir: Optional[str] = N
     if spec.startswith('provence:'):
         return Arm(spec, 'chunk', scorer=ProvenceScorer(spec.split(':', 1)[1], device))
     if spec == 'llmlingua2' or spec.startswith('llmlingua2:'):
-        model = spec.split(':', 1)[1] if ':' in spec else 'microsoft/llmlingua-2-xlm-roberta-large-meetingbank'
+        model = spec.split(':', 1)[1] if ':' in spec else LLMLINGUA2_DEFAULT
         return Arm(spec, 'text', text_compressor=LLMLingua2Compressor(model, device))
+    for name, long in (('llmlingua', False), ('longllmlingua', True)):
+        if spec == name or spec.startswith(name + ':'):
+            model = spec.split(':', 1)[1] if ':' in spec else LLMLinguaCompressor.DEFAULT_MODEL
+            return Arm(spec, 'text', text_compressor=LLMLinguaCompressor(model, long, device))
+    if spec == 'recomp' or spec.startswith('recomp:'):
+        return Arm(spec, 'sentence', scorer=RecompScorer(spec.split(':', 1)[1] if ':' in spec else None, device))
+    if spec == 'exit' or spec.startswith('exit:'):
+        adapter = spec.split(':', 1)[1] if ':' in spec else ExitScorer.DEFAULT_ADAPTER
+        return Arm(spec, 'sentence', scorer=ExitScorer(adapter, device=device))
     raise ValueError(f"unknown arm {spec!r}")

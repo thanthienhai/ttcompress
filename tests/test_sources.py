@@ -101,9 +101,15 @@ def test_multihop_dev_test_disjoint(source):
 def test_uit_viquad_dev_test_disjoint_by_title_and_train_titles_disjoint():
     dev = load_documents('uit_viquad', 'dev', n=40, haystack_chars=5000)
     test = load_documents('uit_viquad', 'test', n=40, haystack_chars=5000)
+    train = load_documents('uit_viquad', 'train', n=40, haystack_chars=5000)
     dev_titles = {d.metadata['title'] for d in dev}
     test_titles = {d.metadata['title'] for d in test}
-    assert not dev_titles & test_titles
+    train_titles = {d.metadata['title'] for d in train}
+    assert not dev_titles & test_titles and not dev_titles & train_titles and not test_titles & train_titles
+    # v2: dev comes from the official train articles, test is the whole official validation
+    from ttcompress.sources import _uit_rows
+    assert len({r['title'] for r in _uit_rows('test')}) == 19
+    assert len({r['title'] for r in _uit_rows('dev')}) >= 8
     for d in dev + test:
         assert len(d.gold_chunks) == 1
         needle = d.chunks[d.gold_chunks[0]].lower()

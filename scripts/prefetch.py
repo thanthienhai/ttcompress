@@ -8,7 +8,8 @@ access should fail in the first minute, not hours into
 label generation.
 
     python scripts/prefetch.py --sources uit_viquad,xquad_vi,vimqa,hotpotqa,2wiki \\
-        --models Qwen/Qwen3-8B,Qwen/Qwen3-1.7B,BAAI/bge-reranker-v2-m3,BAAI/bge-m3
+        --models Qwen/Qwen3-8B,Qwen/Qwen3-1.7B,BAAI/bge-reranker-v2-m3,BAAI/bge-m3 \\
+        --arms xprovence=provence:naver/xprovence-reranker-bgem3-v1,recomp,exit,longllmlingua
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from evaluate import parse_arms  # noqa: E402
+from ttcompress.selection import arm_models  # noqa: E402
 from ttcompress.sources import AVAILABLE_SPLITS, load_documents, parse_source_list  # noqa: E402
 
 WEIGHT_PATTERNS = ['*.json', '*.safetensors', '*.model', '*.txt', '*.py', '*.tiktoken', 'tokenizer*', '*.jinja']
@@ -28,6 +31,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--sources', default='all')
     ap.add_argument('--models', default='', help="comma list of HF model ids")
+    ap.add_argument('--arms', default='', help="evaluate.py arm list (e.g. EXTRA_ARMS); adds the models they load")
     args = ap.parse_args()
 
     failures = []
@@ -41,11 +45,16 @@ def main():
                 failures.append(f"dataset {src}/{split}: {type(exc).__name__}: {exc}")
                 print(failures[-1], flush=True)
 
-    from huggingface_hub import snapshot_download
-    for model in [m.strip() for m in args.models.split(',') if m.strip()]:
+    from huggingface_hub import list_repo_files, snapshot_download
+    models = [m.strip() for m in args.models.split(',') if m.strip()]
+    models += [m for _, spec in parse_arms(args.arms) for m in arm_models(spec)]
+    for model in dict.fromkeys(models):
         t0 = time.time()
         try:
-            path = snapshot_download(model, allow_patterns=WEIGHT_PATTERNS)
+            patterns = WEIGHT_PATTERNS
+            if not any(f.endswith('.safetensors') for f in list_repo_files(model)):
+                patterns = patterns + ['*.bin']   # e.g. the RECOMP compressors ship pytorch_model.bin only
+            path = snapshot_download(model, allow_patterns=patterns)
             print(f"model {model}: ok -> {path} ({time.time() - t0:.0f}s)", flush=True)
         except Exception as exc:
             hint = " (gated model: accept its license on huggingface.co and export HF_TOKEN)" \

@@ -16,15 +16,16 @@ Losses:
 Default: listnet + 0.5 * mse for beta/ensemble, bce for span.
 
 Reductions: listnet SUMS over the C chunks (a cross-entropy between two
-distributions, Cao et al. 2007); mse is the MEAN over chunks. The two LOSS
-VALUES scale differently with C (listnet ~ log C at init), but what the
-optimizer sees is balanced: d(listnet)/ds_i = p_i - q_i and d(mse)/ds_i =
-2 (s_i - t_i) / C are both O(1/C) per chunk for z-scored targets, so the
-gradient-norm ratio w_mse*mse : listnet stays ~1 from C=2 to C=40
-(tests/test_pruner.py::test_listnet_mse_gradient_balance_is_chunk_count_invariant).
-Averaging listnet over chunks instead would shrink its gradient by 1/C and
-let the mse term dominate long documents. Both components are logged per
-epoch (train_pruner.py) so the balance is visible in train_log.json.
+distributions, Cao et al. 2007); mse is the MEAN over chunks (the paper
+states it this way). With tau=1 both terms have the same minimiser (scores
+= z), so the mix does not move the ranking target, only the emphasis. The
+gradient-norm ratio w_mse*mse : listnet is ~1 for smooth (Gaussian) targets
+at any C, but real labels are spiky (one needle / two supporting paragraphs)
+and there it falls with C at initialisation: measured ~1.3 at C=2, ~0.5-0.7
+at C=10, ~0.2-0.3 at C=40 -- long single-hop haystacks lean on the listnet
+(top-of-ranking) term more than 10-paragraph multi-hop documents do.
+Averaging listnet over chunks would instead shrink its gradient by 1/C.
+Both components are logged per epoch (train_pruner.py, train_log.json).
 
 Optional position adjustment: subtract a pooled relative-position prior
 (attribution.fit_position_prior) from the z-labels before training, so the
@@ -124,6 +125,10 @@ def accumulation_group_size(pos: int, n: int, docs_per_step: int) -> int:
 def ranking_metrics(scores: Sequence[float], ex: TrainExample, keep_fraction: float = 0.25) -> Dict[str, float]:
     """Reader-free dev metrics: gold recall inside the top ~keep_fraction of
     chunks, and agreement with the (single-reader or ensemble) beta label."""
+    if not np.all(np.isfinite(np.asarray(scores, dtype=float))):
+        # a NaN model must not look like `lead` (argsort keeps document order) and win model selection
+        nan = float('nan')
+        return {'gold_recall@25%': nan, **({'ndcg@3_beta': nan, 'spearman_beta': nan} if ex.beta_z is not None else {})}
     order = np.argsort(-np.asarray(scores, dtype=float), kind='stable')
     k = max(1, round(len(scores) * keep_fraction))
     top = set(order[:k].tolist())

@@ -19,7 +19,8 @@ import json
 import os
 import sys
 
-DEFAULT_ARMS = 'lead,bm25,embed,reranker,xprovence,llmlingua2,span_sup,ours_beta,ours_ens,oracle_span,oracle_beta'
+DEFAULT_ARMS = ('lead,bm25,embed,reranker,provence,xprovence,recomp,exit,llmlingua,longllmlingua,llmlingua2,span_sup,'
+                'ours_beta,ours_ens,oracle_span,oracle_beta')
 
 
 def load_runs(specs):

@@ -92,8 +92,9 @@ def main():
     train = make_examples(train_labels, args.label_source, prior)
     # dev keeps the unadjusted label: model selection targets the real attribution
     dev = make_examples(dev_labels, 'span' if args.label_source == 'span' else 'beta')
-    if args.max_train_docs:
-        train = train[:args.max_train_docs]
+    if args.max_train_docs and args.max_train_docs < len(train):
+        # train is ordered by source: taking the first N would train on the first source only
+        train = random.Random(args.seed).sample(train, args.max_train_docs)
     if not train:
         raise SystemExit("no usable training documents (all uninformative?)")
     metric = args.select_metric or ('gold_recall@25%' if args.label_source == 'span' else 'ndcg@3_beta')
@@ -125,10 +126,10 @@ def main():
 
     windows_cache = {}
     best, log = -float('inf'), []
-    step = 0
+    step, bad_docs, skipped_steps = 0, 0, 0
     for epoch in range(args.epochs):
         order = list(range(len(train)))
-        random.Random(args.seed + epoch).shuffle(order)
+        random.Random(args.seed * 1_000_003 + epoch).shuffle(order)   # seed 0 keeps its orders
         running, n_docs, t0 = 0.0, 0, time.time()
         components = defaultdict(float)
         optimizer.zero_grad()
@@ -141,14 +142,22 @@ def main():
             parts = {}
             group = accumulation_group_size(pos, len(order), args.docs_per_step)
             loss = example_loss(scores.float(), ex, args.label_source, args.tau, args.w_mse, parts) / group
-            loss.backward()
-            running += loss.item() * group
+            if not torch.isfinite(loss):   # never backpropagate it: one NaN reaches every weight through the step
+                bad_docs += 1
+                print(f"  [WARN] non-finite loss on {ex.doc_id}; document skipped", flush=True)
+            else:
+                loss.backward()
+                running += loss.item() * group
             for k, v in parts.items():
                 components[k] += v
             n_docs += 1
             if (pos + 1) % args.docs_per_step == 0 or pos == len(order) - 1:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                if torch.isfinite(grad_norm):
+                    optimizer.step()
+                else:                      # skip the update instead of writing NaN into the weights
+                    skipped_steps += 1
+                    print(f"  [WARN] non-finite gradient norm at step {step}; update skipped", flush=True)
                 schedule.step()
                 optimizer.zero_grad()
                 step += 1
@@ -156,7 +165,8 @@ def main():
                     print(f"  epoch {epoch + 1} step {step}/{total_steps} loss {running / n_docs:.4f} "
                           f"({(time.time() - t0) / n_docs:.2f}s/doc)", flush=True)
         dev_metrics = evaluate_dev(model, tokenizer, dev, args, device, pad_id)
-        entry = {'epoch': epoch + 1, 'train_loss': running / max(1, n_docs),
+        entry = {'epoch': epoch + 1, 'train_loss': running / max(1, n_docs), 'nonfinite_docs': bad_docs,
+                 'skipped_steps': skipped_steps,
                  'train_components': {k: v / max(1, n_docs) for k, v in components.items()}, 'dev': dev_metrics}
         log.append(entry)
         print(f"epoch {epoch + 1}: train_loss={entry['train_loss']:.4f} "
@@ -165,7 +175,7 @@ def main():
         if score == score and score > best:
             best = score
             model.save_pretrained(args.out_dir, tokenizer, extra={
-                'max_len': args.max_len, 'backbone': args.backbone, 'label_source': args.label_source,
+                'max_len': args.max_len, 'pair_format': True, 'backbone': args.backbone, 'label_source': args.label_source,
                 'train_labels': args.train_labels, 'position_adjust': args.position_adjust,
                 'best_epoch': epoch + 1, 'select_metric': metric, 'best_dev': dev_metrics})
             print(f"  saved (best dev {metric}={best:.4f}) -> {args.out_dir}")
@@ -173,7 +183,7 @@ def main():
     if best == -float('inf'):  # dev metric undefined every epoch (e.g. no informative dev docs): keep the last
         print(f"[WARN] dev {metric} was never defined; saving the final epoch instead of the best one")
         model.save_pretrained(args.out_dir, tokenizer, extra={
-            'max_len': args.max_len, 'backbone': args.backbone, 'label_source': args.label_source,
+            'max_len': args.max_len, 'pair_format': True, 'backbone': args.backbone, 'label_source': args.label_source,
             'train_labels': args.train_labels, 'position_adjust': args.position_adjust,
             'best_epoch': args.epochs, 'select_metric': None})
     os.makedirs(args.out_dir, exist_ok=True)
