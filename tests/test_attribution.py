@@ -29,6 +29,17 @@ def test_masks_are_identical_across_readers_for_a_document():
     assert a == b and a != c
 
 
+def test_masks_do_not_depend_on_sharding():
+    """measure_config.json omits num_shards: a document's masks must not depend on
+    which other documents its shard measured before it (no shared RNG state)."""
+    docs = [(f'doc-{i}', 10 + i) for i in range(12)]
+    alone = {d: masks_for_document(d, C, [0.5, 0.25], 64, 1.0, 256) for d, C in docs}
+    for num_shards in (1, 3, 4):
+        for shard in range(num_shards):
+            for d, C in docs[shard::num_shards]:
+                assert masks_for_document(d, C, [0.5, 0.25], 64, 1.0, 256) == alone[d]
+
+
 def _planted(C=20, K=200, seed=0, noise=0.01):
     rng = np.random.default_rng(seed)
     masks = generate_masks(C, K, [0.5], seed=seed)

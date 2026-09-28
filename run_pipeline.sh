@@ -51,6 +51,15 @@ N_TRAIN=${N_TRAIN:-3000}
 N_DEV=${N_DEV:-300}
 N_TEST=${N_TEST:-500}
 RATIOS=${RATIOS:-"4,8"}
+# oracle_beta (H1 upper bound = the unamortized attribution): Stage A labels of the first ORACLE_N test
+# documents per eval source, primary reader only (test docs are nested across n). 0 disables the arm.
+ORACLE_N=${ORACLE_N:-100}
+(( ORACLE_N <= N_TEST )) || ORACLE_N=$N_TEST
+# report: equivalence margin (H2b), non-inferiority margin to oracle_beta (H1), minimum full-context
+# weak->strong F1 gap for an upgrade-retention ratio to be read (H3b)
+EQUIV_MARGIN=${EQUIV_MARGIN:-0.02}
+ORACLE_MARGIN=${ORACLE_MARGIN:-0.05}
+MIN_UPGRADE_GAP=${MIN_UPGRADE_GAP:-0.05}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}        # longest document measured: ~9k Qwen3 tokens
 GPU_MEM=${GPU_MEM:-0.90}
 DOCS_PER_CALL=${DOCS_PER_CALL:-16}
@@ -76,7 +85,7 @@ HF_PRIVATE=${HF_PRIVATE:-true}
 HF_UPLOAD_LABELS=${HF_UPLOAD_LABELS:-false}
 
 echo "== config${ENV_FILE:+ ($ENV_FILE)}: RUN_ROOT=$RUN_ROOT LABELS=$LABELS NUM_GPUS=$NUM_GPUS BACKEND=$BACKEND"
-echo "   N_TRAIN=$N_TRAIN N_DEV=$N_DEV N_TEST=$N_TEST RATIOS=$RATIOS STAGES=\"$STAGES\""
+echo "   N_TRAIN=$N_TRAIN N_DEV=$N_DEV N_TEST=$N_TEST ORACLE_N=$ORACLE_N RATIOS=$RATIOS STAGES=\"$STAGES\""
 echo "   LABEL_READERS=\"$LABEL_READERS\""
 echo "   EVAL_READERS=\"$EVAL_READERS\""
 echo "   TRAIN_SOURCES=\"$TRAIN_SOURCES\" EVAL_SOURCES=$EVAL_SOURCES HF_TOKEN=$([[ -n "${HF_TOKEN:-}" ]] && echo set || echo unset)"
@@ -141,6 +150,9 @@ if sys.argv[1] == 'vllm':
     print(f"vllm {vllm.__version__}")
 PY
   python -m pytest -q -x tests/test_attribution.py tests/test_selection_metrics.py tests/test_evaluate_report.py
+  if [[ ",${EXTRA_ARMS:-}," == *llmlingua2* ]]; then  # an optional baseline must not fail hours later at select
+    python -c "import llmlingua" || { echo "EXTRA_ARMS has llmlingua2 but 'pip install llmlingua' is missing"; exit 1; }
+  fi
   if has_stage upload; then  # a missing or read-only token should fail now, not after training
     python scripts/upload_hf.py --check ${HF_NAMESPACE:+--namespace "$HF_NAMESPACE"}
   fi
@@ -148,7 +160,9 @@ fi
 
 if has_stage prefetch; then
   echo "== prefetch (single process; avoids N processes racing on the HF cache)"
-  all_models=$(echo "$LABEL_READERS $EVAL_READERS $BACKBONE $EMBED_MODEL" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
+  # + hub ids of provence:/embed:/reranker: arms in EXTRA_ARMS (llmlingua2 downloads its own model)
+  extra_models=$(echo "${EXTRA_ARMS:-}" | tr ',' '\n' | sed -nE 's/^([^=]*=)?(provence|embed|reranker):(.+)$/\3/p')
+  all_models=$(echo "$LABEL_READERS $EVAL_READERS $BACKBONE $EMBED_MODEL $extra_models" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
   all_sources=$(echo "$TRAIN_SOURCES ${EVAL_SOURCES//,/ }" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
   python scripts/prefetch.py --sources "$all_sources" --models "$all_models" 2>&1 | tee -a "$LOGS/prefetch.log"
 fi
@@ -167,6 +181,16 @@ if has_stage labels; then
       done
     done
   done
+  if (( ORACLE_N > 0 )); then  # never read by training: label_dirs() only lists train/dev
+    tp=$(tp_for "$PRIMARY_MODEL")
+    for src in ${EVAL_SOURCES//,/ }; do
+      echo "== labels (oracle_beta): $PRIMARY_MODEL $src/test (n=$ORACLE_N, tp=$tp)"
+      run_sharded "labels_${PRIMARY}_${src}_test" "$tp" \
+        python generate_labels.py measure --source "$src" --split test --n "$ORACLE_N" \
+        --reader-model "$PRIMARY_MODEL" --backend "$BACKEND" --max-model-len "$MAX_MODEL_LEN" --tp "$tp" \
+        --gpu-memory-utilization "$GPU_MEM" --docs-per-call "$DOCS_PER_CALL" --out-root "$LABELS/raw" $MEASURE_ARGS
+    done
+  fi
 fi
 
 if has_stage fit; then
@@ -183,6 +207,19 @@ if has_stage fit; then
       done
     done
   done
+  if (( ORACLE_N > 0 )); then
+    pooled_dev=""
+    for s in $TRAIN_SOURCES; do pooled_dev="$pooled_dev,$LABELS/raw/$PRIMARY/${s}_dev"; done
+    for src in ${EVAL_SOURCES//,/ }; do
+      # alpha from the source's own dev labels; eval-only sources (xquad_vi, 2wiki) pool the train-source dev labels
+      alpha_from=${pooled_dev#,}
+      [[ " $TRAIN_SOURCES " == *" $src "* ]] && alpha_from="$LABELS/raw/$PRIMARY/${src}_dev"
+      echo "== fit (oracle_beta): $PRIMARY f1 $src/test"
+      python generate_labels.py fit --raw-dir "$LABELS/raw/$PRIMARY/${src}_test" --target f1 \
+        --alpha-from "$alpha_from" --out-dir "$LABELS/fit/$PRIMARY/f1/${src}_test" \
+        >> "$LOGS/fit.log" 2>&1 || { echo "!! fit failed:"; tail -n 25 "$LOGS/fit.log"; exit 1; }
+    done
+  fi
 fi
 
 if has_stage ensemble; then
@@ -240,14 +277,32 @@ if has_stage train; then
 fi
 
 if has_stage select; then
-  ARMS="full,lead,random,bm25,embed=embed:$EMBED_MODEL,oracle_span,oracle_support"
+  # reranker = the pruner's backbone zero-shot: ours vs reranker isolates what the attribution labels add
+  ARMS="full,lead,random,bm25,embed=embed:$EMBED_MODEL,reranker=reranker:$BACKBONE,oracle_span,oracle_support"
   ARMS="$ARMS,ours_beta=pruner:$MODELS/pruner_beta_primary,ours_ens=pruner:$MODELS/pruner_beta_ensemble"
   ARMS="$ARMS,span_sup=pruner:$MODELS/pruner_span,abl_logprob=pruner:$MODELS/pruner_logprob_primary"
   ARMS="$ARMS,abl_posadj=pruner:$MODELS/pruner_beta_primary_posadj"
   ARMS="$ARMS${EXTRA_ARMS:+,$EXTRA_ARMS}"   # e.g. EXTRA_ARMS="xprovence=provence:naver/xprovence-reranker-bgem3-v1,llmlingua2"
+  oracle_flags=()
+  if (( ORACLE_N > 0 )); then
+    oracle_dirs=""
+    for src in ${EVAL_SOURCES//,/ }; do
+      d="$LABELS/fit/$PRIMARY/f1/${src}_test"
+      [[ -f "$d/summary.json" ]] || { echo "!! $d missing: run the labels + fit stages first (ORACLE_N=$ORACLE_N)"; exit 1; }
+      oracle_dirs="$oracle_dirs,$d"
+    done
+    ARMS="$ARMS,oracle_beta"
+    oracle_flags=(--oracle-beta-dir "${oracle_dirs#,}")
+  fi
+  # our checkpoints must exist before 4 shards start (e.g. STAGES="select ..." after a failed train)
+  for ckpt in $(echo "$ARMS" | tr ',' '\n' | sed -nE 's/^([^=]*=)?pruner:(.+)$/\2/p'); do
+    if [[ "$ckpt" == "$MODELS"/* && ! -f "$ckpt/pruner_config.json" ]]; then
+      echo "!! $ckpt is not a finished pruner checkpoint; run the train stage first (logs: $LOGS/train_*.log)"; exit 1
+    fi
+  done
   echo "== select ($ARMS)"
   run_sharded select 1 python evaluate.py select --sources "$EVAL_SOURCES" --split test --n "$N_TEST" \
-    --arms "$ARMS" --ratios "$RATIOS" --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" $SELECT_ARGS
+    --arms "$ARMS" --ratios "$RATIOS" --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" ${oracle_flags[@]+"${oracle_flags[@]}"} $SELECT_ARGS
 fi
 
 if has_stage answer; then
@@ -262,7 +317,11 @@ fi
 
 if has_stage report; then
   echo "== report"
-  python evaluate.py report --out-dir "$EVAL_DIR" --ours ours_beta,ours_ens > "$LOGS/report.log" 2>&1 \
+  heldout=""
+  for reader in $EVAL_READERS; do [[ " $LABEL_READERS " == *" $reader "* ]] || heldout="$heldout,$(tag "$reader")"; done
+  python evaluate.py report --out-dir "$EVAL_DIR" --ours ours_beta,ours_ens --primary-reader "$PRIMARY" \
+    --heldout-readers "${heldout#,}" --equiv-margin "$EQUIV_MARGIN" --oracle-margin "$ORACLE_MARGIN" \
+    --min-upgrade-gap "$MIN_UPGRADE_GAP" --labels-dir "$LABELS" > "$LOGS/report.log" 2>&1 \
     || { tail -n 25 "$LOGS/report.log"; exit 1; }
   echo "report: $EVAL_DIR/report.md"
 fi

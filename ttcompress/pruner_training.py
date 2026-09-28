@@ -15,6 +15,17 @@ Losses:
   bce       binary cross-entropy on the span label
 Default: listnet + 0.5 * mse for beta/ensemble, bce for span.
 
+Reductions: listnet SUMS over the C chunks (a cross-entropy between two
+distributions, Cao et al. 2007); mse is the MEAN over chunks. The two LOSS
+VALUES scale differently with C (listnet ~ log C at init), but what the
+optimizer sees is balanced: d(listnet)/ds_i = p_i - q_i and d(mse)/ds_i =
+2 (s_i - t_i) / C are both O(1/C) per chunk for z-scored targets, so the
+gradient-norm ratio w_mse*mse : listnet stays ~1 from C=2 to C=40
+(tests/test_pruner.py::test_listnet_mse_gradient_balance_is_chunk_count_invariant).
+Averaging listnet over chunks instead would shrink its gradient by 1/C and
+let the mse term dominate long documents. Both components are logged per
+epoch (train_pruner.py) so the balance is visible in train_log.json.
+
 Optional position adjustment: subtract a pooled relative-position prior
 (attribution.fit_position_prior) from the z-labels before training, so the
 pruner is not taught the reader's lost-in-the-middle bias (ablation).
@@ -79,16 +90,35 @@ def listnet_loss(scores: torch.Tensor, target: torch.Tensor, tau: float = 1.0) -
     return -(F.softmax(target / tau, dim=-1) * F.log_softmax(scores, dim=-1)).sum()
 
 
-def example_loss(scores: torch.Tensor, ex: TrainExample, label_source: str, tau: float, w_mse: float) -> torch.Tensor:
+def example_loss(scores: torch.Tensor, ex: TrainExample, label_source: str, tau: float, w_mse: float,
+                 parts: Optional[Dict[str, float]] = None) -> torch.Tensor:
+    """`parts`, if given, receives the unweighted component values (for logging)."""
     target = torch.tensor(ex.target, dtype=scores.dtype, device=scores.device)
     if label_source == 'span':
         pos = target.sum().clamp_min(1.0)
         pos_weight = ((len(target) - pos) / pos).clamp_min(1.0)  # few gold chunks among many
-        return F.binary_cross_entropy_with_logits(scores, target, pos_weight=pos_weight)
+        loss = F.binary_cross_entropy_with_logits(scores, target, pos_weight=pos_weight)
+        if parts is not None:
+            parts['bce'] = loss.item()
+        return loss
     loss = listnet_loss(scores, target, tau)
+    if parts is not None:
+        parts['listnet'] = loss.item()
     if w_mse:
-        loss = loss + w_mse * F.mse_loss(scores, target)
+        mse = F.mse_loss(scores, target)
+        if parts is not None:
+            parts['mse'] = mse.item()
+        loss = loss + w_mse * mse
     return loss
+
+
+def accumulation_group_size(pos: int, n: int, docs_per_step: int) -> int:
+    """Documents in the gradient-accumulation group that position `pos` (of n)
+    belongs to: docs_per_step, except for a shorter final group. Dividing each
+    document's loss by this (not by docs_per_step) makes every optimizer step
+    average over its own documents, so the last step is not under-weighted."""
+    start = (pos // docs_per_step) * docs_per_step
+    return min(docs_per_step, n - start)
 
 
 def ranking_metrics(scores: Sequence[float], ex: TrainExample, keep_fraction: float = 0.25) -> Dict[str, float]:

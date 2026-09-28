@@ -14,6 +14,8 @@ Arms (name -> what it is):
   random           random chunk order (seeded by doc id)
   bm25             lexical BM25 of question vs chunk
   embed            dense cosine, BAAI/bge-m3 CLS embeddings
+  reranker[:<id>]  zero-shot cross-encoder, default BAAI/bge-reranker-v2-m3 (the pruner's
+                   untrained backbone: what the attribution labels add over initialization)
   oracle_span      chunks containing a gold answer string first (answer-span oracle, RQ2)
   oracle_support   gold chunks (needle / supporting facts) first
   oracle_beta      Stage A attribution of the test document (upper bound; needs --oracle-beta-dir)
@@ -124,6 +126,41 @@ class EmbeddingScorer:
         return (self._embed(chunks) @ q[0]).cpu().tolist()
 
 
+class RerankerScorer:
+    """Zero-shot cross-encoder (question, chunk) relevance with the model's own
+    classification head -- by default the pruner's backbone
+    (BAAI/bge-reranker-v2-m3) before any attribution training, so ours vs
+    this arm isolates what the distilled labels add over initialization.
+    Each chunk is scored on its own (no late chunking across the window)."""
+
+    def __init__(self, model_name: str = 'BAAI/bge-reranker-v2-m3', device: str = 'cuda', max_len: int = 512,
+                 batch_size: int = 32):
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        from .reader import resolve_device
+
+        self.torch = torch
+        self.device = resolve_device(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name).to(self.device).eval()
+        if self.device != 'cpu':
+            self.model.to(torch.bfloat16)
+        from .pruner import effective_max_len
+        self.max_len = effective_max_len(self.model.config, max_len)
+        self.batch_size = batch_size
+
+    def score_chunks(self, question: str, chunks: Sequence[str]) -> List[float]:
+        torch = self.torch
+        out = []
+        with torch.no_grad():
+            for start in range(0, len(chunks), self.batch_size):
+                batch = list(chunks[start:start + self.batch_size])
+                enc = self.tokenizer([question] * len(batch), batch, padding=True, truncation='only_second',
+                                     max_length=self.max_len, return_tensors='pt').to(self.device)
+                out.extend(self.model(**enc).logits[:, 0].float().cpu().tolist())
+        return out
+
+
 class ProvenceScorer:
     """Provence (naver/provence-reranker-debertav3-v1) / XProvence
     (naver/xprovence-reranker-bgem3-v1) used as a per-chunk reranker so it
@@ -189,9 +226,11 @@ class Arm:
         return self._text.compress(doc.text(), ratio)
 
 
-def load_beta_table(label_dir: str) -> Dict[str, List[float]]:
+def load_beta_table(label_dirs: str) -> Dict[str, List[float]]:
+    """doc_id -> beta over one fit dir or a comma list of them (one per source)."""
     from .attribution import load_chunk_labels, record_paths
-    return {lab.doc['doc_id']: lab.beta for lab in (load_chunk_labels(p) for p in record_paths(label_dir))}
+    paths = [p for d in label_dirs.split(',') if d for p in record_paths(d)]
+    return {lab.doc['doc_id']: lab.beta for lab in (load_chunk_labels(p) for p in paths)}
 
 
 def make_arm(spec: str, device: str = 'cuda', oracle_beta_dir: Optional[str] = None) -> Arm:
@@ -206,6 +245,9 @@ def make_arm(spec: str, device: str = 'cuda', oracle_beta_dir: Optional[str] = N
     if spec == 'embed' or spec.startswith('embed:'):
         model = spec.split(':', 1)[1] if ':' in spec else 'BAAI/bge-m3'
         return Arm(spec, 'chunk', scorer=EmbeddingScorer(model, device))
+    if spec == 'reranker' or spec.startswith('reranker:'):
+        model = spec.split(':', 1)[1] if ':' in spec else 'BAAI/bge-reranker-v2-m3'
+        return Arm(spec, 'chunk', scorer=RerankerScorer(model, device))
     if spec.startswith('pruner:'):
         from .pruner import PrunerScorer
         return Arm(spec, 'chunk', scorer=PrunerScorer(spec.split(':', 1)[1], device))

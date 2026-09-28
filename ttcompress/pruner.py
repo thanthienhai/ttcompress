@@ -22,6 +22,7 @@ import os
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -65,6 +66,13 @@ def pack_windows(tokenizer, question: str, chunks: Sequence[str], max_len: int =
         ids.append(gi)
     flush()
     return windows
+
+
+def compact_windows(windows: Sequence[Window]) -> List[Window]:
+    """Same windows with token ids / slots as int32 arrays (~6x less RAM than
+    lists of Python ints) -- for caching every training document's windows."""
+    return [Window(np.asarray(w.input_ids, dtype=np.int32), np.asarray(w.chunk_slot, dtype=np.int32),
+                   list(w.chunk_ids)) for w in windows]
 
 
 def effective_max_len(encoder_config, requested: int) -> int:
@@ -129,9 +137,9 @@ def collate(windows: Sequence[Window], pad_id: int, device):
     slot_mask = torch.zeros((len(windows), num_slots), dtype=torch.bool)
     for i, w in enumerate(windows):
         n = len(w.input_ids)
-        ids[i, :n] = torch.tensor(w.input_ids)
+        ids[i, :n] = torch.as_tensor(w.input_ids)
         mask[i, :n] = 1
-        slot[i, :n] = torch.tensor(w.chunk_slot)
+        slot[i, :n] = torch.as_tensor(w.chunk_slot)
         slot_mask[i, :len(w.chunk_ids)] = True
     return ids.to(device), mask.to(device), slot.to(device), slot_mask.to(device), num_slots
 
@@ -151,6 +159,12 @@ def document_scores(model: ChunkPruner, windows: Sequence[Window], num_chunks: i
     return torch.stack(out)
 
 
+def _looks_like_repo_id(path: str) -> bool:
+    """'namespace/name' on the Hub vs a local path (absolute, relative with ./, or Windows)."""
+    return (path.count('/') == 1 and '\\' not in path and ':' not in path
+            and not path.startswith(('/', '.', '~')))
+
+
 class PrunerScorer:
     """Inference wrapper: score_chunks(question, chunks) -> list of floats."""
 
@@ -158,9 +172,19 @@ class PrunerScorer:
         from transformers import AutoTokenizer
         from .reader import resolve_device
 
-        if not os.path.isdir(path):  # a Hub repo id uploaded by scripts/upload_hf.py
-            from huggingface_hub import snapshot_download
-            path = snapshot_download(path)
+        if not os.path.isdir(path):
+            if not _looks_like_repo_id(path):
+                raise FileNotFoundError(f"pruner checkpoint {path} does not exist -- did the train stage for it "
+                                        f"finish? (see $RUN_ROOT/logs/train_<name>.log)")
+            from huggingface_hub import snapshot_download  # a Hub repo id uploaded by scripts/upload_hf.py
+            try:
+                path = snapshot_download(path)
+            except Exception as exc:
+                raise FileNotFoundError(f"pruner {path!r} is neither a local directory nor a downloadable Hub repo "
+                                        f"({type(exc).__name__}: {exc})") from exc
+        if not os.path.exists(os.path.join(path, CONFIG_FILE)):
+            raise FileNotFoundError(f"{path} has no {CONFIG_FILE}: not a finished pruner checkpoint "
+                                    f"(train_pruner.py writes it together with the weights)")
         with open(os.path.join(path, CONFIG_FILE), encoding='utf-8') as f:
             cfg = json.load(f)
         self.max_len = max_len or cfg.get('max_len', 4096)

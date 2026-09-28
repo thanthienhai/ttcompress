@@ -69,6 +69,60 @@ def test_listnet_is_minimized_by_matching_order():
     assert listnet_loss(target * 3, target) < listnet_loss(-target * 3, target)
 
 
+def test_listnet_mse_gradient_balance_is_chunk_count_invariant():
+    """listnet (sum) + w_mse * mse (mean): the loss values drift apart with C,
+    the gradients they send do not -- the mse share stays within a narrow band."""
+    import torch.nn.functional as F
+    torch.manual_seed(0)
+    ratios = {}
+    for C in (2, 10, 40):
+        vals = []
+        for _ in range(200):
+            t = torch.randn(C)
+            t = (t - t.mean()) / (t.std() + 1e-6)
+            s = (0.1 * torch.randn(C)).requires_grad_()
+            g_listnet = torch.autograd.grad(listnet_loss(s, t), s)[0].norm()
+            g_mse = torch.autograd.grad(0.5 * F.mse_loss(s, t), s)[0].norm()
+            vals.append(float(g_mse / g_listnet))
+        ratios[C] = sum(vals) / len(vals)
+    assert all(0.7 < r < 1.4 for r in ratios.values()), ratios
+
+
+def test_accumulation_groups_average_over_their_own_documents():
+    from ttcompress.pruner_training import accumulation_group_size
+    sizes = [accumulation_group_size(pos, 19, 8) for pos in range(19)]
+    assert sizes == [8] * 16 + [3] * 3            # the short last group divides by 3, not by 8
+    assert [accumulation_group_size(p, 16, 8) for p in range(16)] == [8] * 16
+
+
+def test_compact_windows_score_identically():
+    from ttcompress.pruner import compact_windows
+    tok = _tok()
+    model = ChunkPruner.from_backbone(TINY_ENCODER).eval()
+    chunks = ['một hai ba', 'bốn năm', 'sáu bảy tám chín'] * 5
+    windows = pack_windows(tok, 'hỏi', chunks, max_len=32)
+    with torch.no_grad():
+        a = document_scores(model, windows, len(chunks), tok.pad_token_id, 'cpu')
+        b = document_scores(model, compact_windows(windows), len(chunks), tok.pad_token_id, 'cpu')
+    assert torch.equal(a, b)
+
+
+def test_pruner_scorer_explains_a_missing_checkpoint(tmp_path):
+    with pytest.raises(FileNotFoundError, match='train stage'):
+        PrunerScorer(str(tmp_path / 'models' / 'pruner_beta'), device='cpu')
+    (tmp_path / 'empty').mkdir()
+    with pytest.raises(FileNotFoundError, match='not a finished pruner checkpoint'):
+        PrunerScorer(str(tmp_path / 'empty'), device='cpu')
+
+
+def test_example_loss_reports_components():
+    ex = TrainExample('d', 's', 'q', ['a', 'b', 'c'], target=[1.0, 0.0, -1.0], gold=[0])
+    parts = {}
+    loss = example_loss(torch.tensor([0.5, 0.0, -0.5]), ex, 'beta', 1.0, 0.5, parts)
+    assert set(parts) == {'listnet', 'mse'}
+    assert abs(loss.item() - (parts['listnet'] + 0.5 * parts['mse'])) < 1e-6
+
+
 def _label(z, informative=True, gold=(1,)):
     doc = {'doc_id': 'd', 'source': 's', 'question': 'q', 'chunks': ['a', 'b', 'c'], 'gold_chunks': list(gold)}
     return ChunkLabels(doc=doc, reader='r', target='f1', beta=z, intercept=0.0, z=z, informative=informative,

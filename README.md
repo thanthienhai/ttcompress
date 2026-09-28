@@ -36,10 +36,14 @@ cp .env.example .env           # all settings + HF_TOKEN (a WRITE token) in one 
 # pilot first (~1/10 of the data, every stage): command-line variables override .env
 N_TRAIN=300 N_DEV=30 N_TEST=50 RUN_ROOT=/mnt/hps/anhm-paper/ttcompress/runs/pilot HF_RUN_NAME=pilot ./run_pipeline.sh
 
-# full run: .env.example is the full configuration (3000 / 300 / 500; labels measured by the pilot are reused)
+# mid-scale go/no-go before the full run: does the gap to `embed` / `reranker` (the untrained backbone)
+# grow with training data? Documents are nested across n, so pilot labels are reused.
+N_TRAIN=800 N_DEV=150 N_TEST=200 RUN_ROOT=/mnt/hps/anhm-paper/ttcompress/runs/mid HF_RUN_NAME=mid ./run_pipeline.sh
+
+# full run: .env.example is the full configuration (3000 / 300 / 500; labels measured by earlier runs are reused)
 ./run_pipeline.sh
-STAGES="select answer report" \
-  EXTRA_ARMS="xprovence=provence:naver/xprovence-reranker-bgem3-v1,llmlingua2" ./run_pipeline.sh
+# re-evaluate without the published baselines (e.g. if XProvence's remote code fails on the cluster)
+STAGES="select answer report" EXTRA_ARMS= ./run_pipeline.sh
 # ablation with a different label/selection setting -> its own RUN_ROOT
 MEASURE_ARGS="--distractors hard" SELECT_ARGS="--distractors hard" RUN_ROOT=runs/hard ./run_pipeline.sh
 ```
@@ -58,7 +62,8 @@ with different ones.
 
 Outputs: `labels/raw/<reader>/<source>_<split>/` (masks + outcomes per document),
 `labels/fit/<reader|ensemble>/<target>/<source>_<split>/` (labels + `summary.json` with label-quality
-diagnostics), `models/<pruner>/` (+ `train_log.json`), `results/eval_test/report.{json,md}`.
+diagnostics), `models/<pruner>/` (+ `train_log.json`), `results/eval_test/report.{json,md}` (hypothesis
+verdicts, RQ1 cost table, per-cell tables, paired differences, upgrade retention).
 
 Every stage skips work already on disk, so a crashed or pre-empted job is simply re-run.
 
@@ -67,8 +72,12 @@ Every stage skips work already on disk, so a crashed or pre-empted job is simply
 - **Splits cannot leak through a seed** — there is none: dev/test membership is a hash of the article
   title (UIT-ViQuAD), the passage (XQuAD-vi) or the example id; `tests/test_sources.py` checks
   disjointness on the real data.
-- **Test is only touched by `evaluate.py select --split test`**; α is chosen on dev measurements and the
+- **Test is only touched by `evaluate.py select --split test`**, and by the `oracle_beta` upper bound: Stage A
+  labels of the first `ORACLE_N` test documents (`labels/fit/<primary>/f1/<source>_test`), which training never
+  lists (`label_dirs` in `run_pipeline.sh` reads train/dev only). α is chosen on dev measurements and the
   pruner's best epoch on dev labels, both reader-free.
+- **Confirmatory tests are fixed in code**: `report.md` opens with one family per hypothesis (METHOD_SPEC.md
+  §1), one-sided paired tests Holm-corrected within the family; the big paired table is exploratory.
 - **Fixed compressor across readers**: budgets use one reference tokenizer and selections are computed
   once, so reader-to-reader differences are attributable to the reader.
 - **Paired statistics**: arms are compared on the same documents with a paired cluster bootstrap.

@@ -59,7 +59,11 @@ def cmd_measure(args):
         return
     keep_rates = [float(x) for x in args.keep_rates.split(',')]
     outcomes = set(args.outcomes.split(','))
-    # a resumed run must measure with exactly the settings the records on disk were measured with
+    # a resumed run must measure with exactly the settings the records on disk were measured with.
+    # num_shards is deliberately NOT part of it: records are per document, masks are seeded by doc_id
+    # (masks_for_document) and the document set is hash-chosen and nested across --n, so a label dir
+    # may be extended with a different GPU count (pilot -> mid -> full share labels/raw). Guarded by
+    # tests/test_attribution.py::test_masks_do_not_depend_on_sharding.
     config = {'keep_rates': keep_rates, 'k_min': args.k_min, 'k_per_chunk': args.k_per_chunk, 'k_max': args.k_max,
               'outcomes': sorted(outcomes), 'haystack_chars': args.haystack_chars, 'distractors': args.distractors,
               'multihop_pad_chars': args.multihop_pad_chars, 'max_new_tokens': args.max_new_tokens}
@@ -155,7 +159,8 @@ def cmd_fit(args):
     else:
         if not args.alpha_from:
             raise SystemExit("pass --alpha, or --alpha-from <dev measure dir> (alpha is chosen on dev, never on train)")
-        dev = [load_mask_outcomes(p) for p in record_paths(args.alpha_from)]
+        # comma list: an eval-only source (xquad_vi, 2wiki) has no dev labels of its own -> pooled train-source dev
+        dev = [load_mask_outcomes(p) for d in args.alpha_from.split(',') if d for p in record_paths(d)]
         if not dev:
             raise SystemExit(f"no measure output in {args.alpha_from}")
         grid = [float(a) for a in args.alpha_grid.split(',')]
@@ -182,6 +187,11 @@ def cmd_ensemble(args):
                         (load_chunk_labels(p) for p in record_paths(d))})
     common = sorted(set.intersection(*(set(m) for m in per_dir)))
     print(f"{len(common)} documents labeled by all {len(dirs)} readers")
+    # a partially recovered shard shrinks the ensemble silently otherwise
+    dropped = {d: len(m) - len(common) for d, m in zip(dirs, per_dir)}
+    for d, m in zip(dirs, per_dir):
+        if dropped[d]:
+            print(f"[WARN] {d}: {dropped[d]} of {len(m)} documents dropped (not labeled by every reader)")
     labels, agreement = [], defaultdict(list)
     for doc_id in common:
         group = [m[doc_id] for m in per_dir]
@@ -194,6 +204,7 @@ def cmd_ensemble(args):
     summary = _summary_stats(labels)
     summary['cross_reader_spearman'] = {k: float(np.nanmean(v)) for k, v in agreement.items()}
     summary['fit_dirs'] = dirs
+    summary['n_dropped_per_dir'] = dropped
     with open(os.path.join(args.out_dir, 'summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(json.dumps({k: v for k, v in summary.items() if k != 'position_prior_by_decile'}, indent=2))
@@ -233,7 +244,7 @@ def main():
     f.add_argument('--raw-dir', required=True)
     f.add_argument('--target', choices=['f1', 'logprob'], default='f1')
     f.add_argument('--alpha', type=float, default=None)
-    f.add_argument('--alpha-from', default=None, help="dev measure dir for alpha CV")
+    f.add_argument('--alpha-from', default=None, help="dev measure dir(s) for alpha CV (comma list = pooled)")
     f.add_argument('--alpha-grid', default='0.1,0.3,1,3,10')
     f.add_argument('--n-boot', type=int, default=0, help="bootstrap CIs per chunk (slow; diagnostics only)")
     f.add_argument('--out-dir', required=True)

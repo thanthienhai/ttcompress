@@ -26,7 +26,7 @@
 
 - **RQ1 (amortization).** A pruner distilled from F1-utility attribution keeps downstream F1 at fixed token
   budgets (1/4, 1/8) while costing one encoder pass instead of K≈64 reader calls.
-  *H1:* `ours_beta` beats `bm25`, `embed`, `lead`, `random` at both ratios on every source (paired Δ F1 > 0,
+  *H1:* `ours_beta` beats `bm25`, `embed`, `reranker` (its untrained backbone), `lead`, `random` at both ratios on every source (paired Δ F1 > 0,
   CI excludes 0), and gets within a small margin of `oracle_beta`.
 - **RQ2 (survival test).** Utility labels beat answer-span supervision.
   *H2a:* on multi-hop (VIMQA, HotpotQA, 2Wiki), `ours_beta` > `span_sup` and > `oracle_span` (the answer-span
@@ -44,6 +44,24 @@
 
 Everything is reported **per source** (never pooled across sources or languages): the previous run showed a
 sign flip between pools.
+
+**Confirmatory tests** (`evaluate.py report`, "Hypotheses" section; fixed before the full run). Each
+hypothesis is its own family of one-sided paired cluster-bootstrap tests on the primary (label) reader,
+Holm-corrected within the family at α = 0.05; the full paired table is exploratory.
+
+| family | test | per source × ratio |
+|---|---|---|
+| H1 | superiority, `ours_beta` − {`bm25`, `embed`, `reranker`, `lead`, `random`} > 0 | all sources |
+| H1-oracle | non-inferiority, `ours_beta` − `oracle_beta` > −0.05 (`ORACLE_MARGIN`), on the `ORACLE_N` labeled test docs | all sources |
+| H2a | superiority vs `span_sup`, `oracle_span` | multi-hop |
+| H2b | equivalence (TOST) vs `span_sup`, margin ±0.02 (`EQUIV_MARGIN`) | single-hop |
+| H3b / H3b-heldout | superiority of retention(`ours_ens`) − retention(`ours_beta`), same docs, reader pairs with full-context gap ≥ 0.05 (`MIN_UPGRADE_GAP`); pairs with the held-out reader are a separate family | all sources |
+| H4 | superiority of `ours_beta`, `ours_ens` vs `xprovence`, `llmlingua2` | Vietnamese sources |
+
+`reranker` is in H1 because it is the pruner's own backbone: beating it is what shows the attribution labels
+add something. A test whose two arms differ by > 10% in realized tokens is flagged `budget ≠` (text arms
+compress to a rate, not a hard budget). H3a is descriptive (`cross_reader_spearman`); RQ1's cost claim is
+the "Cost" table (label reader calls and seconds per document vs selection ms per document).
 
 ## 2. Data (`ttcompress/sources.py`)
 
@@ -96,14 +114,17 @@ distinction), `pruner_beta_primary_posadj` (position adjustment).
 
 Budget = ⌈full_tokens / ratio⌉ in a fixed reference tokenizer; every chunk arm greedily keeps its best
 chunks that fit, in original order. Arms: `full`, `lead`, `random`, `bm25`, `embed` (bge-m3),
-`oracle_span`, `oracle_support`, `oracle_beta` (optional upper bound), `pruner:<ckpt>` (any number),
+`reranker` (bge-reranker-v2-m3 zero-shot: the pruner's backbone before attribution training),
+`oracle_span`, `oracle_support`, `oracle_beta` (upper bound: Stage A labels of the first `ORACLE_N`=100 test
+documents per source, primary reader; `ORACLE_N=0` disables it), `pruner:<ckpt>` (any number),
 `provence:<hf id>` (Provence / XProvence as budget-matched rerankers), `llmlingua2`.
 Selections are computed once and answered by every reader (fixed compressor ⇒ upgrade retention is
 meaningful).
 
 Reported per reader × source × ratio × arm: token F1, EM, answer recall, gold-chunk recall, realized
 compression, selection latency; cluster-bootstrap CIs (cluster = article for UIT, passage for XQuAD);
-paired Δ F1 of our arms vs every other arm with CI and p; upgrade retention for every reader pair; F1 and
+paired Δ F1 of our arms vs every other arm with CI, raw p, BH q and Holm p (the whole paired table is
+one family; quote q or Holm p); upgrade retention for every reader pair; F1 and
 gold recall by needle-depth quintile for single-hop.
 
 ## 6. Ablations (map to proposal)
@@ -121,7 +142,7 @@ gold recall by needle-depth quintile for single-hop.
 ## 7. Compute plan (4×H100)
 
 Label generation dominates: per reader ≈ Σ_docs (K+1) ≈ 3 sources × 3000 docs × 65 ≈ 0.6M generations
-(3 readers ≈ 1.8M). Throughput must be measured on the cluster with a pilot
+(3 readers ≈ 1.8M), plus `oracle_beta` test labels: 5 sources × `ORACLE_N` × 65 ≈ 33k (primary reader). Throughput must be measured on the cluster with a pilot
 (`N_TRAIN=50 N_DEV=20 N_TEST=30 ./run_pipeline.sh`) before committing to N. Pruner training: five runs,
 one GPU each, a few hours. Evaluation: 5 sources × 500 docs × (arms × ratios) × 4 readers.
 

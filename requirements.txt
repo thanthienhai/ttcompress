@@ -9,5 +9,5 @@ pyarrow
 pytest
 # label generation / evaluation at scale (one process per GPU)
 vllm>=0.6 ; platform_system == "Linux"
-# optional baselines -- only needed when the corresponding --arms are used
-# llmlingua            # llmlingua2 arm
+# baselines: llmlingua2 arm (EXTRA_ARMS in .env.example); provence: arms load with trust_remote_code
+llmlingua

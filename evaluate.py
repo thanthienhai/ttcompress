@@ -36,14 +36,15 @@ import numpy as np
 
 from ttcompress.data import QADocument
 from ttcompress.metrics import (
-    answer_recall, bootstrap_mean_ci, exact_match, gold_chunk_recall, paired_bootstrap_diff, token_f1,
-    upgrade_retention,
+    answer_recall, bh_adjust, bootstrap_mean_ci, cluster_bootstrap_column_means, directional_p, exact_match,
+    gold_chunk_recall, holm_adjust, paired_bootstrap_diff, paired_bootstrap_test, token_f1, upgrade_retention,
+    upgrade_retention_array,
 )
 from ttcompress.reader import MAX_NEW_TOKENS, load_reader, reader_tag
 from ttcompress.selection import Selection, budget_for, make_arm, select_by_scores
 from ttcompress.sources import load_documents, parse_source_list
 
-_PREFIXES = ('pruner:', 'provence:', 'embed:', 'llmlingua2:')
+_PREFIXES = ('pruner:', 'provence:', 'embed:', 'reranker:', 'llmlingua2:')
 
 
 def parse_arms(spec: str):
@@ -271,7 +272,10 @@ def cmd_report(args):
                  'n_clusters': len(set(clusters)),
                  'compression': float(np.mean([by_doc[d]['full_tokens'] / max(1, by_doc[d]['kept_tokens']) for d in docs])),
                  'select_ms': 1000 * float(np.mean([by_doc[d]['seconds'] for d in docs])),
-                 'truncated_rate': float(np.mean([bool(by_doc[d].get('truncated')) for d in docs]))}
+                 'truncated_rate': float(np.mean([bool(by_doc[d].get('truncated')) for d in docs])),
+                 # text arms (LLMLingua-2) compress to a rate, not a hard budget: realized tokens may overshoot
+                 'over_budget_rate': 0.0 if ratio == 'full' else float(np.mean(
+                     [by_doc[d]['kept_tokens'] > by_doc[d]['budget'] * (1 + args.budget_tolerance) for d in docs]))}
         for m in METRICS:
             vals = [np.nan if by_doc[d].get(m) is None else by_doc[d][m] for d in docs]
             mean, lo, hi = bootstrap_mean_ci(vals, clusters, n_boot=args.n_boot)
@@ -296,6 +300,10 @@ def cmd_report(args):
                                         clusters, n_boot=args.n_boot)
             report['paired'].append({'reader': reader, 'source': source, 'ratio': ratio, 'ours': arm, 'vs': other,
                                      'metric': 'f1', **res})
+    # the whole paired table is one family: hundreds of tests at alpha=0.05 yield dozens of raw "wins" by chance
+    raw = [p['p'] for p in report['paired']]
+    for p, holm, bh in zip(report['paired'], holm_adjust(raw), bh_adjust(raw)):
+        p['p_holm'], p['q_bh'] = holm, bh
 
     # upgrade retention for every reader pair ordered by full-context F1 on that source
     sources = sorted({r['source'] for r in rows})
@@ -321,9 +329,16 @@ def cmd_report(args):
                     arr = np.array([[cw[d]['f1'], cs[d]['f1'], fw[d]['f1'], fs[d]['f1']] for d in common])
                     point = upgrade_retention(*arr.mean(axis=0))
                     lo, hi = _retention_ci(arr, [cw[d]['cluster_id'] for d in common], args.n_boot)
+                    gap = full_mean[strong] - full_mean[weak]
+                    # a ratio over a near-zero full-context gap is noise, whatever its CI says
                     report['upgrade_retention'].append({'source': source, 'weak': weak, 'strong': strong,
                                                         'ratio': ratio, 'arm': arm, 'retention': point,
-                                                        'ci95': [lo, hi], 'n': len(common)})
+                                                        'ci95': [lo, hi], 'n': len(common), 'gap': gap,
+                                                        'stable': gap >= args.min_upgrade_gap})
+
+    report['hypotheses'] = hypothesis_families(cell, rows, readers, sources, ratios, args)
+    if args.labels_dir:
+        report['cost'] = cost_tables(report['cells'], args)
 
     # single-hop: gold recall and F1 by needle depth (quintiles of relative position)
     for (reader, source, ratio, arm), by_doc in sorted(cell.items()):
@@ -348,20 +363,150 @@ def cmd_report(args):
 
 
 def _retention_ci(arr: np.ndarray, clusters, n_boot: int, seed: int = 42):
-    groups = defaultdict(list)
-    for i, c in enumerate(clusters):
-        groups[c].append(i)
-    members = list(groups.values())
-    rng = np.random.default_rng(seed)
-    vals = []
-    for _ in range(n_boot):
-        idx = np.concatenate([members[j] for j in rng.integers(0, len(members), size=len(members))])
-        vals.append(upgrade_retention(*arr[idx].mean(axis=0)))
-    vals = np.asarray(vals)
+    boot = cluster_bootstrap_column_means(arr, clusters, n_boot, seed)
+    vals = upgrade_retention_array(boot[:, 0], boot[:, 1], boot[:, 2], boot[:, 3])
     vals = vals[~np.isnan(vals)]
     if len(vals) == 0:
         return None, None
     return float(np.quantile(vals, 0.025)), float(np.quantile(vals, 0.975))
+
+
+# ---------------------------------------------------------------------------
+# confirmatory hypothesis families (METHOD_SPEC.md §1)
+# ---------------------------------------------------------------------------
+# Each hypothesis is a small pre-specified family of one-sided tests, Holm-corrected WITHIN the family
+# (the big paired table above is exploratory). Arm labels are the ones run_pipeline.sh assigns; a family
+# whose arms were not run comes out empty ("not run").
+
+H1_BASELINES = ('bm25', 'embed', 'reranker', 'lead', 'random')
+H2A_VS = ('span_sup', 'oracle_span')
+H4_VS = ('xprovence', 'llmlingua2')
+FAMILY_ALPHA = 0.05
+
+
+def _paired_family(cell, readers, meta, source_ok, ratios, ours_arms, vs_arms, kind, margin, n_boot):
+    tests = []
+    for reader, source, ratio, ours, vs in itertools.product(readers, sorted(meta), ratios, ours_arms, vs_arms):
+        a, b = cell.get((reader, source, ratio, ours)), cell.get((reader, source, ratio, vs))
+        if not (source_ok(meta[source]) and a and b):
+            continue
+        common = sorted(set(a) & set(b))
+        if len(common) < 2:
+            continue
+        res = paired_bootstrap_test([a[d]['f1'] for d in common], [b[d]['f1'] for d in common],
+                                    [a[d]['cluster_id'] for d in common], kind, margin, n_boot)
+        # budget matching is checked on realized tokens, not assumed (text arms compress to a rate)
+        tokens = float(np.mean([a[d]['kept_tokens'] for d in common]) /
+                       max(1.0, np.mean([b[d]['kept_tokens'] for d in common])))
+        tests.append({'reader': reader, 'source': source, 'ratio': ratio, 'ours': ours, 'vs': vs, **res,
+                      'n_clusters': len({a[d]['cluster_id'] for d in common}), 'tokens_ours_over_vs': tokens,
+                      'budget_mismatch': abs(tokens - 1.0) > 0.1})
+    return tests
+
+
+def _retention_family(cell, meta, readers, ratios, arm_a, arm_b, heldout, want_heldout, min_gap, n_boot):
+    """retention(arm_a) - retention(arm_b) for the same weak->strong pair, source, ratio and documents
+    (a paired bootstrap of the difference, not two overlapping marginal CIs)."""
+    tests = []
+    for source in sorted(meta):
+        full = {r: cell.get((r, source, 'full', 'full')) for r in readers}
+        full_mean = {r: float(np.mean([v['f1'] for v in c.values()])) for r, c in full.items() if c}
+        for weak, strong in itertools.permutations(full_mean, 2):
+            gap = full_mean[strong] - full_mean[weak]
+            if gap < min_gap or ((weak in heldout or strong in heldout) != want_heldout):
+                continue
+            for ratio in ratios:
+                cols = [cell.get((weak, source, ratio, arm_a)), cell.get((strong, source, ratio, arm_a)),
+                        cell.get((weak, source, ratio, arm_b)), cell.get((strong, source, ratio, arm_b)),
+                        full[weak], full[strong]]
+                if not all(cols):
+                    continue
+                common = sorted(set.intersection(*(set(c) for c in cols)))
+                if len(common) < 2:
+                    continue
+                arr = np.array([[c[d]['f1'] for c in cols] for d in common])
+
+                def stat(m):
+                    return (upgrade_retention_array(m[..., 0], m[..., 1], m[..., 4], m[..., 5])
+                            - upgrade_retention_array(m[..., 2], m[..., 3], m[..., 4], m[..., 5]))
+
+                boot = stat(cluster_bootstrap_column_means(arr, [cols[4][d]['cluster_id'] for d in common], n_boot))
+                finite = boot[~np.isnan(boot)]
+                lo, hi = (float(q) for q in np.quantile(finite, [0.025, 0.975])) if len(finite) else (None, None)
+                tests.append({'source': source, 'weak': weak, 'strong': strong, 'ratio': ratio, 'ours': arm_a,
+                              'vs': arm_b, 'diff': float(stat(arr.mean(axis=0))), 'ci95': [lo, hi],
+                              'p': directional_p(boot, 'superiority') if len(finite) else None, 'n': len(common),
+                              'gap': gap})
+    return tests
+
+
+def hypothesis_families(cell, rows, readers, sources, ratios, args):
+    meta = {r['source']: {'language': r['language'], 'hop': r['hop']} for r in rows}
+    main = [args.primary_reader] if args.primary_reader in readers else readers
+    heldout = {h for h in (args.heldout_readers or '').split(',') if h}
+    every = lambda m: True  # noqa: E731
+    fam = [
+        ('H1', 'ours_beta > each cheap baseline (bm25, embed, reranker, lead, random), every source and ratio',
+         'superiority', 0.0,
+         _paired_family(cell, main, meta, every, ratios, ['ours_beta'], H1_BASELINES, 'superiority', 0.0,
+                        args.n_boot)),
+        ('H1-oracle', f'ours_beta within {args.oracle_margin} F1 of oracle_beta (non-inferiority; '
+                      f'oracle_beta covers the ORACLE_N labeled test docs)', 'noninferiority', args.oracle_margin,
+         _paired_family(cell, main, meta, every, ratios, ['ours_beta'], ['oracle_beta'], 'noninferiority',
+                        args.oracle_margin, args.n_boot)),
+        ('H2a', 'multi-hop: ours_beta > span_sup and > oracle_span', 'superiority', 0.0,
+         _paired_family(cell, main, meta, lambda m: m['hop'] == 'multi', ratios, ['ours_beta'], H2A_VS,
+                        'superiority', 0.0, args.n_boot)),
+        ('H2b', f'single-hop: ours_beta equivalent to span_sup within ±{args.equiv_margin} F1 (TOST)',
+         'equivalence', args.equiv_margin,
+         _paired_family(cell, main, meta, lambda m: m['hop'] == 'single', ratios, ['ours_beta'], ['span_sup'],
+                        'equivalence', args.equiv_margin, args.n_boot)),
+        ('H3b', f'retention(ours_ens) > retention(ours_beta), label-reader pairs with full-context gap '
+                f'>= {args.min_upgrade_gap}', 'superiority', 0.0,
+         _retention_family(cell, meta, readers, ratios, 'ours_ens', 'ours_beta', heldout, False,
+                           args.min_upgrade_gap, args.n_boot)),
+        ('H3b-heldout', 'same, pairs involving the held-out reader', 'superiority', 0.0,
+         _retention_family(cell, meta, readers, ratios, 'ours_ens', 'ours_beta', heldout, True,
+                           args.min_upgrade_gap, args.n_boot)),
+        ('H4', 'Vietnamese sources: ours_beta and ours_ens > XProvence and LLMLingua-2', 'superiority', 0.0,
+         _paired_family(cell, main, meta, lambda m: m['language'] == 'vi', ratios, ['ours_beta', 'ours_ens'],
+                        H4_VS, 'superiority', 0.0, args.n_boot)),
+    ]
+    out = []
+    for name, claim, kind, margin, tests in fam:
+        for t, h in zip(tests, holm_adjust([t['p'] for t in tests])):
+            t['p_holm'] = h
+            t['supported'] = h is not None and h < FAMILY_ALPHA
+        out.append({'name': name, 'claim': claim, 'kind': kind,
+                    'margin': margin, 'n_tests': len(tests), 'n_supported': sum(t['supported'] for t in tests),
+                    'n_budget_mismatch': sum(bool(t.get('budget_mismatch')) for t in tests), 'tests': tests})
+    return out
+
+
+def cost_tables(cells, args):
+    """RQ1: what one pruner pass replaces. Label cost per (reader, source_split) from the Stage A raw
+    records (reader calls = K masks + 1 full context; `seconds` = the document's share of its batch's
+    wall-clock on one process), next to per-document selection time of every arm."""
+    from ttcompress.attribution import record_paths
+    labels = []
+    for reader_dir in sorted(glob.glob(os.path.join(args.labels_dir, 'raw', '*'))):
+        for split_dir in sorted(glob.glob(os.path.join(reader_dir, '*'))):
+            secs, calls = [], []
+            for p in record_paths(split_dir):
+                with open(p, encoding='utf-8') as f:
+                    rec = json.load(f)
+                secs.append(rec.get('seconds', float('nan')))
+                calls.append(len(rec['masks']) + 1)
+            if calls:
+                labels.append({'reader': os.path.basename(reader_dir), 'set': os.path.basename(split_dir),
+                               'n_docs': len(calls), 'calls_per_doc': float(np.mean(calls)),
+                               'seconds_per_doc': float(np.nanmean(secs)), 'total_hours': float(np.nansum(secs) / 3600)})
+    select = defaultdict(list)  # selection time does not depend on the reader
+    for c in cells:
+        if c['ratio'] != 'full':
+            select[(c['source'], c['arm'])].append(c['select_ms'])
+    return {'labels': labels,
+            'select_ms': [{'source': s, 'arm': a, 'select_ms': float(np.mean(v))} for (s, a), v in sorted(select.items())]}
 
 
 def _fmt(m):
@@ -371,39 +516,93 @@ def _fmt(m):
 
 def _markdown(report) -> str:
     lines = ['# Evaluation report', '', 'Token F1 with 95% cluster-bootstrap CI; never pooled across sources.', '']
+    lines += _hypotheses_markdown(report.get('hypotheses', []))
+    lines += _cost_markdown(report.get('cost'))
     groups = defaultdict(list)
     for c in report['cells']:
         groups[(c['reader'], c['source'])].append(c)
     for (reader, source), cells in sorted(groups.items()):
         lines += [f'## {source} — reader `{reader}`', '',
-                  '| ratio | arm | F1 | EM | gold recall | realized compression | truncated | select ms |',
-                  '|---|---|---|---|---|---|---|---|']
+                  '| ratio | arm | F1 | EM | gold recall | n (clusters) | realized compression | over budget | '
+                  'truncated | select ms |',
+                  '|---|---|---|---|---|---|---|---|---|---|']
         for c in sorted(cells, key=lambda c: (c['ratio'] != 'full', c['ratio'], -c['f1']['mean'])):
             gr = c['gold_recall']['mean']
             gr_text = '' if gr != gr else f"{gr:.3f}"
             lines.append(f"| {c['ratio']} | {c['arm']} | {_fmt(c['f1'])} | {c['em']['mean']:.3f} | "
-                         f"{gr_text} | {c['compression']:.1f}x | {c['truncated_rate']:.0%} | {c['select_ms']:.0f} |")
+                         f"{gr_text} | {c['n']} ({c['n_clusters']}) | {c['compression']:.1f}x | "
+                         f"{c.get('over_budget_rate', 0.0):.0%} | {c['truncated_rate']:.0%} | {c['select_ms']:.0f} |")
         lines.append('')
     if report['paired']:
+        tested = [p for p in report['paired'] if p['p'] is not None]
+        n_sig = {k: sum(p[k] < 0.05 for p in tested) for k in ('p', 'q_bh', 'p_holm')}
+        fmt = lambda v: '' if v is None else f"{v:.3f}"  # noqa: E731
         lines += ['## Paired differences (ours − other, token F1)', '',
-                  '| reader | source | ratio | ours | vs | Δ F1 [95% CI] | p |', '|---|---|---|---|---|---|---|']
+                  f"{len(tested)} tests, one family. Below 0.05: raw p {n_sig['p']}, BH q {n_sig['q_bh']}, "
+                  f"Holm p {n_sig['p_holm']}. Quote q (FDR) or Holm p, not raw p.", '',
+                  '| reader | source | ratio | ours | vs | Δ F1 [95% CI] | p | q (BH) | p (Holm) |',
+                  '|---|---|---|---|---|---|---|---|---|']
         for p in report['paired']:
             lo, hi = p['ci95']
             ci = f" [{lo:+.3f}, {hi:+.3f}]" if lo is not None else ''
-            pval = '' if p['p'] is None else f"{p['p']:.3f}"
             lines.append(f"| {p['reader']} | {p['source']} | {p['ratio']} | {p['ours']} | {p['vs']} | "
-                         f"{p['diff']:+.3f}{ci} | {pval} |")
+                         f"{p['diff']:+.3f}{ci} | {fmt(p['p'])} | {fmt(p['q_bh'])} | {fmt(p['p_holm'])} |")
         lines.append('')
     if report['upgrade_retention']:
         lines += ['## Upgrade retention (share of the full-context weak→strong gain kept)', '',
-                  '| source | weak → strong | ratio | arm | retention [95% CI] |', '|---|---|---|---|---|']
+                  'Rows marked ⚠ have a full-context gap below --min-upgrade-gap: the ratio is noise.', '',
+                  '| source | weak → strong | full gap | ratio | arm | retention [95% CI] |', '|---|---|---|---|---|---|']
         for u in report['upgrade_retention']:
             lo, hi = u['ci95']
             ci = f" [{lo:.2f}, {hi:.2f}]" if lo is not None else ''
-            lines.append(f"| {u['source']} | {u['weak']} → {u['strong']} | {u['ratio']} | {u['arm']} | "
-                         f"{u['retention']:.2f}{ci} |")
+            flag = '' if u.get('stable', True) else ' ⚠'
+            lines.append(f"| {u['source']} | {u['weak']} → {u['strong']} | {u.get('gap', float('nan')):.3f}{flag} | "
+                         f"{u['ratio']} | {u['arm']} | {u['retention']:.2f}{ci} |")
         lines.append('')
     return '\n'.join(lines)
+
+
+def _hypotheses_markdown(families) -> list:
+    if not families:
+        return []
+    lines = ['## Hypotheses (confirmatory; one-sided tests, Holm within each family, alpha 0.05)', '',
+             '| family | claim | tests | supported | budget-mismatched |', '|---|---|---|---|---|']
+    for f in families:
+        status = 'not run' if not f['n_tests'] else f"{f['n_supported']}/{f['n_tests']}"
+        lines.append(f"| {f['name']} | {f['claim']} | {f['n_tests']} | {status} | {f['n_budget_mismatch']} |")
+    lines.append('')
+    for f in families:
+        if not f['n_tests']:
+            continue
+        lines += [f"### {f['name']}: {f['claim']}", '',
+                  '| reader / pair | source | ratio | ours | vs | Δ [95% CI] | p | p (Holm) | ok |',
+                  '|---|---|---|---|---|---|---|---|---|']
+        for t in f['tests']:
+            who = t['reader'] if 'reader' in t else f"{t['weak']} → {t['strong']}"
+            lo, hi = t['ci95']
+            ci = f" [{lo:+.3f}, {hi:+.3f}]" if lo is not None else ''
+            p = '' if t['p'] is None else f"{t['p']:.4f}"
+            holm = '' if t['p_holm'] is None else f"{t['p_holm']:.4f}"
+            ok = ('✓' if t['supported'] else '✗') + (' (budget ≠)' if t.get('budget_mismatch') else '')
+            lines.append(f"| {who} | {t['source']} | {t['ratio']} | {t['ours']} | {t['vs']} | {t['diff']:+.3f}{ci} | "
+                         f"{p} | {holm} | {ok} |")
+        lines.append('')
+    return lines
+
+
+def _cost_markdown(cost) -> list:
+    if not cost:
+        return []
+    lines = ['## Cost (RQ1): Stage A labels vs one selection pass', '',
+             '| reader | label set | docs | reader calls / doc | s / doc | total h |', '|---|---|---|---|---|---|']
+    for c in cost['labels']:
+        lines.append(f"| {c['reader']} | {c['set']} | {c['n_docs']} | {c['calls_per_doc']:.0f} | "
+                     f"{c['seconds_per_doc']:.1f} | {c['total_hours']:.2f} |")
+    lines += ['', '| source | arm | select ms / doc |', '|---|---|---|']
+    for c in cost['select_ms']:
+        lines.append(f"| {c['source']} | {c['arm']} | {c['select_ms']:.0f} |")
+    lines.append('')
+    return lines
 
 
 def main():
@@ -424,7 +623,8 @@ def main():
     s.add_argument('--arms', required=True, help="comma list; 'label=spec' to name an arm, e.g. beta=pruner:models/x")
     s.add_argument('--ratios', default='4,8')
     s.add_argument('--budget-tokenizer', required=True, help="reference tokenizer for budgets (usually the first reader)")
-    s.add_argument('--oracle-beta-dir', default=None)
+    s.add_argument('--oracle-beta-dir', default=None,
+                   help="Stage A fit dir(s) of the evaluated documents (comma list) for the oracle_beta arm")
     s.add_argument('--device', default='cuda')
     s.add_argument('--shard', type=int, default=0)
     s.add_argument('--num-shards', type=int, default=1)
@@ -450,6 +650,16 @@ def main():
     r.add_argument('--out-dir', required=True)
     r.add_argument('--ours', default='', help="comma list of arm labels to compare against every other arm")
     r.add_argument('--n-boot', type=int, default=5000)
+    r.add_argument('--primary-reader', default=None,
+                   help="reader tag for H1/H2/H4 (the label reader of ours_beta); default: every reader")
+    r.add_argument('--heldout-readers', default='', help="comma list of reader tags that produced no labels (H3b)")
+    r.add_argument('--equiv-margin', type=float, default=0.02, help="H2b equivalence margin (token F1)")
+    r.add_argument('--oracle-margin', type=float, default=0.05, help="H1 non-inferiority margin to oracle_beta")
+    r.add_argument('--min-upgrade-gap', type=float, default=0.05,
+                   help="minimum full-context weak->strong F1 gap for a retention ratio to be read (H3b)")
+    r.add_argument('--budget-tolerance', type=float, default=0.05,
+                   help="a selection is over budget when kept_tokens > budget * (1 + this)")
+    r.add_argument('--labels-dir', default=None, help="labels root (raw/<reader>/...) for the RQ1 cost table")
     r.set_defaults(func=cmd_report)
 
     args = ap.parse_args()

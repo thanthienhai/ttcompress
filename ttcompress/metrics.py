@@ -130,7 +130,8 @@ def bootstrap_mean_ci(values: Sequence[float], clusters: Optional[Sequence] = No
 def paired_bootstrap_diff(a: Sequence[float], b: Sequence[float], clusters: Optional[Sequence] = None,
                           n_boot: int = 10000, ci: float = 0.95, seed: int = 42) -> Dict[str, Optional[float]]:
     """mean(a - b) with a paired cluster-bootstrap CI and a two-sided
-    bootstrap p-value (share of resamples on the other side of 0, x2)."""
+    bootstrap p-value (share of resamples on the other side of 0, x2; +1
+    smoothed so it is never exactly 0 -- the resolution is 2 / (n_boot + 1))."""
     diff = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
     mean, lo, hi = bootstrap_mean_ci(diff, clusters, n_boot, ci, seed)
     keep = ~np.isnan(diff)
@@ -138,8 +139,83 @@ def paired_bootstrap_diff(a: Sequence[float], b: Sequence[float], clusters: Opti
         return {'diff': mean, 'ci95': [lo, hi], 'p': None, 'n': int(keep.sum())}
     cl = None if clusters is None else [c for c, k in zip(clusters, keep) if k]
     boot = _boot_means(diff[keep], cl, n_boot, seed)
-    p = 2 * min((boot <= 0).mean(), (boot >= 0).mean())
+    p = 2 * (min((boot <= 0).sum(), (boot >= 0).sum()) + 1) / (len(boot) + 1)
     return {'diff': mean, 'ci95': [lo, hi], 'p': float(min(1.0, p)), 'n': int(keep.sum())}
+
+
+def directional_p(boot: np.ndarray, kind: str, margin: float = 0.0) -> float:
+    """One-sided bootstrap p-value (+1 smoothed) of a pre-registered claim
+    about a difference d, from its bootstrap distribution `boot` (NaNs dropped):
+      superiority      H0: d <= 0
+      noninferiority   H0: d <= -margin
+      equivalence      TOST, H0: |d| >= margin (the larger of the two one-sided p's)."""
+    boot = boot[~np.isnan(boot)]
+    n = len(boot) + 1
+    if kind == 'superiority':
+        return float(((boot <= 0).sum() + 1) / n)
+    if kind == 'noninferiority':
+        return float(((boot <= -margin).sum() + 1) / n)
+    if kind == 'equivalence':
+        return float((max((boot <= -margin).sum(), (boot >= margin).sum()) + 1) / n)
+    raise ValueError(f"unknown test kind {kind!r}")
+
+
+def paired_bootstrap_test(a: Sequence[float], b: Sequence[float], clusters: Optional[Sequence], kind: str,
+                          margin: float = 0.0, n_boot: int = 10000, seed: int = 42) -> Dict[str, Optional[float]]:
+    """mean(a - b), its paired cluster-bootstrap 95% CI and the one-sided p of `kind` (directional_p)."""
+    diff = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
+    keep = ~np.isnan(diff)
+    n = int(keep.sum())
+    if n < 2:
+        return {'diff': float(np.nanmean(diff)) if n else float('nan'), 'ci95': [None, None], 'p': None, 'n': n}
+    cl = None if clusters is None else [c for c, k in zip(clusters, keep) if k]
+    boot = _boot_means(diff[keep], cl, n_boot, seed)
+    lo, hi = np.quantile(boot, [0.025, 0.975])
+    return {'diff': float(diff[keep].mean()), 'ci95': [float(lo), float(hi)], 'p': directional_p(boot, kind, margin),
+            'n': n}
+
+
+def cluster_bootstrap_column_means(arr: np.ndarray, clusters: Sequence, n_boot: int, seed: int = 42) -> np.ndarray:
+    """[n_boot, n_columns] column means of `arr` [n_rows, n_columns] under a
+    cluster bootstrap of its rows -- for statistics that are functions of
+    several paired means (upgrade retention and its differences)."""
+    members = _cluster_members(clusters)
+    sums = np.stack([arr[m].sum(axis=0) for m in members])           # [k, cols]
+    sizes = np.array([len(m) for m in members], dtype=float)         # [k]
+    draws = np.random.default_rng(seed).integers(0, len(members), size=(n_boot, len(members)))
+    return sums[draws].sum(axis=1) / sizes[draws].sum(axis=1)[:, None]
+
+
+def holm_adjust(pvalues: Sequence[Optional[float]]) -> List[Optional[float]]:
+    """Holm-Bonferroni adjusted p-values (family-wise error); None stays None."""
+    idx = [i for i, p in enumerate(pvalues) if p is not None]
+    m = len(idx)
+    out: List[Optional[float]] = [None] * len(pvalues)
+    running = 0.0
+    for rank, i in enumerate(sorted(idx, key=lambda i: pvalues[i])):
+        running = max(running, min(1.0, (m - rank) * pvalues[i]))
+        out[i] = running
+    return out
+
+
+def bh_adjust(pvalues: Sequence[Optional[float]]) -> List[Optional[float]]:
+    """Benjamini-Hochberg q-values (false discovery rate); None stays None."""
+    idx = [i for i, p in enumerate(pvalues) if p is not None]
+    m = len(idx)
+    out: List[Optional[float]] = [None] * len(pvalues)
+    running = 1.0
+    for rank, i in reversed(list(enumerate(sorted(idx, key=lambda i: pvalues[i]), start=1))):
+        running = min(running, pvalues[i] * m / rank)
+        out[i] = running
+    return out
+
+
+def upgrade_retention_array(weak_compressed, strong_compressed, weak_full, strong_full) -> np.ndarray:
+    """Vectorized upgrade_retention (NaN where the full-context gap is ~0)."""
+    gap = np.asarray(strong_full, dtype=float) - np.asarray(weak_full, dtype=float)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        out = (np.asarray(strong_compressed, dtype=float) - np.asarray(weak_compressed, dtype=float)) / gap
+    return np.where(np.abs(gap) < 1e-9, np.nan, out)
 
 
 def upgrade_retention(weak_compressed: float, strong_compressed: float, weak_full: float, strong_full: float) -> float:

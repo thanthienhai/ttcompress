@@ -23,13 +23,16 @@ import os
 import sys
 import random
 import time
+from collections import defaultdict
 
 import torch
 
 from ttcompress.attribution import fit_position_prior
-from ttcompress.pruner import DEFAULT_BACKBONE, ChunkPruner, document_scores, effective_max_len, pack_windows
+from ttcompress.pruner import (
+    DEFAULT_BACKBONE, ChunkPruner, compact_windows, document_scores, effective_max_len, pack_windows,
+)
 from ttcompress.pruner_training import (
-    example_loss, load_label_dirs, make_examples, mean_metrics, ranking_metrics,
+    accumulation_group_size, example_loss, load_label_dirs, make_examples, mean_metrics, ranking_metrics,
 )
 from ttcompress.reader import resolve_device
 
@@ -127,16 +130,21 @@ def main():
         order = list(range(len(train)))
         random.Random(args.seed + epoch).shuffle(order)
         running, n_docs, t0 = 0.0, 0, time.time()
+        components = defaultdict(float)
         optimizer.zero_grad()
         for pos, i in enumerate(order):
             ex = train[i]
             if ex.doc_id not in windows_cache:
-                windows_cache[ex.doc_id] = pack_windows(tokenizer, ex.question, ex.chunks, args.max_len)
+                windows_cache[ex.doc_id] = compact_windows(pack_windows(tokenizer, ex.question, ex.chunks, args.max_len))
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=args.bf16):
                 scores = document_scores(model, windows_cache[ex.doc_id], len(ex.chunks), pad_id, device)
-            loss = example_loss(scores.float(), ex, args.label_source, args.tau, args.w_mse) / args.docs_per_step
+            parts = {}
+            group = accumulation_group_size(pos, len(order), args.docs_per_step)
+            loss = example_loss(scores.float(), ex, args.label_source, args.tau, args.w_mse, parts) / group
             loss.backward()
-            running += loss.item() * args.docs_per_step
+            running += loss.item() * group
+            for k, v in parts.items():
+                components[k] += v
             n_docs += 1
             if (pos + 1) % args.docs_per_step == 0 or pos == len(order) - 1:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -148,9 +156,11 @@ def main():
                     print(f"  epoch {epoch + 1} step {step}/{total_steps} loss {running / n_docs:.4f} "
                           f"({(time.time() - t0) / n_docs:.2f}s/doc)", flush=True)
         dev_metrics = evaluate_dev(model, tokenizer, dev, args, device, pad_id)
-        entry = {'epoch': epoch + 1, 'train_loss': running / max(1, n_docs), 'dev': dev_metrics}
+        entry = {'epoch': epoch + 1, 'train_loss': running / max(1, n_docs),
+                 'train_components': {k: v / max(1, n_docs) for k, v in components.items()}, 'dev': dev_metrics}
         log.append(entry)
-        print(f"epoch {epoch + 1}: train_loss={entry['train_loss']:.4f} dev={json.dumps(dev_metrics)}", flush=True)
+        print(f"epoch {epoch + 1}: train_loss={entry['train_loss']:.4f} "
+              f"components={json.dumps(entry['train_components'])} dev={json.dumps(dev_metrics)}", flush=True)
         score = dev_metrics.get(metric, float('nan'))
         if score == score and score > best:
             best = score
