@@ -14,7 +14,8 @@ Lessons carried over from RUN_REPORT_2026-09-23.md, fixed here by design:
     The recommended multi-GPU launch is one process per GPU (group) with
     CUDA_VISIBLE_DEVICES, so every process just uses 'cuda'.
   - generation budget: chat-tuned readers spend tokens on a preamble;
-    budgets are per hop type and generous (32 / 48), never 6.
+    budgets are per hop type and generous (MAX_NEW_TOKENS: 64 single-hop /
+    48 multi-hop), never 6.
   - Qwen3 thinking mode is switched off through the chat template.
   - reader failures propagate instead of being scored as F1 = 0: a silently
     empty answer would be written into the labels as "this context is useless".

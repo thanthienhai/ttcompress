@@ -42,7 +42,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
-from .data import QADocument
+from .data import CHUNK_SEP, QADocument
 from .sources import contains_answer, hash_seed
 
 
@@ -63,14 +63,24 @@ def budget_for(full_tokens: int, ratio: float) -> int:
 
 def select_by_scores(doc: QADocument, scores: Sequence[float], lengths: Sequence[int], budget: int,
                      tokenizer) -> Selection:
+    """Greedy by score; a chunk costs its tokens plus the separator before it. The joined text is recounted
+    (tokens can merge across a join) and the weakest kept chunk dropped until it fits, so `kept_tokens` is
+    what the reader gets and never exceeds the budget."""
+    count = lambda text: len(tokenizer.encode(text, add_special_tokens=False))  # noqa: E731
+    sep = count(CHUNK_SEP)
     order = sorted(range(len(scores)), key=lambda i: (-scores[i], i))
     kept, used = [], 0
     for i in order:
-        if used + lengths[i] <= budget:
+        cost = lengths[i] + (sep if kept else 0)
+        if used + cost <= budget:
             kept.append(i)
-            used += lengths[i]
-    if kept:
-        return Selection(sorted(kept), doc.text(kept), used, budget, sum(lengths))
+            used += cost
+    while kept:
+        text = doc.text(kept)
+        n = count(text)
+        if n <= budget:
+            return Selection(sorted(kept), text, n, budget, sum(lengths))
+        kept.pop()  # `kept` is in score order: drop the weakest
     best = order[0]
     ids = tokenizer.encode(doc.chunks[best], add_special_tokens=False)[:budget]
     return Selection([best], tokenizer.decode(ids), len(ids), budget, sum(lengths), truncated=True)

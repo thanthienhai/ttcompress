@@ -174,8 +174,8 @@ def _label(z, informative=True, gold=(1,)):
 def test_make_examples_label_sources():
     labs = [_label([0.0, 1.2, -1.2]), _label([0.0, 0.0, 0.0], informative=False)]
     assert len(make_examples(labs, 'beta')) == 1           # uninformative dropped
-    span = make_examples(labs, 'span')
-    assert len(span) == 2 and span[0].target == [0.0, 1.0, 0.0]
+    span = make_examples(labs, 'span')                     # same documents as beta (RQ2 control)
+    assert len(span) == 1 and span[0].target == [0.0, 1.0, 0.0]
     adj = make_examples(labs, 'beta', position_prior=[1.0] * 10)
     assert adj[0].target == pytest.approx([-1.0, 0.2, -2.2])
     m = ranking_metrics([0.1, 0.9, 0.0], make_examples(labs, 'beta')[0])

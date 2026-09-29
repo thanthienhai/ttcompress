@@ -32,8 +32,8 @@ PUBLISHED = [('provence', 'Provence', 's'), ('xprovence', 'XProvence', 'D'), ('r
              ('exit', 'EXIT', 'v'), ('llmlingua', 'LLMLingua', 'P'), ('longllmlingua', 'LongLLMLingua', 'X'),
              ('llmlingua2', 'LLMLingua-2', 'h')]
 OURS = [('ours_beta', 'Ours-β', BLUE), ('ours_ens', 'Ours-ens', ORANGE)]
-DEPTH_ARMS = [('ours_beta', 'Ours-β', BLUE, '-'), ('ours_ens', 'Ours-ens', ORANGE, '-'),
-              ('reranker', 'bge-reranker', INK2, '-'), ('lead', 'lead', MUTED, '-')]
+DEPTH_ARMS = [('ours_beta', 'Ours-β', BLUE, '-'), ('abl_posadj', 'Ours-β, position-adjusted', BLUE, '--'),
+              ('ours_ens', 'Ours-ens', ORANGE, '-'), ('reranker', 'bge-reranker', INK2, '-'), ('lead', 'lead', MUTED, '-')]
 
 
 def setup_matplotlib():
@@ -216,9 +216,10 @@ def depth(report, reader, ratio, plt):
         ax.set_xlim(0.7, 5.3)
     axes[0][0].set_ylabel('F1')
     fig.supxlabel('Vị trí đoạn kim (ngũ phân vị)', fontsize=7, color=INK2)
+    present = {e['arm'] for e in entries}
     handles = [Line2D([], [], color=color, linestyle=style, linewidth=1.2, marker='o', markersize=4,
-                      markeredgecolor='white', label=label) for _, label, color, style in DEPTH_ARMS]
-    _legend(fig, handles, ncol=4, handletextpad=0.3, columnspacing=0.8)
+                      markeredgecolor='white', label=label) for arm, label, color, style in DEPTH_ARMS if arm in present]
+    _legend(fig, handles, ncol=3, handletextpad=0.3, columnspacing=0.8)
     return fig
 
 

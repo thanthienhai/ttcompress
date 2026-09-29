@@ -72,6 +72,26 @@ def test_measure_refuses_to_mix_settings_in_one_label_dir(tmp_path):
     assert res.returncode != 0 and 'use another --out-root' in res.stderr
 
 
+def test_empty_measure_shard_records_the_sources_answer_budget(tmp_path):
+    """n < num_shards leaves a shard with no documents; it must record the multi-hop budget (48), not the
+    single-hop default, or the other shards of the same label dir refuse its measure_config.json. The shard
+    that measures appends its run settings to measure_runs.jsonl (provenance, never compared)."""
+    def measure(shard):
+        subprocess.run([sys.executable, 'generate_labels.py', 'measure', '--source', 'vimqa', '--split', 'dev',
+                        '--n', '1', '--shard', str(shard), '--num-shards', '2', '--reader-model', TINY_CAUSAL_LM,
+                        '--device', 'cpu', '--backend', 'hf', '--k-min', '4', '--k-max', '4',
+                        '--max-model-len', '512',   # the tiny test model's context
+                        '--out-root', str(tmp_path)], check=True, capture_output=True, env=ENV)
+    out = tmp_path / TINY_CAUSAL_LM.replace('/', '--') / 'vimqa_dev'
+    measure(1)
+    assert json.loads((out / 'measure_config.json').read_text(encoding='utf-8'))['max_new_tokens'] == 48
+    assert not (out / 'measure_runs.jsonl').exists()   # nothing measured, nothing to account for
+    measure(0)
+    (run,) = [json.loads(line) for line in (out / 'measure_runs.jsonl').read_text(encoding='utf-8').splitlines()]
+    assert run['shard'] == 0 and run['num_shards'] == 2 and run['tp'] == 1 and run['n_todo'] == 1
+    assert len([p for p in out.glob('*.json') if p.name != 'measure_config.json']) == 1
+
+
 def test_select_refuses_a_different_document_set_in_one_out_dir(tmp_path):
     (tmp_path / 'select_config.json').write_text(json.dumps({'num_shards': 8}), encoding='utf-8')
     res = subprocess.run([sys.executable, 'evaluate.py', 'select', '--sources', 'vimqa', '--split', 'test',

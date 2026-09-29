@@ -1,9 +1,10 @@
 """The amortized pruner: a query-aware cross-encoder that scores every chunk
 of a document in one forward pass.
 
-Input (per window):   [CLS] question [SEP] chunk_1 chunk_2 ... chunk_m [SEP]
-Each chunk is tokenized on its own and concatenated, so chunk token spans
-are exact. The encoder contextualizes the whole window jointly and each
+Input (per window), the backbone's (query, passage) pair frame:
+    <s> question </s></s> chunk_1 chunk_2 ... chunk_m </s>
+(see `pack_windows`). Each chunk is tokenized on its own and concatenated,
+so chunk token spans are exact. The encoder contextualizes the whole window jointly and each
 chunk's score is a linear head on the MEAN of its token states ("late
 chunking": pool after contextualization, not before). A document longer
 than `max_len` is packed into several windows of whole chunks, each

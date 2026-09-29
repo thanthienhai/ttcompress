@@ -10,9 +10,11 @@ log-prob (the AT2/ContextCite target, ablation only). beta_c is the chunk's
 utility attribution; within-document z-scored beta is the pseudo-label the
 pruner is distilled on (Stage B, pruner_training.py).
 
-Masks are i.i.d. Bernoulli(p) per chunk, p cycling over `keep_rates`
-(ContextCite uses p=0.5; mixing in sparser rates keeps the surrogate honest
-near the 1/4-1/8 budgets the pruner is deployed at). Masks are seeded by the
+Masks are Bernoulli(p) per chunk, p cycling over `keep_rates` (ContextCite
+uses p=0.5; mixing in sparser rates keeps the surrogate honest near the
+1/4-1/8 budgets the pruner is deployed at), corrected so that no mask is the
+empty or the full context (`generate_masks`; how often that bites, by C:
+METHOD_SPEC.md §3 -- often for short documents). Masks are seeded by the
 document id, so every reader sees the exact same masks for a document --
 which is what makes per-reader labels comparable and ensemblable.
 
@@ -45,7 +47,9 @@ def num_masks(C: int, k_min: int = 64, k_per_chunk: float = 1.0, k_max: int = 25
 
 def generate_masks(C: int, K: int, keep_rates: Sequence[float], seed: int) -> List[List[bool]]:
     """K Bernoulli masks over C chunks; every mask keeps >= 1 chunk and
-    drops >= 1 chunk (when C > 1), so no mask is the full or empty context."""
+    drops >= 1 chunk (when C > 1), so no mask is the full or empty context:
+    a draw that breaks this gets ONE chunk flipped, not a redraw. Changing that
+    would change the masks of documents a shared label dir already holds."""
     if C <= 0:
         raise ValueError(f"C must be > 0; got {C}")
     rng = random.Random(seed)

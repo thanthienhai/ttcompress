@@ -14,7 +14,8 @@ Sources (all public, pulled from the HuggingFace hub at runtime):
     vimqa        nguyenlab/vimqa           official train / validation / test (vi)
     hotpotqa     hotpotqa/hotpot_qa        train = official train; dev/test = official
                                            distractor validation hashed by id (en)
-    2wiki        framolfese/2WikiMultihopQA  same as hotpotqa (its test ships no answers)
+    2wiki        framolfese/2WikiMultihopQA  eval-only: dev/test = official validation hashed by id
+                                             (its test ships no answers); no train split
 
 Why hash-based splits: the previous pipeline carved dev/test with
 `random.Random(seed)` and two CLIs defaulted to different seeds, which
@@ -45,9 +46,11 @@ SOURCES = ('uit_viquad', 'xquad_vi', 'vimqa', 'hotpotqa', '2wiki')
 LANGUAGE = {'uit_viquad': 'vi', 'xquad_vi': 'vi', 'vimqa': 'vi', 'hotpotqa': 'en', '2wiki': 'en'}
 HOP = {'uit_viquad': 'single', 'xquad_vi': 'single', 'vimqa': 'multi', 'hotpotqa': 'multi', '2wiki': 'multi'}
 SPLITS = ('train', 'dev', 'test')
-# Which splits exist per source (xquad_vi is evaluation-only).
+# Which splits exist per source. xquad_vi and 2wiki are evaluation-only (cross-dataset transfer): no train
+# split, so no TRAIN_SOURCES setting can train on them.
 AVAILABLE_SPLITS = {s: SPLITS for s in SOURCES}
 AVAILABLE_SPLITS['xquad_vi'] = ('dev', 'test')
+AVAILABLE_SPLITS['2wiki'] = ('dev', 'test')
 
 YES_NO_ANSWERS = {'yes', 'no', 'đúng', 'không', 'sai', 'có'}
 DEFAULT_HAYSTACK_CHARS = 30000
@@ -253,9 +256,7 @@ _MULTIHOP_FILES = {
     'hotpotqa': ('hotpotqa/hotpot_qa', {'train': ['distractor/train-00000-of-00002.parquet',
                                                   'distractor/train-00001-of-00002.parquet'],
                                         'eval': ['distractor/validation-00000-of-00001.parquet']}),
-    '2wiki': ('framolfese/2WikiMultihopQA', {'train': ['data/train-00000-of-00002.parquet',
-                                                       'data/train-00001-of-00002.parquet'],
-                                             'eval': ['data/validation-00000-of-00001.parquet']}),
+    '2wiki': ('framolfese/2WikiMultihopQA', {'eval': ['data/validation-00000-of-00001.parquet']}),  # eval-only
 }
 
 

@@ -64,6 +64,19 @@ def test_budget_and_greedy_selection_preserve_order(fake_tokenizer):
     assert sel.kept == [1, 3] and sel.kept_tokens == 3 and sel.text == 'd e\n\nj'
 
 
+def test_selection_counts_the_separators_between_chunks():
+    class SepTokenizer:   # the chunk separator is a token of its own, as in a real BPE vocabulary
+        def encode(self, text, add_special_tokens=False):
+            return [hash(w) % 1000 for w in text.replace('\n\n', ' <sep> ').split()]
+
+    doc = make_doc(['a b', 'c d', 'e f'])
+    # 2 + 2 words fit a budget of 4 only without the separator: one chunk is all that fits
+    sel = select_by_scores(doc, [0.9, 0.8, 0.1], [2, 2, 2], budget=4, tokenizer=SepTokenizer())
+    assert sel.kept == [0] and sel.kept_tokens == 2 and not sel.truncated
+    sel = select_by_scores(doc, [0.9, 0.8, 0.1], [2, 2, 2], budget=5, tokenizer=SepTokenizer())
+    assert sel.kept == [0, 1] and sel.kept_tokens == 5 == len(SepTokenizer().encode(sel.text))
+
+
 def test_selection_truncates_best_chunk_when_nothing_fits(fake_tokenizer):
     doc = make_doc(['a b c d e f'])
     sel = select_by_scores(doc, [1.0], [6], budget=2, tokenizer=fake_tokenizer)

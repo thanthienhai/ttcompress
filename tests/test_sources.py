@@ -117,8 +117,9 @@ def test_uit_viquad_dev_test_disjoint_by_title_and_train_titles_disjoint():
 
 
 def test_xquad_vi_has_no_train_and_is_disjoint_by_passage():
-    with pytest.raises(ValueError):
-        load_documents('xquad_vi', 'train')
+    for eval_only in ('xquad_vi', '2wiki'):   # cross-dataset transfer: never trainable, whatever TRAIN_SOURCES says
+        with pytest.raises(ValueError):
+            load_documents(eval_only, 'train')
     dev = load_documents('xquad_vi', 'dev', haystack_chars=3000)
     test = load_documents('xquad_vi', 'test', n=50, haystack_chars=3000)
     assert not {d.cluster_id for d in dev} & {d.cluster_id for d in test}

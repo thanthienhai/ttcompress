@@ -122,6 +122,28 @@ def test_report_cost_table_from_raw_labels(tmp_path):
     assert cost['select_ms'][0]['arm'] == 'ours_beta'
 
 
+def test_ablation_cost_table_uses_its_own_labels_and_unknown_arms_are_listed(tmp_path):
+    """An ablation passes its labels and the main run's: a label set in both is the ablation's (one row);
+    an arm outside every family (e.g. a published compressor under an unknown label) is named in report.md."""
+    for root, secs in (('labels_hard', 5.0), ('labels', 2.0)):
+        for split in ('uit_viquad_train', 'hotpotqa_train') if root == 'labels' else ('uit_viquad_train',):
+            raw = tmp_path / root / 'raw' / 'Qwen--Qwen3-8B' / split
+            raw.mkdir(parents=True)
+            (raw / 'd0.json').write_text(json.dumps({'masks': [[True]] * 64, 'seconds': secs}), encoding='utf-8')
+    rows = [_hrow('r', arm, ratio, i, 0.5, 'hotpotqa') for i in range(4)
+            for arm, ratio in (('full', 'full'), ('ours_beta', 4.0), ('provence_big', 4.0))]
+    (tmp_path / 'answers_r_shard0.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
+    subprocess.run([sys.executable, 'evaluate.py', 'report', '--out-dir', str(tmp_path), '--ours', 'ours_beta',
+                    '--labels-dir', f"{tmp_path / 'labels_hard'},{tmp_path / 'labels'}", '--n-boot', '100'],
+                   check=True, capture_output=True)
+    report = json.loads((tmp_path / 'report.json').read_text(encoding='utf-8'))
+    assert [(c['set'], c['seconds_per_doc']) for c in report['cost']['labels']] == [
+        ('hotpotqa_train', 2.0), ('uit_viquad_train', 5.0)]
+    assert report['outside_families'] == ['provence_big']
+    md = (tmp_path / 'report.md').read_text(encoding='utf-8')
+    assert 'Arms in no confirmatory family: provence_big' in md and '| answer recall |' in md
+
+
 def test_text_arm_is_forced_into_the_budget(fake_tokenizer):
     from evaluate import _text_within_budget
     from tests.conftest import make_doc

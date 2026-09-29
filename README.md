@@ -57,12 +57,32 @@ python scripts/compare_runs.py --primary-reader Qwen--Qwen3-8B --out-dir results
   --run random=runs/main/results/eval_test/report.json --run hard=runs/main_distractors-hard/results/eval_test/report.json
 ```
 
+### The whole campaign as one job
+
+When the cluster only accepts a submitted script (no shell on the pod), build one self-contained file and
+submit it as the job's command (`bash ttcompress_job.sh`):
+
+```bash
+python scripts/build_cluster_job.py        # -> dist/ttcompress_job.sh (the repository embedded, no secrets)
+python scripts/build_cluster_job.py --set PHASES="main abl_hard" --set MAIN_SIZES="2000 200 500"   # variants
+```
+
+The job unpacks the code to `$BASE/code/<build>` and runs `scripts/cluster_campaign.sh`: `smoke` → `probe`
+(each published compressor alone on the smoke run; one that cannot run there is dropped, not fatal) → `pilot`
+→ `main` → `abl_hard` / `abl_pad` → `compare` → `upload`. Re-submitting it resumes: finished phases are
+skipped, a compressor that failed is probed again and, once it works, added to the finished runs. Progress
+and every report go to stdout and to the private dataset repo `<token user>/ttcompress-campaign-<CAMPAIGN>`
+(`STATUS.md`, updated after each phase and every 30 min, with a projection of the full run from the pilot).
+Settings and their defaults: the top of `scripts/cluster_campaign.sh`; the HF token is read on the cluster
+(`HF_TOKEN` in the job, else `HF_TOKEN_SOURCES`).
+
 Training-seed robustness: `EXTRA_SEEDS="1 2"` (default) also trains `ours_beta` / `ours_ens` with seeds 1 and 2
 (4 more training runs); the report lists F1 per seed and, per hypothesis, how many supported tests hold for
 every seed. `EXTRA_SEEDS=none` turns it off.
 
-Stages: `preflight` (GPU count, imports, CPU unit tests) → `prefetch` (every dataset and model downloaded
-once, in one process; gated models fail here, not hours later) → `labels` → `fit` → `ensemble` → `train`
+Stages: `preflight` (GPU count, imports, baseline packages) → `prefetch` (every dataset and model downloaded
+once, in one process; gated models fail here, not hours later; then, when `preflight` is in STAGES too, the
+whole CPU unit-test suite, `logs/tests.log`) → `labels` → `fit` → `ensemble` → `train`
 → `select` → `answer` → `report` → `upload` (every pruner to its own model repo
 `<namespace>/ttcompress-<run>-<pruner>`, evaluation outputs and labels to the dataset repo
 `<namespace>/ttcompress-<run>-eval`; private by default, namespace defaults to the token's user;
@@ -71,7 +91,8 @@ tensor parallelism over `TP_LARGE` GPUs; the answer stage works with any process
 how many shards `select` used. A scheduler-provided `CUDA_VISIBLE_DEVICES` is respected. A failed
 shard prints the tail of its log (`$RUN_ROOT/logs/<stage>_shard<k>.log`) and stops the run; re-running
 continues from what is on disk. Label and selection dirs record their settings and refuse to be resumed
-with different ones.
+with different ones; a `RUN_ROOT` records its sizes, train sources and label readers (`run_config.txt`) and
+refuses fit / train / select with other ones, so every configuration (pilot, mid, full) needs its own.
 
 Outputs: `labels/raw/<reader>/<source>_<split>/` (masks + outcomes per document; `LABELS` is shared by runs,
 documents are nested across N), `$RUN_ROOT/labels_fit/<reader|ensemble>/<target>/<source>_<split>/` (this

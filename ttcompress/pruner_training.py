@@ -67,27 +67,33 @@ def load_label_dirs(dirs: Sequence[str]) -> List[ChunkLabels]:
 
 def make_examples(labels: Sequence[ChunkLabels], label_source: str,
                   position_prior: Optional[Sequence[float]] = None) -> List[TrainExample]:
-    """Uninformative documents (outcome never varied) are dropped for
-    beta/ensemble -- a constant label carries no ranking signal -- but kept
-    for span, whose label does not depend on the reader."""
+    """Uninformative documents (outcome never varied) are dropped: a constant
+    label carries no ranking signal. Also for span, whose label does not need
+    the reader: the RQ2 control must train on exactly pruner_beta_primary's
+    documents (it reads the same fit dirs), so only the label type differs."""
     out = []
     for lab in labels:
+        if not lab.informative:
+            continue
         doc = lab.doc
         C = len(doc['chunks'])
         if label_source == 'span':
             target = [1.0 if i in set(doc['gold_chunks']) else 0.0 for i in range(C)]
         else:
-            if not lab.informative:
-                continue
             target = list(lab.z)
             if position_prior is not None:
                 target = [z - position_prior[position_bin(i, C, len(position_prior))] for i, z in enumerate(target)]
         out.append(TrainExample(doc['doc_id'], doc['source'], doc['question'], doc['chunks'], target,
-                                list(doc['gold_chunks']), list(lab.z) if lab.informative else None))
+                                list(doc['gold_chunks']), list(lab.z)))
     return out
 
 
 def listnet_loss(scores: torch.Tensor, target: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
+    # Cross-entropy between the two chunk distributions: a sum over chunks (Cao et al. 2007), next to a
+    # mean-reduced MSE. Not an imbalance: the ListNet value grows like log C only through the label's
+    # entropy, which has no gradient; per chunk, both gradients are ~ z_i / C at init (0.5·MSE / ListNet
+    # gradient norm ≈ 1 for C = 2..40), so w_mse weighs the two terms alike for any C. A mean over chunks
+    # here would shrink ListNet's gradient C-fold on long documents.
     return -(F.softmax(target / tau, dim=-1) * F.log_softmax(scores, dim=-1)).sum()
 
 

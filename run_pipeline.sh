@@ -176,6 +176,30 @@ if [[ "${SMOKE:-0}" == 1 && "${SMOKE_KEEP:-0}" != 1 ]] && has_stage preflight \
 fi
 tp_for() { if [[ "$1" =~ $LARGE_READER_PATTERN ]]; then echo "$TP_LARGE"; else echo 1; fi; }
 mkdir -p "$LOGS"
+# One RUN_ROOT = one configuration. Its fits, pruners and selections are restricted to these sizes, and train
+# skips any pruner whose train_log.json exists: a pilot launched without its own RUN_ROOT (landing in .env's
+# runs/main) would make the later full run evaluate the pilot's pruners. Checked before the labels stage, so
+# a mismatch costs nothing. The labels stage alone is exempt: LABELS is shared and nested across N.
+if has_stage fit || has_stage train || has_stage select; then
+  run_config="N_TRAIN=$N_TRAIN N_DEV=$N_DEV N_TEST=$N_TEST TRAIN_SOURCES=$(echo $TRAIN_SOURCES) LABEL_READERS=$(echo $LABEL_READERS)"
+  mkdir -p "$RUN_ROOT"
+  if [[ ! -f "$RUN_ROOT/run_config.txt" ]]; then
+    # outputs without the record come from a run before this check (older code, sizes unknown)
+    for d in "$FIT" "$MODELS" "$EVAL_DIR"; do
+      if [[ -n "$(ls -A "$d" 2>/dev/null)" ]]; then
+        echo "!! $d holds outputs of a run that predates run_config.txt; give this run its own RUN_ROOT"; exit 1
+      fi
+    done
+    echo "$run_config" > "$RUN_ROOT/run_config.txt"
+  elif [[ "$(cat "$RUN_ROOT/run_config.txt")" != "$run_config" ]]; then
+    echo "!! $RUN_ROOT belongs to another configuration:"
+    echo "     it holds: $(cat "$RUN_ROOT/run_config.txt")"
+    echo "     this run: $run_config"
+    echo "   Give this run its own RUN_ROOT (a pilot: RUN_ROOT=<runs>/pilot), or start this one over by removing"
+    echo "   $FIT $MODELS $EVAL_DIR and $RUN_ROOT/run_config.txt (the labels in $LABELS can stay)."
+    exit 1
+  fi
+fi
 # Physical GPU ids: honour a scheduler-provided CUDA_VISIBLE_DEVICES (Slurm etc.), else 0..NUM_GPUS-1.
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then IFS=',' read -r -a GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
 else mapfile -t GPU_IDS < <(seq 0 $((NUM_GPUS - 1))); fi
@@ -341,6 +365,17 @@ ensure_baseline_deps() {
   fi
 }
 
+# The whole unit-test suite on CPU (a few minutes; tests/test_cluster_safety.py runs offline, so the datasets and
+# the tiny test models must be cached: after prefetch, or from an earlier run's cache).
+TEST_MODELS="hf-internal-testing/tiny-random-gpt2 hf-internal-testing/tiny-random-RobertaModel"
+run_tests() {
+  echo "== unit tests (log: $LOGS/tests.log)"
+  if ! python -m pytest -q -x -p no:cacheprovider tests/ > "$LOGS/tests.log" 2>&1; then
+    tail -n 40 "$LOGS/tests.log"; echo "!! unit tests failed"; exit 1
+  fi
+  tail -n 1 "$LOGS/tests.log"
+}
+
 if has_stage preflight; then
   echo "== preflight"
   visible=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)
@@ -355,7 +390,7 @@ if sys.argv[1] == 'vllm':
     import vllm
     print(f"vllm {vllm.__version__}")
 PY
-  python -m pytest -q -x tests/test_attribution.py tests/test_selection_metrics.py tests/test_evaluate_report.py
+  has_stage prefetch || run_tests   # with prefetch in STAGES they run once every dataset and model is cached
   # every package version of this run, for reproducing it (the image, the baseline and llmlingua sites)
   { echo "# $(date -u +%FT%TZ) $(python --version 2>&1) $(command -v python)"
     for site in "" "$BASELINE_SITE" "$LLMLINGUA_SITE"; do
@@ -372,10 +407,11 @@ fi
 if has_stage prefetch; then
   echo "== prefetch (single process; avoids N processes racing on the HF cache)"
   # --arms adds the hub ids the EXTRA_ARMS baselines load (ttcompress.selection.arm_models)
-  all_models=$(echo "$LABEL_READERS $EVAL_READERS $BACKBONE $EMBED_MODEL" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
+  all_models=$(echo "$LABEL_READERS $EVAL_READERS $BACKBONE $EMBED_MODEL $TEST_MODELS" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
   all_sources=$(echo "$TRAIN_SOURCES ${EVAL_SOURCES//,/ }" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -)
   python scripts/prefetch.py --sources "$all_sources" --models "$all_models" --arms "${EXTRA_ARMS:-}" 2>&1 \
     | tee -a "$LOGS/prefetch.log"
+  if has_stage preflight; then run_tests; fi   # a launch from scratch: the unit tests, before any GPU hour
 fi
 
 if has_stage labels; then

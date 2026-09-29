@@ -240,6 +240,9 @@ def cmd_select(args):
     fail_path = os.path.join(args.out_dir, f'select_failures_shard{args.shard}.jsonl')
     failed = {(r['doc_id'], r['arm']) for r in _read_jsonl(fail_path)} if not args.retry_failed else set()
     for label, spec in parse_arms(args.arms):
+        if spec.partition(':')[0] in PUBLISHED_ARMS and label not in H1_PUBLISHED:
+            print(f"[WARN] {label}={spec}: a published compressor under a label H1 does not know "
+                  f"({', '.join(H1_PUBLISHED)}): it is evaluated but left out of H1", flush=True)
         wanted = ['full'] if spec == 'full' else ratios
         # only the missing (doc, ratio) rows: a re-select with an extra ratio must not duplicate the others
         need = {d.doc_id: [r for r in wanted if (d.doc_id, label, r) not in done] for d in docs}
@@ -438,6 +441,7 @@ def cmd_report(args):
                                                         'stable': gap >= args.min_upgrade_gap})
 
     report['hypotheses'] = hypothesis_families(cell, rows, readers, sources, ratios, args)
+    report['outside_families'] = arms_outside_families(arms)
     report['h2a_multi_support'] = multi_support_slice(cell, readers, rows, ratios, args)
     report['seeds'] = seed_table(report['cells'])
     if args.labels_dir:
@@ -595,6 +599,13 @@ def hypothesis_families(cell, rows, readers, sources, ratios, args):
     return out
 
 
+def arms_outside_families(arms) -> list:
+    """Arms no confirmatory family reads, beyond the expected ones (reference, oracles, ablations, seed
+    reruns). A published compressor run under a label H1 does not know lands here instead of in H1."""
+    known = {'full', 'ours_beta', 'ours_ens', 'oracle_beta', 'oracle_support', *H1_BASELINES, *H1_PUBLISHED, *H2A_VS}
+    return sorted(a for a in arms if a not in known and not a.startswith('abl_') and not SEED_ARM.match(a))
+
+
 def multi_support_slice(cell, readers, rows, ratios, args):
     """Exploratory: H2a's comparisons on multi-hop documents with >= 2 supporting paragraphs only. About half
     of VIMQA's questions have a single supporting paragraph, where the answer-span label already covers the
@@ -677,11 +688,16 @@ def cost_tables(cells, args):
     records (reader calls = K masks + 1 full context; `seconds` = the document's share of its batch's
     wall-clock on one process), next to per-document selection time of every arm."""
     from ttcompress.attribution import record_paths
-    labels = []
-    # a comma list: an ablation run's own labels plus the main run's (for the sources it did not re-measure)
+    labels, seen = [], set()
+    # a comma list: an ablation run's own labels, then the main run's (for the sources it did not re-measure).
+    # A label set in both is the ablation's: the first root wins, as in run_pipeline.sh's raw_root.
     roots = [d for d in args.labels_dir.split(',') if d]
-    for reader_dir in sorted(p for root in roots for p in glob.glob(os.path.join(root, 'raw', '*'))):
-        for split_dir in sorted(glob.glob(os.path.join(reader_dir, '*'))):
+    for root in roots:
+        for split_dir in sorted(glob.glob(os.path.join(root, 'raw', '*', '*'))):
+            reader_dir = os.path.dirname(split_dir)
+            key = (os.path.basename(reader_dir), os.path.basename(split_dir))
+            if key in seen:
+                continue
             secs, calls = [], []
             for p in record_paths(split_dir):
                 with open(p, encoding='utf-8') as f:
@@ -689,9 +705,11 @@ def cost_tables(cells, args):
                 secs.append(rec.get('seconds', float('nan')))
                 calls.append(len(rec['masks']) + 1)
             if calls:
-                labels.append({'reader': os.path.basename(reader_dir), 'set': os.path.basename(split_dir),
+                seen.add(key)
+                labels.append({'reader': key[0], 'set': key[1],
                                'n_docs': len(calls), 'calls_per_doc': float(np.mean(calls)),
                                'seconds_per_doc': float(np.nanmean(secs)), 'total_hours': float(np.nansum(secs) / 3600)})
+    labels.sort(key=lambda r: (r['reader'], r['set']))
     select = defaultdict(list)  # selection time does not depend on the reader
     for c in cells:
         if c['ratio'] != 'full':
@@ -726,6 +744,9 @@ def _fmt(m):
 def _markdown(report) -> str:
     lines = ['# Evaluation report', '', 'Token F1 with 95% cluster-bootstrap CI; never pooled across sources.', '']
     lines += _hypotheses_markdown(report.get('hypotheses', []))
+    if report.get('outside_families'):
+        lines += [f"Arms in no confirmatory family: {', '.join(report['outside_families'])}. A published "
+                  f"compressor is tested in H1 only under one of these labels: {', '.join(H1_PUBLISHED)}.", '']
     lines += _multi_support_markdown(report.get('h2a_multi_support', []))
     lines += _cost_markdown(report.get('cost'))
     lines += _label_quality_markdown(report.get('label_quality'))
@@ -735,13 +756,14 @@ def _markdown(report) -> str:
         groups[(c['reader'], c['source'])].append(c)
     for (reader, source), cells in sorted(groups.items()):
         lines += [f'## {source} — reader `{reader}`', '',
-                  '| ratio | arm | F1 | EM | gold recall | n (clusters) | realized compression | over budget | '
-                  'truncated | select ms |',
-                  '|---|---|---|---|---|---|---|---|---|---|']
+                  '| ratio | arm | F1 | EM | answer recall | gold recall | n (clusters) | realized compression | '
+                  'over budget | truncated | select ms |',
+                  '|---|---|---|---|---|---|---|---|---|---|---|']
         for c in sorted(cells, key=lambda c: (c['ratio'] != 'full', c['ratio'], -c['f1']['mean'])):
             gr = c['gold_recall']['mean']
             gr_text = '' if gr != gr else f"{gr:.3f}"
             lines.append(f"| {c['ratio']} | {c['arm']} | {_fmt(c['f1'])} | {c['em']['mean']:.3f} | "
+                         f"{c['answer_recall']['mean']:.3f} | "
                          f"{gr_text} | {c['n']} ({c['n_clusters']}) | {c['compression']:.1f}x | "
                          f"{c.get('over_budget_rate', 0.0):.0%} | {c['truncated_rate']:.0%} | {c['select_ms']:.0f} |")
         lines.append('')

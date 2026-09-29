@@ -71,7 +71,8 @@ def cmd_measure(args):
               'outcomes': sorted(outcomes), 'haystack_chars': args.haystack_chars if single else None,
               'distractors': args.distractors if single else None,
               'multihop_pad_chars': None if single else args.multihop_pad_chars,
-              'max_new_tokens': args.max_new_tokens or MAX_NEW_TOKENS[docs[0].hop if docs else 'single'],
+              # from the source, not docs[0]: a shard can be empty (n < num_shards)
+              'max_new_tokens': args.max_new_tokens or MAX_NEW_TOKENS[HOP[args.source]],
               'data_version': data_version(args.source), 'prompt_version': PROMPT_VERSION,
               'backend': args.backend, 'dtype': args.dtype, 'max_model_len': args.max_model_len}
     os.makedirs(out_dir, exist_ok=True)
@@ -90,6 +91,20 @@ def cmd_measure(args):
         os.replace(tmp, config_path)
     if not todo:
         return
+    # how these records were produced, for provenance only (never compared: num_shards would stop a label dir
+    # from growing on another GPU count, and vLLM batching is not bit-deterministic anyway)
+    import importlib.metadata as im
+    versions = {}
+    for pkg in ('vllm', 'torch', 'transformers'):
+        try:
+            versions[pkg] = im.version(pkg)
+        except im.PackageNotFoundError:
+            pass
+    with open(os.path.join(out_dir, 'measure_runs.jsonl'), 'a', encoding='utf-8') as f:
+        f.write(json.dumps({'time': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'shard': args.shard,
+                            'num_shards': args.num_shards, 'n_todo': len(todo), 'tp': args.tp,
+                            'docs_per_call': args.docs_per_call, 'batch_size': args.batch_size,
+                            'gpu_memory_utilization': args.gpu_memory_utilization, **versions}) + '\n')
     reader = load_reader(args.reader_model, args.backend, args.device, args.dtype, args.batch_size, args.max_model_len,
                          args.tp, args.gpu_memory_utilization)
 
