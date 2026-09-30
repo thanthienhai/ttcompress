@@ -1,0 +1,40 @@
+{
+  "name": "Sentence-level scoring replication (ours_sent vs EXIT, ours_sent vs reranker_sent)",
+  "fixed": "2026-09-30, before any of these documents were evaluated (docs/PREREG_SENTENCE_REPLICATION.md)",
+  "documents": "test split, per source the documents ranked 501-2500 in hash order (select --n 2000 --offset 500); vimqa has 199 (501-699)",
+  "families": [
+    {
+      "name": "R1",
+      "claim": "ours_sent not worse than EXIT by more than 0.02 token F1 at 8x (primary reader)",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "ours_sent",
+      "vs": ["exit"],
+      "kind": "noninferiority",
+      "margin": 0.02,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [8]
+    },
+    {
+      "name": "R2",
+      "claim": "ours_sent > reranker_sent at 8x: utility labels beat relevance at sentence level (primary reader)",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "ours_sent",
+      "vs": ["reranker_sent"],
+      "kind": "superiority",
+      "margin": 0.0,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [8]
+    },
+    {
+      "name": "R3",
+      "claim": "R1 on the held-out reader Qwen3-32B (no labels from it)",
+      "reader": "Qwen--Qwen3-32B",
+      "ours": "ours_sent",
+      "vs": ["exit"],
+      "kind": "noninferiority",
+      "margin": 0.02,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [8]
+    }
+  ]
+}

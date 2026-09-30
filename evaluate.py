@@ -233,6 +233,8 @@ def cmd_select(args):
             'multihop_pad_chars': args.multihop_pad_chars}
     if args.multihop_units != 'paragraph':   # only then: select_config.json files written before the option match
         meta['multihop_units'] = args.multihop_units
+    if args.offset:
+        meta['offset'] = args.offset
     config_path = os.path.join(args.out_dir, 'select_config.json')
     matched = os.path.exists(config_path)
     if matched:
@@ -251,8 +253,11 @@ def cmd_select(args):
     else:
         docs = []
         for src in parse_source_list(args.sources):
-            docs.extend(load_documents(src, args.split, args.n, args.haystack_chars, args.distractors,
-                                       args.multihop_pad_chars, args.multihop_units))
+            # --offset k: skip the first k documents of the (nested, hash-ordered) sample, e.g. the main run's test
+            # set, so a replication evaluates documents no earlier result has seen
+            n = None if args.n is None else args.n + args.offset
+            docs.extend(load_documents(src, args.split, n, args.haystack_chars, args.distractors,
+                                       args.multihop_pad_chars, args.multihop_units)[args.offset:])
         docs = [d for i, d in enumerate(docs) if i % args.num_shards == args.shard]
         tmp = f'{doc_path}.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
@@ -492,6 +497,8 @@ def cmd_report(args):
     if args.fit_dir:
         report['label_quality'] = label_quality(args.fit_dir)
     report['oracle_gap_by_reader'] = oracle_gap_by_reader(cell, readers, confirm, args.n_boot)
+    if args.prereg:
+        report['prereg'] = prereg_families(cell, rows, args.prereg, args.n_boot)
     if not args.no_diagnostics:
         report['diagnostics'] = selection_diagnostics(args.out_dir, cell, args.primary_reader, ours)
 
@@ -766,6 +773,36 @@ def hypothesis_families(cell, rows, readers, sources, ratios, args):
     return out
 
 
+def prereg_families(cell, rows, prereg_path, n_boot):
+    """Families fixed in a file BEFORE the documents they test were evaluated (a replication of an exploratory
+    finding, docs/PREREG_*.md). Each family: one reader, one of our arms against one or more arms, a test kind
+    (superiority | noninferiority | equivalence) and margin, sources and ratios; one-sided paired cluster
+    bootstrap, Holm within the family, the same machinery as the confirmatory families. Seed reruns of `ours`
+    (<ours>_s<k>) give the "every seed agrees" check."""
+    with open(prereg_path, encoding='utf-8') as f:
+        spec = json.load(f)
+    meta = {r['source']: {'language': r['language'], 'hop': r['hop']} for r in rows}
+    variants = seed_variants(sorted({a for (_, _, _, a) in cell}))
+    out = []
+    for fam in spec['families']:
+        sub = {s: meta[s] for s in fam['sources'] if s in meta}
+        ratios = [_ratio_key(float(r)) for r in fam['ratios']]
+        tests = _paired_family(cell, [fam['reader']], sub, lambda m: True, ratios, [fam['ours']], fam['vs'],
+                               fam['kind'], fam.get('margin', 0.0), n_boot)
+        for t, h in zip(tests, holm_adjust([t['p'] for t in tests])):
+            t['p_holm'] = h
+            t['supported'] = h is not None and h < fam.get('alpha', FAMILY_ALPHA)
+            if variants.get(t['ours']):
+                _seed_check(t, cell, variants[t['ours']], fam['kind'], fam.get('margin', 0.0))
+        seeded = [t for t in tests if 'seeds_agree' in t]
+        out.append({'name': fam['name'], 'claim': fam['claim'], 'kind': fam['kind'], 'margin': fam.get('margin', 0.0),
+                    'n_tests': len(tests), 'n_supported': sum(t['supported'] for t in tests),
+                    'n_budget_mismatch': sum(bool(t.get('budget_mismatch')) for t in tests),
+                    'n_seed_robust': sum(t['supported'] and t['seeds_agree'] for t in seeded) if seeded else None,
+                    'tests': tests})
+    return {'name': spec.get('name', os.path.basename(prereg_path)), 'fixed': spec.get('fixed'), 'families': out}
+
+
 def arms_outside_families(arms) -> list:
     """Arms no confirmatory family reads, beyond the expected ones (reference, oracles, ablations, seed
     reruns). A published compressor run under a label H1 does not know lands here instead of in H1."""
@@ -806,7 +843,7 @@ def _multi_support_markdown(tests) -> list:
     return lines + ['']
 
 
-SEED_ARM = re.compile(r'^(ours_beta|ours_ens)_s(\d+)$')
+SEED_ARM = re.compile(r'^(ours_beta|ours_ens|ours_sent|ours_fill)_s(\d+)$')
 
 
 def seed_variants(arms):
@@ -911,6 +948,10 @@ def _fmt(m):
 def _markdown(report) -> str:
     lines = ['# Evaluation report', '', 'Token F1 with 95% cluster-bootstrap CI; never pooled across sources.', '']
     lines += _hypotheses_markdown(report.get('hypotheses', []))
+    if report.get('prereg'):
+        pr = report['prereg']
+        lines += _hypotheses_markdown(pr['families'], title=f"Pre-registered families: {pr['name']}",
+                                      note=f"Fixed {pr.get('fixed')}, before these documents were evaluated.")
     if report.get('outside_families'):
         lines += [f"Arms in no confirmatory family: {', '.join(report['outside_families'])}. A published "
                   f"compressor is tested in H1 only under one of these labels: {', '.join(H1_PUBLISHED)}.", '']
@@ -968,10 +1009,11 @@ def _markdown(report) -> str:
     return '\n'.join(lines)
 
 
-def _hypotheses_markdown(families) -> list:
+def _hypotheses_markdown(families, title='Hypotheses (confirmatory; one-sided tests, Holm within each family, '
+                                          'alpha 0.05)', note=None) -> list:
     if not families:
         return []
-    lines = ['## Hypotheses (confirmatory; one-sided tests, Holm within each family, alpha 0.05)', '',
+    lines = [f'## {title}', ''] + ([note, ''] if note else []) + [
              '| family | claim | tests | supported | supported, every seed agrees | budget-mismatched |',
              '|---|---|---|---|---|---|']
     for f in families:
@@ -1098,6 +1140,8 @@ def main():
     s.add_argument('--sources', required=True, help="comma list or 'all'")
     s.add_argument('--split', choices=['dev', 'test'], default='test')
     s.add_argument('--n', type=int, default=None, help="documents per source")
+    s.add_argument('--offset', type=int, default=0,
+                   help="skip the first N documents per source (hash order), e.g. a replication on unseen documents")
     s.add_argument('--haystack-chars', type=int, default=30000)
     s.add_argument('--distractors', choices=['random', 'hard'], default='random')
     s.add_argument('--multihop-pad-chars', type=int, default=0)
@@ -1152,6 +1196,8 @@ def main():
                                                     "for the label-quality table")
     r.add_argument('--confirm-ratios', default='',
                    help="ratios the confirmatory families test (the pre-registered ones, e.g. 4,8); default: every ratio")
+    r.add_argument('--prereg', default=None,
+                   help="JSON of families fixed before the run (docs/prereg_*.json), tested like the confirmatory ones")
     r.add_argument('--no-diagnostics', action='store_true',
                    help="skip the exploratory diagnostics read from the selection files")
     r.set_defaults(func=cmd_report)

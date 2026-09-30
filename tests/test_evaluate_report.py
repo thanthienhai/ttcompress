@@ -310,3 +310,53 @@ def test_bench_latency_times_each_arm_per_source(tmp_path):
         (a, s) for a in ('bm25', 'bm25_fill') for s in ('hotpotqa', '2wiki')}
     assert all(r['n'] == 6 and len(r['pass_medians_ms']) == 2 for r in bench['rows'])   # 3 docs x 2 passes
     assert (tmp_path / 'bench.md').read_text(encoding='utf-8').startswith('# Selection latency')
+
+
+def test_paper_figures_pareto_uses_isolated_latency(tmp_path):
+    import pytest
+    pytest.importorskip('matplotlib')
+    test_report_hypothesis_families(tmp_path)
+    bench = tmp_path / 'bench.json'
+    bench.write_text(json.dumps({'env': {}, 'rows': [
+        {'arm': a, 'source': s, 'median_ms': ms} for s in ('uit_viquad', 'hotpotqa')
+        for a, ms in (('ours_beta', 14.0), ('bm25', 1.0))]}), encoding='utf-8')
+    out = tmp_path / 'figs'
+    res = subprocess.run([sys.executable, 'scripts/paper_figures.py', '--report', str(tmp_path / 'report.json'),
+                          '--primary-reader', 'strong', '--out-dir', str(out), '--bench', str(bench)],
+                         capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    assert (out / 'pareto.pdf').stat().st_size > 1000
+
+
+def test_report_preregistered_families_with_seed_check(tmp_path):
+    """Families fixed in a JSON file are tested like the confirmatory ones: Holm within the family, the
+    noninferiority margin, and the seed reruns of the tested arm (ours_sent_s<k>)."""
+    rng = np.random.default_rng(3)
+    rows = []
+    for i in range(80):
+        e = 0.01 * rng.standard_normal()
+        base = 0.6 + e
+        for arm, f1 in (('exit', base), ('ours_sent', base - 0.005), ('ours_sent_s1', base - 0.004),
+                        ('ours_sent_s2', base - 0.006), ('reranker_sent', base - 0.1)):
+            rows.append(_hrow('r8', arm, 8.0, i, f1, 'hotpotqa'))
+    with open(tmp_path / 'answers_r8_shard0.jsonl', 'w', encoding='utf-8') as f:
+        f.writelines(json.dumps(r) + '\n' for r in rows)
+    prereg = {'name': 'test prereg', 'fixed': '2026-09-30', 'families': [
+        {'name': 'R1', 'claim': 'noninferior', 'reader': 'r8', 'ours': 'ours_sent', 'vs': ['exit'],
+         'kind': 'noninferiority', 'margin': 0.02, 'sources': ['hotpotqa', 'vimqa'], 'ratios': [8]},
+        {'name': 'R2', 'claim': 'superior', 'reader': 'r8', 'ours': 'ours_sent', 'vs': ['reranker_sent', 'exit'],
+         'kind': 'superiority', 'margin': 0.0, 'sources': ['hotpotqa'], 'ratios': [8]}]}
+    (tmp_path / 'prereg.json').write_text(json.dumps(prereg), encoding='utf-8')
+    res = subprocess.run([sys.executable, 'evaluate.py', 'report', '--out-dir', str(tmp_path), '--ours', 'ours_sent',
+                          '--n-boot', '400', '--prereg', str(tmp_path / 'prereg.json'), '--no-diagnostics'],
+                         capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    report = json.loads((tmp_path / 'report.json').read_text(encoding='utf-8'))
+    fam = {f['name']: f for f in report['prereg']['families']}
+    assert fam['R1']['n_tests'] == 1 and fam['R1']['n_supported'] == 1        # vimqa absent: no test, no error
+    assert fam['R1']['tests'][0]['seeds_agree'] and fam['R1']['n_seed_robust'] == 1
+    assert fam['R2']['n_tests'] == 2 and fam['R2']['n_supported'] == 1         # beats reranker_sent, not exit
+    assert {t['vs'] for t in fam['R2']['tests'] if t['supported']} == {'reranker_sent'}
+    assert report['hypotheses'][0]['n_tests'] == 0                             # confirmatory families untouched
+    md = (tmp_path / 'report.md').read_text(encoding='utf-8')
+    assert '## Pre-registered families: test prereg' in md and 'Fixed 2026-09-30' in md

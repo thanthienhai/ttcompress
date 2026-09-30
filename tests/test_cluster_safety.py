@@ -114,7 +114,8 @@ def _select_args(out_dir, arms, ratios, sources='hotpotqa', restrict_sources='')
     import argparse
     return argparse.Namespace(split='test', budget_tokenizer=TINY_CAUSAL_LM, sources=sources, n=1, num_shards=1,
                               shard=0, haystack_chars=30000, distractors='random', multihop_pad_chars=0,
-                              multihop_units='paragraph', arms=arms, ratios=ratios, restrict_sources=restrict_sources,
+                              multihop_units='paragraph', offset=0, arms=arms, ratios=ratios,
+                              restrict_sources=restrict_sources,
                               oracle_beta_dir=None, device='cpu', out_dir=str(out_dir), flush_every=25,
                               retry_failed=False)
 
@@ -156,6 +157,22 @@ def test_extra_ratios_for_part_of_the_sources_keep_the_document_set(tmp_path):
     assert keys == [('h0', 4.0), ('u0', 4.0), ('u0', 16.0)]
     # the option does not enter select_config.json: a run from before it still matches
     assert json.loads((tmp_path / 'select_config.json').read_text(encoding='utf-8')) == meta
+
+
+def test_offset_selects_only_documents_after_the_main_test_set(tmp_path, monkeypatch):
+    """A replication (docs/PREREG_*.md) evaluates the documents ranked after the main run's N_TEST: --offset skips
+    the first ones of the nested hash order, and is recorded in select_config.json."""
+    os.environ.setdefault('HF_HUB_OFFLINE', '1')
+    import evaluate
+    pool = [make_doc(['Paris is in France.', 'Berlin is in Germany.'], doc_id=f'h{i}', source='hotpotqa', hop='multi')
+            for i in range(10)]
+    monkeypatch.setattr(evaluate, 'load_documents', lambda src, split, n, *a: pool[:n] if n else pool)
+    args = _select_args(tmp_path, 'lead', '4')
+    args.n, args.offset = 3, 2
+    evaluate.cmd_select(args)
+    docs = [d['doc_id'] for d in _read_jsonl(str(tmp_path / 'documents_shard0.jsonl'))]
+    assert docs == ['h2', 'h3', 'h4']
+    assert json.loads((tmp_path / 'select_config.json').read_text(encoding='utf-8'))['offset'] == 2
 
 
 def test_a_failing_published_compressor_is_recorded_not_fatal(tmp_path, monkeypatch):

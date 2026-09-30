@@ -92,17 +92,19 @@ chỉ chạy một lượt. Chúng tôi đánh giá trên năm nguồn dữ li�
 bước và nhiều bước suy luận, ở ngân sách $1/4$ và $1/8$ token, với bốn reader (một reader không
 tham gia sinh nhãn) và bảy bộ nén đã công bố ở cùng ngân sách. Các giả thuyết được đăng ký trước
 dưới dạng họ kiểm định bootstrap cụm ghép cặp có hiệu chỉnh Holm. Bộ tỉa chọn đoạn trong
-dưới 80\,ms mỗi tài liệu, thay cho khoảng 65 lần gọi reader. Trên hỏi đáp nhiều bước tiếng Việt và
+14--63\,ms mỗi tài liệu trên một H100, ngang chính xương sống dùng làm reranker, thay cho khoảng 65 lần gọi
+reader. Trên hỏi đáp nhiều bước tiếng Việt và
 tiếng Anh, nó vượt chính xương sống chưa huấn luyện và XProvence (cùng họ khởi tạo) từ 0.05 đến
 0.13 F1 ở 5/6 cặp nguồn--tỉ lệ, và mẫu hình giữ nguyên với reader không tham gia sinh nhãn. Trên
 hỏi đáp một bước, nơi mọi bộ nén theo đoạn đều giữ được đoạn chứa đáp án, nó chênh không quá 0.015
 F1 so với giám sát bằng nhãn đoạn vàng. Ba giả thuyết còn lại không được ủng hộ: bộ tỉa kém mức
-đóng góp đo trực tiếp trên dữ liệu nhiều bước (trên dữ liệu một bước, khoảng cách chỉ tồn tại với chính
+đóng góp đo trực tiếp trên dữ liệu nhiều bước (trên dữ liệu một bước, khoảng cách nhỏ và chủ yếu nằm ở chính
 reader gán nhãn); trên dữ liệu nhiều bước, nó không vượt giám sát bằng câu hỗ trợ gán tay; và nhãn gộp từ ba
 reader không giữ lợi ích nâng cấp reader tốt hơn nhãn một reader. Bộ nén theo câu EXIT mạnh hơn trên dữ liệu
-nhiều bước, nhưng chậm hơn nhiều lần; phân tích theo từng tài liệu cho thấy lợi thế của nó đến từ đơn vị chọn
+nhiều bước, nhưng chậm hơn 10--16 lần; phân tích theo từng tài liệu cho thấy lợi thế của nó đến từ đơn vị chọn
 là câu, không phải từ điểm số: ở $1/8$ ngân sách, chọn nguyên đoạn không giữ được đủ bằng chứng của câu hỏi
-hai bước.
+hai bước. Trong một thí nghiệm khám phá, cùng bộ tỉa đó, không huấn luyện lại, được dùng để chấm điểm từng câu
+thay vì từng đoạn: ở $1/8$ ngân sách, nó ngang EXIT trên VIMQA và HotpotQA và vượt EXIT 0.09 F1 trên 2Wiki.
 \end{abstract}
 
 % ============================================================================
@@ -172,7 +174,9 @@ Việc chưng cất vẫn làm mất một phần F1 so với đo trực tiếp 
 hộ: đối chứng thực chất học từ câu hỗ trợ gán tay, vốn đã bao gồm đoạn cầu nối, và ở $1/8$ ngân sách chọn nguyên
 đoạn không còn chỗ cho đoạn cầu nối (\S\ref{sec:results}, \S\ref{sec:diagnosis}). Ý (iii) không được
 ủng hộ theo nghĩa gộp nhãn giúp ích, nhưng nhãn từ một reader 8B đã chuyển được sang một reader 32B
-không tham gia sinh nhãn.
+không tham gia sinh nhãn. Một thí nghiệm khám phá sau đó xác nhận chẩn đoán về đơn vị chọn: cùng bộ tỉa, chấm
+điểm từng câu thay vì từng đoạn, đạt ngang hoặc vượt bộ nén theo câu mạnh nhất (EXIT) trên dữ liệu nhiều bước,
+và vẫn vượt chính xương sống khi xương sống cũng chấm theo câu (\S\ref{sec:followup}).
 
 \paragraph{Đóng góp.}
 \begin{enumerate}
@@ -180,7 +184,7 @@ không tham gia sinh nhãn.
   attribution). Phương pháp sinh nhãn mức đóng góp theo đoạn bằng mặt nạ ngẫu nhiên, surrogate Ridge của F1 và chuẩn
   hóa z trong tài liệu, rồi chưng cất các nhãn này vào một bộ tỉa cross-encoder
   một lượt. Chi phí nén giảm từ khoảng 65 lần gọi reader (1--6\,s mỗi tài liệu) xuống một lượt
-  encoder (dưới 80\,ms) (\S\ref{sec:method}, Bảng~\ref{tab:cost}).
+  encoder (14--63\,ms), tức khoảng 60--95 lần (\S\ref{sec:method}, Bảng~\ref{tab:cost}).
   \item Chúng tôi cho thấy \textbf{nhãn mức đóng góp thêm thông tin so với độ liên quan}. Trên hỏi đáp
   nhiều bước tiếng Việt (VIMQA) và tiếng Anh (HotpotQA, 2Wiki), bộ tỉa vượt chính xương sống
   \texttt{bge-reranker-v2-m3} chưa huấn luyện từ 0.048 đến 0.134 F1, và vượt XProvence cùng họ khởi
@@ -193,8 +197,9 @@ không tham gia sinh nhãn.
   cùng một ngân sách token (Phụ lục~\ref{app:baselines}). Chúng tôi báo cáo đầy đủ \textbf{các kết
   quả âm} và phân tích nguyên nhân theo từng tài liệu (\S\ref{sec:diagnosis}): F1 được quyết định bởi việc
   ngữ cảnh nén còn chứa đáp án, và ở $1/8$ ngân sách đơn vị đoạn là một trần cứng mà nhãn không vượt qua được;
-  khoảng cách tới mức đóng góp đo trực tiếp trên dữ liệu một bước chỉ là khớp quá mức vào reader gán nhãn; và
-  nhãn gộp nhiều reader không dịch lựa chọn xa hơn một lần đổi hạt giống.
+  khoảng cách tới mức đóng góp đo trực tiếp trên dữ liệu một bước chủ yếu là khớp quá mức vào reader gán nhãn; và
+  nhãn gộp nhiều reader không dịch lựa chọn xa hơn một lần đổi hạt giống. Chấm điểm theo câu bằng chính bộ tỉa
+  đã chưng cất, không huấn luyện lại, gỡ được trần đó (\S\ref{sec:followup}).
   \item Chúng tôi đánh giá \textbf{tiếng Việt} ở hai dạng: một bước (haystack xây từ
   UIT-ViQuAD và XQuAD-vi) và nhiều bước (VIMQA). Trên dữ liệu một bước, XProvence zero-shot mạnh ngang
   bộ tỉa; trên VIMQA thì không. Chúng tôi cũng ghi lại một lỗi dễ bỏ sót khi dùng mô hình base làm
@@ -450,8 +455,8 @@ chứng \arm{span\_sup} dùng cùng kiến trúc, huấn luyện bằng BCE trê
 và chọn epoch theo recall đoạn vàng ở ngân sách 25\%. Đoạn vàng là đoạn kim với dữ liệu một bước, và
 là \emph{các đoạn chứa câu hỗ trợ} (supporting facts) do người gán với dữ liệu nhiều bước. Vì vậy, trên
 dữ liệu nhiều bước, \arm{span\_sup} học từ bằng chứng gán tay, bao gồm cả đoạn cầu nối.
-\todo{xác nhận \arm{span\_sup} được huấn luyện trên đúng tập tài liệu của \arm{ours\_beta}: bản sửa này
-nằm ở commit \texttt{561254e}, sau commit \texttt{d936896} của lần chạy.}
+Trong lần chạy chính, \arm{span\_sup} được huấn luyện trên 9000 tài liệu, gồm cả 372 tài liệu (4.1\%) mà
+\arm{ours\_beta} bỏ vì không mang thông tin (8628 tài liệu); lợi thế dữ liệu nhỏ này nghiêng về phía đối chứng.
 
 \subsection{Chọn đoạn trong ngân sách}
 Với ngân sách $B=\lceil\mathrm{tok}(d)/\rho\rceil$, đếm bằng một bộ token hóa tham chiếu cố định, mọi
@@ -547,7 +552,8 @@ $q$ theo BH \citep{benjamini1995fdr}. Một phép kiểm định được đánh
 
 \paragraph{Cài đặt.} $\rho\in\{4,8\}$, 3 epoch, 3 hạt giống huấn luyện
 (\S\ref{sec:ablation}). \arm{oracle\_beta} dùng 100 tài liệu test đầu tiên của mỗi
-nguồn. Siêu tham số chi tiết ở Phụ lục~\ref{app:hparams}.
+nguồn (đã đăng ký trước); phần mở rộng sau lần chạy chính dùng 500 tài liệu với reader chính. Siêu tham số chi
+tiết ở Phụ lục~\ref{app:hparams}.
 
 % ============================================================================
 \begin{figure*}[t]
@@ -555,11 +561,9 @@ nguồn. Siêu tham số chi tiết ở Phụ lục~\ref{app:hparams}.
 \datafigure{figures/pareto.pdf}{\textwidth}
 \caption{F1 theo thời gian nén trên mỗi tài liệu (thang log), reader chính, tỉ lệ nén 4$\times$, từng
 nguồn riêng. Đường ngang: F1 toàn ngữ cảnh. Vòng tròn rỗng: \arm{oracle\_beta}, tức mức đóng góp đo
-trực tiếp với $K{+}1$ lần gọi reader (thời gian là chi phí sinh nhãn), tính trên 100 tài liệu test đầu
-tiên của mỗi nguồn; so sánh ghép cặp với \arm{ours\_beta} trên cùng các tài liệu đó là họ H1-oracle. Số
-liệu từng nhánh ở Bảng~\ref{tab:main} và Bảng~\ref{tab:cost}. Thời gian là trung bình trong stage chọn đoạn:
-\arm{ours\_beta} và \arm{ours\_ens} cùng kiến trúc, khoảng cách ngang giữa chúng là sai lệch đo do tranh chấp tài
-nguyên (Bảng~\ref{tab:cost}). \todo{vẽ lại với số của benchmark riêng.}}
+trực tiếp với $K{+}1$ lần gọi reader (thời gian là chi phí sinh nhãn), tính trên 500 tài liệu test đầu
+tiên của mỗi nguồn. Thời gian là trung vị đo riêng từng nhánh trên một H100 (Bảng~\ref{tab:cost}); chỉ các nhánh
+đã được đo riêng được vẽ. F1 của từng nhánh ở Bảng~\ref{tab:main}.}
 \label{fig:pareto}
 \end{figure*}
 
@@ -666,35 +670,37 @@ các hàng khác. Reader giữ lại Qwen3-32B: Bảng~\ref{tab:heldout} (Phụ 
 \footnotesize
 \setlength{\tabcolsep}{2pt}
 \resizebox{\columnwidth}{!}{%
-\begin{tabular}{llcc}
+\begin{tabular}{llccc}
 \toprule
-\textbf{Nhánh} & \textbf{Mô hình} & \textbf{Lượt} & \textbf{Thời gian} \\
+\textbf{Nhánh} & \textbf{Mô hình} & \textbf{Lượt} & \textbf{Đo riêng} & \textbf{Trong stage chọn} \\
 \midrule
-Sinh nhãn & reader 8B & $K{+}1$ & 1.0--5.9 s \\
-\arm{oracle\_beta} & reader 8B & $K{+}1$ & 1.0--5.9 s \\
+Sinh nhãn & reader 8B & $K{+}1$ & \multicolumn{2}{c}{1.0--5.9 s} \\
+\arm{oracle\_beta} & reader 8B & $K{+}1$ & \multicolumn{2}{c}{0.8--5.9 s} \\
 \midrule
-\arm{reranker} & bge-reranker-m3 & $C$ & 15--103 ms \\
-\arm{provence} & DeBERTa-v3 & $C$ & 97--593 ms \\
-\arm{xprovence} & bge-reranker-m3 & $C$ & 93--326 ms \\
-\arm{recomp} & BERT-base & $S{+}1$ & 17--163 ms \\
-\arm{exit} & Gemma-2B & $S$ & 146--1030 ms \\
-\arm{llmlingua} & Qwen2.5-7B & nhiều & 269--1144 ms \\
-\arm{longllmlingua} & Qwen2.5-7B & nhiều & 442--1566 ms \\
-\arm{llmlingua2} & XLM-R large & 1 & 80--606 ms \\
+\arm{bm25} & -- & 1 & 0.6--6.1 ms & -- \\
+\arm{embed} & bge-m3 & $C{+}1$ & 57--260 ms & -- \\
+\arm{reranker} & bge-reranker-m3 & $C$ & 13--71 ms & 15--103 ms \\
+\arm{provence} & DeBERTa-v3 & $C$ & -- & 97--593 ms \\
+\arm{xprovence} & bge-reranker-m3 & $C$ & -- & 93--326 ms \\
+\arm{recomp} & BERT-base & $S{+}1$ & 21--201 ms & 17--163 ms \\
+\arm{exit} & Gemma-2B & $S$ & 140--1010 ms & 146--1030 ms \\
+\arm{llmlingua} & Qwen2.5-7B & nhiều & -- & 269--1144 ms \\
+\arm{longllmlingua} & Qwen2.5-7B & nhiều & -- & 442--1566 ms \\
+\arm{llmlingua2} & XLM-R large & 1 & -- & 80--606 ms \\
 \midrule
-\arm{ours\_beta} & bge-reranker-m3 & $\lceil T/4096\rceil$ & 40--77 ms \\
-\quad cùng kiến trúc$^\ast$ & bge-reranker-m3 & $\lceil T/4096\rceil$ & 11--50 ms \\
+\arm{ours\_beta} & bge-reranker-m3 & $\lceil T/4096\rceil$ & 14--63 ms & 40--77 ms \\
+\arm{ours\_fill} & bge-reranker-m3 & 2 lượt & 28--134 ms & 52--119 ms \\
+\arm{ours\_sent} & bge-reranker-m3 & $\geq\lceil T/4096\rceil$ & -- & 42--60 ms \\
 \bottomrule
 \end{tabular}}
-\caption{Chi phí lúc nén cho mỗi tài liệu. Hàng đầu: đo mức đóng góp trực tiếp (sinh nhãn,
-và \arm{oracle\_beta} tức ContextCite ở cùng ngân sách). Lượt: số lần chạy mô hình ($K{+}1\approx65$ với reader); $C$: số đoạn, $S$: số
-câu, $T$: số token của tài liệu; bge-reranker-m3 là \texttt{bge-reranker-v2-m3}. Thời gian là trung vị mỗi
-tài liệu trong stage chọn đoạn (bốn tiến trình song song, mỗi tiến trình một H100), gồm cả các lần siết lại
-tỉ lệ nén của nhánh theo token; khoảng giá trị là nhỏ nhất--lớn nhất trên năm nguồn. Với reader 8B: 1.0\,s
-(HotpotQA) đến 5.9\,s (UIT-ViQuAD, khoảng 30k ký tự). $^\ast$: các lần chạy lại của cùng bộ tỉa với hạt giống
-khác, \arm{ours\_ens} và \arm{span\_sup} trên cùng tài liệu; thời gian đo được của \arm{ours\_beta} cao hơn
-khoảng 3 lần ở mọi tài liệu, dấu hiệu của tranh chấp tài nguyên. \todo{thay bằng benchmark riêng
-(\texttt{STAGES=bench}), một nhánh một lúc trên một GPU.}}
+\caption{Chi phí lúc nén cho mỗi tài liệu. Hàng đầu: đo mức đóng góp trực tiếp (sinh nhãn, và \arm{oracle\_beta}
+tức ContextCite ở cùng ngân sách); với reader 8B, từ 0.8--1.0\,s (dữ liệu nhiều bước) đến 5.9\,s (UIT-ViQuAD,
+khoảng 30k ký tự). Lượt: số lần chạy mô hình ($K{+}1\approx65$ với reader); $C$: số đoạn, $S$: số câu, $T$: số token
+của tài liệu; bge-reranker-m3 là \texttt{bge-reranker-v2-m3}. \emph{Đo riêng}: trung vị trên 100 tài liệu mỗi nguồn
+$\times$ 2 lượt, một nhánh một lúc trên một H100, sau khi làm nóng. \emph{Trong stage chọn}: trung vị trong stage chọn
+đoạn, với bốn tiến trình chạy song song; con số này cao hơn và kém ổn định (ví dụ \arm{ours\_beta} đo được
+40--77\,ms trong khi các bộ tỉa cùng kiến trúc chỉ 11--50\,ms), nên chỉ dùng cho các nhánh chưa được đo riêng.
+Khoảng giá trị là nhỏ nhất--lớn nhất trên năm nguồn; dữ liệu một bước dài hơn nên chậm hơn.}
 \label{tab:cost}
 \end{table}
 
@@ -732,8 +738,10 @@ ngữ cảnh nén còn chứa đáp án, F1 của mọi nhánh gần như bằng
 nó lấy câu từ khoảng ba đoạn trong khi một nhánh theo đoạn chỉ giữ được 1.6--2.1 đoạn ở $8\times$. Nó cũng
 dùng nhiều ngân sách hơn: ở $8\times$ trên dữ liệu nhiều bước, \arm{ours\_beta} dùng 83--89\% ngân sách so với
 93--94\% của EXIT, tức tỉ lệ nén thực tế 9.1--10.0$\times$ so với 8.5--8.7$\times$ (Hình~\ref{fig:tokens}).
-Đổi lại, EXIT tốn 146--1030\,ms mỗi tài liệu (trung vị) vì chạy Gemma-2B trên từng câu, so với 11--77\,ms của
-bộ tỉa (Bảng~\ref{tab:cost}). Hình~\ref{fig:pareto} đặt F1 cạnh thời gian nén của mọi bộ nén.
+Đổi lại, EXIT tốn 140--1010\,ms mỗi tài liệu vì chạy Gemma-2B trên từng câu, tức chậm hơn bộ tỉa (14--63\,ms)
+10--16 lần (Bảng~\ref{tab:cost}). Hình~\ref{fig:pareto} đặt F1 cạnh thời gian nén. Khi chính bộ tỉa được dùng
+để chấm điểm từng câu, khoảng cách với EXIT biến mất trên VIMQA và HotpotQA và đảo chiều trên 2Wiki
+(\S\ref{sec:followup}).
 
 \emph{Chuyển giao sang 2Wiki là điểm yếu nhất.} 2Wiki không được dùng để huấn luyện, và cấu trúc của nó khác
 hai nguồn huấn luyện nhiều bước: ở 42\% câu hỏi, đáp án xuất hiện ngay trong câu hỏi (như câu hỏi so sánh hai
@@ -753,8 +761,9 @@ của nhãn.
 \caption{F1 theo tỉ lệ nén \emph{thực tế} (số token toàn ngữ cảnh chia cho số token giữ lại, thang log), reader
 chính, một điểm cho mỗi tỉ lệ đã chạy. Trên dữ liệu nhiều bước, các nhánh theo đoạn nằm lệch sang phải so với
 tỉ lệ danh nghĩa (chúng không lấp hết ngân sách), còn các nhánh theo câu thì không; so sánh ở cùng tỉ lệ danh
-nghĩa vì vậy không khớp số token. \todo{thêm \arm{ours\_fill}, \arm{ours\_sent} và 16$\times$/32$\times$ sau
-thí nghiệm bổ sung.}}
+nghĩa vì vậy không khớp số token. Nét đứt và nét chấm xanh: bộ tỉa lấp ngân sách bằng câu (\arm{ours\_fill}) và
+chấm điểm theo câu (\arm{ours\_sent}), không huấn luyện lại (\S\ref{sec:followup}); trên dữ liệu một bước có thêm
+16$\times$ và 32$\times$ (các bộ nén đã công bố không chạy ở hai tỉ lệ này).}
 \label{fig:tokens}
 \end{figure*}
 
@@ -770,11 +779,19 @@ hơn trên VIMQA ($+0.01$ đến $+0.05$): đó là mất mát thật khi chưng
 Cỡ mẫu cũng giới hạn phép kiểm định: ô UIT-ViQuAD $8\times$ có khoảng tin cậy 95\% $[-0.046, +0.015]$ và vượt lề
 trước hiệu chỉnh ($p=0.012$), nhưng không sau Holm trên mười ô ($p=0.12$).
 
+\emph{Mở rộng lên 500 tài liệu} (sau lần chạy chính, nên không thay kết quả đã đăng ký ở trên): chúng tôi đo thêm
+nhãn của 400 tài liệu test mỗi nguồn. Với reader gán nhãn, H1-oracle đạt 1/10 ô: UIT-ViQuAD $8\times$
+($-0.016$, khoảng tin cậy $[-0.034, +0.002]$, $p$ sau Holm $0.002$, cả ba hạt giống đồng ý). Trên 500 tài liệu, khoảng
+cách với \arm{oracle\_beta} là 0.016--0.040 trên hai nguồn một bước, 0.036--0.052 trên VIMQA, 0.09 trên HotpotQA
+và 0.115--0.167 trên 2Wiki: khoảng cách UIT-ViQuAD $4\times$ đo trên 100 tài liệu (0.083) là một mẫu nhỏ bất lợi,
+còn thứ tự giữa các nguồn giữ nguyên.
+
 \paragraph{Chi phí.} Sinh nhãn cần khoảng 65 lần gọi reader cho mỗi tài liệu: với Qwen3-8B, 1.0\,s mỗi tài
-liệu trên HotpotQA và 5.9\,s trên UIT-ViQuAD trên một GPU. Chọn đoạn bằng bộ tỉa mất 11--77\,ms mỗi tài liệu
-(trung vị; Bảng~\ref{tab:cost}), tức rẻ hơn đo trực tiếp khoảng 24--120 lần tùy nguồn và tùy phép đo thời
-gian. Đo trên các lần chạy cùng kiến trúc (11--50\,ms), bộ tỉa còn nhanh hơn chính xương sống dùng làm
-reranker trên cùng tài liệu (15--103\,ms), vì nó chấm mọi đoạn trong một lượt thay vì từng cặp (câu hỏi, đoạn). \todo{thay khoảng 24--120 bằng số của benchmark riêng.}
+liệu trên HotpotQA và 5.9\,s trên UIT-ViQuAD trên một GPU. Đo riêng trên một H100, chọn đoạn bằng bộ tỉa mất
+13.5--63\,ms mỗi tài liệu (trung vị; Bảng~\ref{tab:cost}), tức rẻ hơn đo trực tiếp khoảng 60--95 lần tùy nguồn,
+và ngang chính xương sống dùng làm reranker (13--71\,ms): chấm mọi đoạn trong một lượt qua cửa sổ 4096 token tốn
+xấp xỉ bằng chấm từng cặp (câu hỏi, đoạn) theo lô. Phiên bản lấp ngân sách bằng câu cần thêm một lượt chấm câu
+(28--134\,ms).
 
 \subsection{RQ2: Mức đóng góp so với nhãn đáp án}
 
@@ -945,7 +962,9 @@ HotpotQA & 4$\times$ & $+.038$ & $+.036$ & $+.080$ & $+.042$ \\
 \end{tabular}}
 \caption{Lợi thế F1 của \arm{oracle\_beta} so với \arm{ours\_beta} trên 100 tài liệu ghép cặp, theo reader.
 $^\ast$: reader dùng để đo nhãn của \arm{oracle\_beta} (họ H1-oracle). Trên dữ liệu một bước, lợi thế chỉ có ở
-reader gán nhãn; trên dữ liệu nhiều bước, nó còn trên mọi reader. \todo{cập nhật với \texttt{ORACLE\_N}=500.}}
+reader gán nhãn; trên dữ liệu nhiều bước, nó còn trên mọi reader. Các reader khác chỉ có nhãn oracle cho 100 tài
+liệu đầu, nên bảng giữ 100 tài liệu cho mọi cột; trên 500 tài liệu, lợi thế với Qwen3-8B là 0.016--0.040 trên dữ
+liệu một bước và 0.036--0.167 trên dữ liệu nhiều bước (\S\ref{sec:results}).}
 \label{tab:oraclegap}
 \end{table}
 
@@ -1002,43 +1021,119 @@ từng reader trước khi sinh nhãn, nhất là khi dùng mô hình base với
 
 \subsection{Thí nghiệm bổ sung}
 \label{sec:followup}
-Phân tích ở \S\ref{sec:diagnosis} gợi ý các thí nghiệm sau. Tất cả dùng lại nhãn và bộ tỉa của lần chạy chính
-(trừ (b) và (d)), nằm ngoài các họ kiểm định xác nhận, và được báo cáo như kết quả khám phá.
-\begin{enumerate}
-  \item[(a)] \textbf{Lấp ngân sách bằng câu} (\arm{ours\_fill}) và \textbf{chấm điểm theo câu}
-  (\arm{ours\_sent}), không huấn luyện lại: bộ tỉa giữ nguyên các đoạn tốt nhất, rồi dùng phần ngân sách còn dư
-  cho các câu tốt nhất của những đoạn bị bỏ; hoặc chấm từng câu (kèm tiêu đề đoạn) như một đoạn. Cùng phép biến
-  đổi áp dụng cho \arm{span\_sup} và \arm{reranker}, để phần cải thiện được quy cho điểm số chứ không cho đơn vị
-  chọn. \todo{kết quả.}
-  \item[(b)] \textbf{Đơn vị câu cho dữ liệu nhiều bước}: đo lại nhãn Giai đoạn A với mỗi câu là một đơn vị (câu hỗ
-  trợ là câu vàng), huấn luyện lại bộ tỉa, và đánh giá trên cùng câu hỏi (so với lần chạy chính theo mã tài liệu).
-  \todo{kết quả.}
-  \item[(c)] \textbf{Tỉ lệ nén 16$\times$ và 32$\times$ trên dữ liệu một bước}, nơi ngân sách chỉ còn 1--2 đoạn và
-  việc xếp đúng đoạn kim lên đầu mới tạo khác biệt. \todo{kết quả.}
-  \item[(d)] \textbf{Nhiễu cùng bài báo} cho dữ liệu một bước. \todo{kết quả.}
-  \item[(e)] \textbf{\texttt{ORACLE\_N}=500} cho H1-oracle, và khoảng cách oracle trên các reader không gán nhãn
-  (Bảng~\ref{tab:oraclegap}). \todo{kết quả.}
-  \item[(f)] \textbf{Độ trễ} đo riêng từng nhánh trên một GPU. \todo{kết quả.}
-  \item[(g)] \textbf{LLMLingua và LongLLMLingua với mục tiêu số token} thay cho tỉ lệ, để chúng không bị cắt đuôi.
-  \todo{kết quả.}
-\end{enumerate}
+Phân tích ở \S\ref{sec:diagnosis} gợi ý các thí nghiệm dưới đây. Chúng được thiết kế \emph{sau khi} thấy kết quả
+chính, dùng lại nhãn và bộ tỉa của lần chạy chính (trừ (b) và (d)), nằm ngoài các họ kiểm định xác nhận, và được
+báo cáo như kết quả khám phá. Các so sánh ghép cặp dưới đây dùng bootstrap cụm như \S\ref{sec:setup}; $q$ là giá trị
+BH trên toàn bộ bảng khám phá (3008 phép so sánh). Trừ khi ghi khác, chỉ reader chính đã trả lời các lựa chọn mới.
+\todo{bổ sung ba reader còn lại cho các nhánh (a) và (c).}
+
+\begin{table}[t]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l cc cc cc}
+\toprule
+& \multicolumn{2}{c}{VIMQA} & \multicolumn{2}{c}{HotpotQA} & \multicolumn{2}{c}{2Wiki} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+\textbf{Nhánh} & 4$\times$ & 8$\times$ & 4$\times$ & 8$\times$ & 4$\times$ & 8$\times$ \\
+\midrule
+\multicolumn{7}{l}{\emph{chọn nguyên đoạn}} \\
+\arm{ours\_beta} & .689 & .593 & .695 & .646 & .458 & .347 \\
+\arm{span\_sup} & .664 & .570 & .716 & .570 & .447 & .347 \\
+\arm{reranker} & .641 & .535 & .641 & .512 & .378 & .312 \\
+\midrule
+\multicolumn{7}{l}{\emph{nguyên đoạn, lấp ngân sách dư bằng câu}} \\
+\arm{ours\_fill} & .685 & .622 & .689 & .637 & .475 & .368 \\
+\arm{span\_fill} & .670 & .603 & .725 & .626 & .469 & .357 \\
+\arm{reranker\_fill} & .632 & .581 & .652 & .551 & .385 & .315 \\
+\midrule
+\multicolumn{7}{l}{\emph{chấm điểm từng câu}} \\
+\arm{ours\_sent} & .710 & .691 & .712 & .681 & .602 & .548 \\
+\arm{span\_sent} & .716 & .694 & .739 & .699 & .648 & .545 \\
+\arm{reranker\_sent} & .687 & .664 & .684 & .640 & .536 & .446 \\
+\midrule
+\multicolumn{7}{l}{\emph{bộ nén theo câu đã công bố}} \\
+\arm{exit} & .689 & .672 & .718 & .692 & .561 & .456 \\
+\arm{recomp} & .495 & .426 & .660 & .589 & .522 & .430 \\
+\bottomrule
+\end{tabular}}
+\caption{F1 token (reader chính) khi đổi đơn vị chọn mà không huấn luyện lại. \arm{*\_fill}: giữ các đoạn tốt nhất
+theo bộ chấm điểm đoạn, rồi lấp ngân sách còn dư bằng các câu tốt nhất (cùng bộ chấm điểm) của các đoạn bị bỏ.
+\arm{*\_sent}: chấm từng câu, kèm tiêu đề đoạn, như một đoạn, rồi chọn câu trong ngân sách như EXIT và RECOMP.
+\arm{span\_*} dùng bộ tỉa \arm{span\_sup}, \arm{reranker\_*} dùng xương sống chưa huấn luyện. Khám phá, không thuộc
+họ kiểm định xác nhận.}
+\label{tab:sentence}
+\end{table}
+
+\paragraph{(a) Đổi đơn vị chọn, không huấn luyện lại} (Bảng~\ref{tab:sentence}).
+\emph{Lấp ngân sách bằng câu} đưa phần ngân sách được dùng ở $8\times$ từ 83--89\% lên 95--96\% và tăng nhẹ tỉ lệ ngữ
+cảnh còn chứa đáp án (VIMQA 0.79 $\to$ 0.81, HotpotQA 0.80 $\to$ 0.85, 2Wiki 0.28 $\to$ 0.36). F1 chỉ tăng trên VIMQA
+$8\times$ ($+0.029$, $q=0.011$) và 2Wiki $8\times$ ($+0.021$, $q=0.06$), không tăng trên HotpotQA, và
+\arm{ours\_fill} vẫn kém EXIT ở $8\times$ trên cả ba nguồn ($-0.050$, $-0.055$, $-0.088$; $q\le0.005$): vài câu rời
+rạc lấy từ các đoạn bị bỏ không thay được đoạn bằng chứng thứ hai.
+
+\emph{Chấm điểm theo câu} thì khác. Cùng bộ tỉa, chấm từng câu thay vì từng đoạn, giữ được đáp án ở 93\%, 92\% và
+67\% tài liệu VIMQA, HotpotQA và 2Wiki ở $8\times$ (EXIT: 86\%, 92\%, 57\%), với tỉ lệ nén thực tế 8.4--8.5$\times$,
+tức khớp số token với EXIT (8.5--8.7$\times$). So với \arm{ours\_beta}, F1 tăng $+0.098$, $+0.035$ và $+0.201$ ở
+$8\times$. So với EXIT, \arm{ours\_sent} hơn $+0.019$ trên VIMQA và kém $-0.012$ trên HotpotQA ở $8\times$ (đều không có
+ý nghĩa), và hơn $+0.092$ trên 2Wiki ($[+0.046, +0.140]$, $q=0.003$); ở $4\times$ là $+0.021$, $-0.007$ và $+0.042$.
+Trong stage chọn đoạn, \arm{ours\_sent} tốn 42--60\,ms mỗi tài liệu, ngang \arm{ours\_beta} trong cùng stage, tức
+vẫn rẻ hơn EXIT khoảng một bậc độ lớn. \todo{đo riêng \arm{ours\_sent} bằng benchmark.}
+
+Vì kết quả này là khám phá, chúng tôi đã đăng ký trước một lần lặp lại trên tài liệu chưa dùng (các tài liệu test
+xếp hạng 501--2500 của mỗi nguồn nhiều bước), trước khi đánh giá chúng: \arm{ours\_sent} không kém EXIT quá 0.02 F1 ở
+$8\times$ với reader chính (R1) và với Qwen3-32B (R3), và vượt \arm{reranker\_sent} (R2), mỗi họ Holm trên ba nguồn.
+\todo{kết quả R1--R3.}
+
+Hai so sánh cho biết phần cải thiện đến từ đâu. Ở cùng đơn vị câu, nhãn mức đóng góp vẫn vượt độ liên quan:
+\arm{ours\_sent} hơn \arm{reranker\_sent} $+0.023$ và $+0.027$ (VIMQA), $+0.028$ và $+0.041$ (HotpotQA), $+0.066$ và
+$+0.102$ (2Wiki) ở $4\times$ và $8\times$, tức kết luận của RQ1 giữ nguyên khi đổi đơn vị chọn. Nhưng giám sát bằng câu
+hỗ trợ gán tay cũng vậy: \arm{span\_sent} ngang hoặc nhỉnh hơn \arm{ours\_sent} (từ $-0.046$ đến $+0.003$; có ý
+nghĩa ở HotpotQA và 2Wiki $4\times$), đúng với kết luận của RQ2. Nói cách khác, trần của lần chạy chính nằm ở đơn vị
+chọn; khi gỡ trần đó, thứ tự giữa các loại nhãn không đổi.
+
+\paragraph{(b) Đơn vị câu ngay từ Giai đoạn A.} Đo lại nhãn với mỗi câu là một đơn vị (câu hỗ trợ là câu vàng) và
+huấn luyện lại bộ tỉa, để nhãn và bộ tỉa cùng khớp với đơn vị chọn. \todo{đang chạy; kết quả.}
+
+\paragraph{(c) Tỉ lệ nén 16$\times$ và 32$\times$ trên dữ liệu một bước.} Ở 16$\times$ (khoảng 2--3 đoạn), mọi nhánh
+theo đoạn vẫn giữ được đoạn kim ở 94--99\% tài liệu, nên dữ liệu vẫn bão hòa. Ở 32$\times$ (khoảng 1--1.5 đoạn), tỉ lệ
+này giảm còn 69--75\% cho \emph{mọi} nhánh theo đoạn, và \arm{ours\_beta} ngang \arm{embed}, \arm{span\_sup} và cả
+\arm{oracle\_beta} (0.582 và 0.575 trên UIT-ViQuAD và XQuAD-vi), hơi kém \arm{reranker} trên UIT-ViQuAD ($-0.018$,
+$q=0.010$): khi chỉ giữ được một đoạn, bộ tỉa không xếp đoạn kim lên đầu thường xuyên hơn độ liên quan. Các nhánh chấm
+theo câu giữ được đáp án ở 98--99\% tài liệu và đạt 0.73--0.78 F1 ở 32$\times$, nhưng \arm{ours\_sent},
+\arm{reranker\_sent} và \arm{span\_sent} ngang nhau ($|\Delta|\le0.015$). Trên dữ liệu một bước, nhãn mức đóng góp
+không thêm gì so với độ liên quan ở bất kỳ ngân sách nào; đơn vị chọn quyết định kết quả.
+
+\paragraph{(d) Nhiễu cùng bài báo} cho dữ liệu một bước. \todo{đang chạy; kết quả.}
+
+\paragraph{(e) \texttt{ORACLE\_N}=500.} Xem \S\ref{sec:results} (đoạn H1-oracle): 1/10 ô đạt với reader gán nhãn,
+khoảng cách trên dữ liệu một bước còn 0.016--0.040.
+
+\paragraph{(f) Độ trễ đo riêng.} Bảng~\ref{tab:cost}: bộ tỉa 14--63\,ms, ngang xương sống (13--71\,ms); EXIT
+140--1010\,ms; RECOMP 21--201\,ms; \arm{embed} 57--260\,ms.
+
+\paragraph{(g) LLMLingua và LongLLMLingua với mục tiêu số token} thay cho tỉ lệ, để chúng không bị cắt đuôi.
+\todo{chưa chạy trong đợt này.}
 
 % ============================================================================
 \section{Kết luận}
 Chúng tôi đề xuất và kiểm định giả thuyết rằng mức đóng góp của từng đoạn vào F1 đầu ra
 có thể được chưng cất vào một bộ tỉa một lượt, rằng nó chứa thông tin vượt quá nhãn
 đáp án khi câu hỏi cần nhiều đoạn, và rằng gộp nhãn nhiều reader giúp bộ nén ít phụ thuộc
-reader hơn. Vế thứ nhất được ủng hộ một phần. Bộ tỉa chọn đoạn trong dưới 80\,ms mỗi tài liệu. Trên hỏi đáp
-nhiều bước tiếng Việt và tiếng Anh, nó vượt chính xương sống chưa huấn luyện và XProvence từ 0.05 đến 0.13
-F1, và mẫu hình giữ nguyên với một reader không tham gia sinh nhãn. Trên hỏi đáp một bước, mọi bộ nén theo đoạn
-đều ngang nhau vì bài toán đã bão hòa. Bộ tỉa vẫn kém mức đóng góp đo trực tiếp trên dữ liệu nhiều bước
-(H1-oracle không đạt; trên dữ liệu một bước, khoảng cách chỉ tồn tại với reader gán nhãn), và kém bộ nén theo câu
-EXIT trên dữ liệu nhiều bước, dù EXIT chậm hơn nhiều lần. Phân tích theo từng tài liệu cho thấy nút thắt nằm ở
-đơn vị chọn, không phải ở nhãn: ở $1/8$ ngân sách, chọn nguyên đoạn không giữ được đủ bằng chứng của một câu
-hỏi hai bước. Vế thứ hai không được ủng hộ: trên dữ liệu nhiều bước, nhãn mức đóng góp chỉ ngang giám sát bằng
-câu hỗ trợ gán tay. Vế thứ ba không được ủng hộ theo cách đã phát biểu: nhãn gộp không dịch lựa chọn xa hơn
-một lần đổi hạt giống, và bộ tỉa dùng nhãn một reader đã chuyển được sang reader lớn hơn. Hai hướng tiếp theo là
-chọn ở mức câu hoặc lai đoạn--câu (\S\ref{sec:followup}), và surrogate có tương tác giữa các đoạn.
+reader hơn. Vế thứ nhất được ủng hộ một phần. Bộ tỉa chọn đoạn trong 14--63\,ms mỗi tài liệu, ngang chính
+xương sống dùng làm reranker và rẻ hơn đo trực tiếp 60--95 lần. Trên hỏi đáp nhiều bước tiếng Việt và tiếng
+Anh, nó vượt xương sống chưa huấn luyện và XProvence từ 0.05 đến 0.13 F1, và mẫu hình giữ nguyên với một reader
+không tham gia sinh nhãn. Trên hỏi đáp một bước, mọi bộ nén theo đoạn đều ngang nhau vì bài toán đã bão hòa, kể
+cả ở 16$\times$ và 32$\times$. Bộ tỉa vẫn kém mức đóng góp đo trực tiếp trên dữ liệu nhiều bước (H1-oracle không đạt
+với 100 tài liệu đã đăng ký; 1/10 ô với 500 tài liệu), và khi chọn theo đoạn thì kém bộ nén theo câu EXIT trên dữ
+liệu nhiều bước. Phân tích theo từng tài liệu cho thấy nút thắt nằm ở đơn vị chọn, không phải ở nhãn, và một
+thí nghiệm khám phá xác nhận điều đó: dùng chính bộ tỉa để chấm điểm từng câu, không huấn luyện lại, nó ngang
+EXIT trên VIMQA và HotpotQA và vượt EXIT 0.09 F1 trên 2Wiki ở $1/8$ ngân sách, trong khi EXIT chậm hơn 10--16 lần.
+Vế thứ hai không được ủng hộ: nhãn mức đóng góp chỉ ngang giám sát bằng câu hỗ trợ gán tay, cả khi chọn theo
+đoạn lẫn theo câu. Vế thứ ba không được ủng hộ theo cách đã phát biểu: nhãn gộp không dịch lựa chọn xa hơn một
+lần đổi hạt giống, và bộ tỉa dùng nhãn một reader đã chuyển được sang reader lớn hơn. Hai hướng tiếp theo là đo
+nhãn ngay ở mức câu (\S\ref{sec:followup}, (b)) và surrogate có tương tác giữa các đoạn.
 
 % ============================================================================
 \section*{Hạn chế (Limitations)}
@@ -1054,14 +1149,18 @@ chọn ở mức câu hoặc lai đoạn--câu (\S\ref{sec:followup}), và surro
   tóm tắt bên trong đoạn. Ngân sách đạt được nên thấp hơn ngân sách danh nghĩa: ở $8\times$ trên dữ liệu nhiều
   bước, tỉ lệ nén thực tế là 9.1--10.0$\times$, so với 8.5--8.7$\times$ của EXIT. Với 10 đoạn và ngân sách $1/8$,
   mọi đoạn vàng chỉ vừa ngân sách ở 2--51\% tài liệu tùy nguồn. Đây là lý do chính khiến EXIT vượt chúng tôi trên
-  dữ liệu nhiều bước (\S\ref{sec:diagnosis}).
-  \item \textbf{Oracle}: \arm{oracle\_beta} chỉ tính trên 100 tài liệu mỗi nguồn, và nhãn của nó được đo bằng chính
+  dữ liệu nhiều bước (\S\ref{sec:diagnosis}). Dùng bộ tỉa để chấm điểm từng câu gỡ được trần này
+  (\S\ref{sec:followup}), nhưng đó là kết quả khám phá: bộ tỉa được chưng cất trên đoạn và áp dụng cho câu mà không
+  huấn luyện lại, và mới được đánh giá với reader chính.
+  \item \textbf{Oracle}: \arm{oracle\_beta} chỉ tính trên 100 tài liệu mỗi nguồn trong phân tích đã đăng ký (500 tài
+  liệu với reader chính trong phần mở rộng), và nhãn của nó được đo bằng chính
   reader đánh giá trên chính các tài liệu đó, nên nó một phần khớp quá mức vào reader này
   (Bảng~\ref{tab:oraclegap}). Nó không phải cận trên cho một bộ nén dùng với reader khác.
   \item \textbf{Đối chứng nhãn đoạn vàng}: trên dữ liệu nhiều bước, \arm{span\_sup} học từ câu hỗ trợ gán
   tay chứ không từ nhãn đoạn chứa đáp án, nên H2a thực chất so với một đối chứng mạnh hơn phát biểu ban đầu.
-  \item \textbf{Đo thời gian}: thời gian nén được đo trong stage chọn đoạn, với bốn tiến trình chạy song song;
-  cùng một kiến trúc bộ tỉa đo được 11--50\,ms ở lần chạy này và 40--77\,ms ở lần chạy khác trên cùng tài liệu.
+  \item \textbf{Đo thời gian}: độ trễ được đo riêng cho bộ tỉa, các baseline đơn giản, RECOMP và EXIT
+  (Bảng~\ref{tab:cost}); Provence, XProvence, họ LLMLingua và \arm{ours\_sent} chỉ có thời gian đo trong stage chọn
+  đoạn, nơi bốn tiến trình chạy song song và số đo cao hơn, kém ổn định hơn.
   \item \textbf{F1 token} là thước đo không hoàn hảo cho câu trả lời tự do. Với tiếng
   Việt, F1 theo âm tiết có thể đánh giá quá cao các câu trả lời trùng một phần.
   \item \textbf{Phạm vi reader}: ba reader sinh nhãn đều dưới 10B tham số và reader giữ lại

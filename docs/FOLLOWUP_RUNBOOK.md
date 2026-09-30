@@ -99,3 +99,81 @@ File thứ tư là patch XProvence / `defusedxml`. Sau khi nó được gộp v�
 `scripts/followup.sh`: `hard` (nhiễu cùng bài báo), `units` (đơn vị câu cho multi-hop, cần đo lại nhãn và train lại
 pruner) và LLMLingua theo số token (`*_tt`, nằm trong bước `arms`). Riêng bước `units` không dùng XProvence nên chạy
 được ngay: `bash scripts/followup.sh units`.
+
+---
+
+# Đợt 2: củng cố kết quả chấm điểm theo câu (không train lại)
+
+Mục tiêu: biến kết quả khám phá của đợt 1 (`ours_sent` ngang hoặc vượt EXIT) thành bằng chứng dùng được trong paper.
+Bốn việc, thứ tự chạy dưới đây. Không việc nào nạp XProvence, nên chạy được khi patch XProvence chưa gộp. Nếu job
+ablation `units` / `hard` đang chiếm GPU, chờ nó xong hoặc chạy trên một pod khác cùng HPS.
+
+Tổng ước tính trên 4×H100: khoảng 3 giờ.
+
+## Bước 2.0: lấy code mới
+
+```bash
+cd /mnt/hps/anhm-paper/ttcompress_new
+git fetch origin && git checkout main && git pull --ff-only origin main
+git log --oneline -3          # phải có commit đăng ký trước docs/PREREG_SENTENCE_REPLICATION.md
+M=/mnt/hps/anhm-paper/ttscompress/runs/main/models
+R=/mnt/hps/anhm-paper/ttscompress/runs/main
+```
+
+## Bước 2.1: đo riêng độ trễ của `ours_sent` (~10 phút, một GPU, không chạy gì khác cùng lúc)
+
+```bash
+EXTRA_ARMS= STAGES=bench BENCH_OUT=$R/results/eval_test/bench_latency_sent.json \
+BENCH_ARMS="ours_beta=pruner:$M/pruner_beta_primary,ours_sent=sent+pruner:$M/pruner_beta_primary,reranker=reranker:BAAI/bge-reranker-v2-m3" \
+  bash run_pipeline.sh
+```
+
+`ours_beta` và `reranker` được đo lại cùng lượt làm mốc so sánh. `BENCH_OUT` giữ nguyên file `bench_latency.json` của
+đợt 1.
+
+## Bước 2.2: ba reader còn lại và các seed của `ours_sent` trên tài liệu chính (~1–1.5 giờ)
+
+```bash
+FOLLOWUP_ARMS=1 EXTRA_RATIOS_SINGLE=16,32 EXTRA_ARMS= STAGES="select answer" bash run_pipeline.sh
+REPORT_OURS=ours_beta,ours_ens,ours_fill,ours_sent STAGES=report bash run_pipeline.sh
+```
+
+- `select` chỉ tạo các nhánh mới `ours_sent_s1`, `ours_sent_s2` (mọi thứ khác đã có trên đĩa).
+- `answer` chạy với danh sách reader mặc định: Qwen3-8B trả lời các nhánh seed mới; Qwen3-1.7B, SEA-LION và
+  Qwen3-32B trả lời mọi nhánh của đợt 1 (`*_sent`, `*_fill`, 16×/32×) và các nhánh seed.
+- Cần xem: bảng Qwen3-32B của các nguồn nhiều bước (`ours_sent` so với `exit`), và bảng "Training-seed variation"
+  có thêm `ours_sent`.
+
+## Bước 2.3: lặp lại đã đăng ký trước trên tài liệu mới (~1.5 giờ)
+
+Giả thuyết, biên, tài liệu và phép thử đã cố định trong `docs/PREREG_SENTENCE_REPLICATION.md` và
+`docs/prereg_sentence_replication.json` **trước** lần chạy này. Không sửa hai file đó sau khi chạy (nếu buộc phải
+sửa, ghi ở mục 8 của file `.md`).
+
+```bash
+ARMS_REPL="full,ours_beta=pruner:@MODELS@/pruner_beta_primary,ours_sent=sent+pruner:@MODELS@/pruner_beta_primary"
+ARMS_REPL="$ARMS_REPL,ours_sent_s1=sent+pruner:@MODELS@/pruner_beta_primary_s1,ours_sent_s2=sent+pruner:@MODELS@/pruner_beta_primary_s2"
+ARMS_REPL="$ARMS_REPL,reranker_sent=sent+reranker:@BACKBONE@,span_sent=sent+pruner:@MODELS@/pruner_span,exit"
+
+EVAL_DIR=$R/results/eval_replication EVAL_SOURCES=vimqa,hotpotqa,2wiki EVAL_N=2000 EVAL_OFFSET=500 ORACLE_N=0 \
+  EXTRA_ARMS=exit FOLLOWUP_ARMS=0 EXTRA_RATIOS_SINGLE= ONLY_ARMS="$ARMS_REPL" \
+  STAGES="select answer" bash run_pipeline.sh
+EVAL_DIR=$R/results/eval_replication PREREG_FILE=docs/prereg_sentence_replication.json \
+  REPORT_OURS=ours_sent,ours_beta STAGES=report bash run_pipeline.sh
+```
+
+- `EVAL_N=2000 EVAL_OFFSET=500`: mỗi nguồn lấy các tài liệu xếp hạng 501–2500, không tài liệu nào trùng 500 tài liệu
+  của lần chạy chính (VIMQA chỉ còn 199). Thư mục riêng `results/eval_replication`, nên không đụng tới kết quả cũ.
+- `EXTRA_ARMS=exit` chỉ để pipeline kiểm tra gói của EXIT (peft); danh sách nhánh do `ONLY_ARMS` quyết định.
+- Cần xem: mục "Pre-registered families" đầu `results/eval_replication/report.md` (R1, R2, R3, kèm cột "every seed
+  agrees").
+
+## Gửi kết quả về
+
+```bash
+huggingface-cli upload thanthienhai/ttcompress-main-eval $R/results/eval_test/bench_latency_sent.json followup2/bench_latency_sent.json --repo-type dataset
+huggingface-cli upload thanthienhai/ttcompress-main-eval $R/results/eval_test/report.json followup2/report.json --repo-type dataset
+huggingface-cli upload thanthienhai/ttcompress-main-eval $R/results/eval_test/report.md followup2/report.md --repo-type dataset
+huggingface-cli upload thanthienhai/ttcompress-main-eval $R/results/eval_replication/report.json followup2/replication/report.json --repo-type dataset
+huggingface-cli upload thanthienhai/ttcompress-main-eval $R/results/eval_replication/report.md followup2/replication/report.md --repo-type dataset
+```

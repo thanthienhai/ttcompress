@@ -303,6 +303,15 @@ H1-oracle 0/10, H2a 1/12, H2b 1/4, H3 0/28, H3-heldout 0/28. The per-document an
 All of it runs with `scripts/followup.sh` (README). Still to confirm there: the published arms' behaviour on the
 sentence-unit documents is not evaluated (they are compared on the paragraph documents, by doc_id).
 
+**Follow-up results, 2026-09-30** (exploratory; Qwen3-8B only for the new selections; HF `followup/`):
+`ours_sent` (the paragraph-trained pruner scoring sentences, no retraining) matches EXIT on VIMQA / HotpotQA at 8x
+(+0.019, −0.012, n.s.) and beats it on 2Wiki (+0.092, q = 0.003) at matched realized tokens (8.4–8.5x vs 8.5–8.7x);
+it still beats `reranker_sent` (+0.027 to +0.102 at 8x) and ties `span_sent`. `ours_fill` helps little (still below
+EXIT at 8x). Single-hop stays saturated at 16x; at 32x every chunk arm keeps the needle in ~70 % of documents and
+`ours_beta` ≈ relevance baselines ≈ `oracle_beta`. Isolated latency: pruner 14–63 ms/doc ≈ reranker 13–71, EXIT
+140–1010. `ORACLE_N=500`: H1-oracle 1/10 (UIT 8x); single-hop gap 0.016–0.040. The main run's `span_sup` trained on
+9000 documents vs `ours_beta`'s 8628 (the fix of `561254e` was not in the run).
+
 Before the full run:
 
 Status 2026-09-29. What ran on the cluster so far: the pilot (2026-09-26, vLLM 0.26, 4×H100) and the smoke

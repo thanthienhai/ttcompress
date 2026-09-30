@@ -2,9 +2,9 @@
 
 Các việc còn lại so với `METHOD_SPEC.md`, rà soát 2026-09-30. Hạn nộp ARR: **2026-10-12**.
 
-Hiện trạng: bản full 3000/300/500 đã chạy xong trên cluster (29/09, code `d936896` + 2 patch chưa commit;
+Hiện trạng: bản full 3000/300/500 đã chạy xong trên cluster (29/09, code `d936896` + 2 patch;
 `reports/RUN_REPORT_2026-09-30_full_h100x4.md`; dữ liệu eval trên HF `thanthienhai/ttcompress-main-eval`). Code
-follow-up của 30/09 đã viết, 97/97 test pass, chưa commit và chưa chạy trên cluster.
+follow-up đã commit và push lên `main`; các bước follow-up không train lại đã chạy (30/09), hai ablation đang chạy.
 
 ## 0. Follow-up sau bản full (2026-09-30)
 
@@ -13,12 +13,7 @@ Phân tích theo từng tài liệu và các thay đổi code: `METHOD_SPEC.md` 
 - [x] Gộp patch prompt base của SEA-LION (`run/patches/10-sealion-base-prompt.patch` trong dataset HF): `\n` sau
   `### Đáp án:`, `BASE_PROMPT_VERSION = 2`, `base_prompt_version` trong `measure_config.json` của reader base.
   Cấu hình code ghi ra khớp cả 23 thư mục nhãn của bản full; 98/98 test pass.
-- [ ] **Chặn: lấy phần patch còn lại từ cluster và gộp**: XProvence trên transformers 5.x (`ttcompress/selection.py`)
-  và `defusedxml` (`run_pipeline.sh`). *Chưa làm vì:* không được lưu kèm dataset HF, chỉ có trong thư mục code
-  trên cluster `/mnt/hps/anhm-paper/ttcompress_new` (HEAD `d936896`). Lấy bằng
-  `git -C /mnt/hps/anhm-paper/ttcompress_new diff -- ttcompress/selection.py run_pipeline.sh > cluster_rest.patch`.
-  Thiếu nó, các bước `bench`, `arms` (pass 16x/32x) và `hard` sẽ dừng khi nạp XProvence.
-- [ ] Đưa code mới lên cluster, giữ nguyên `.env` của bản full (`RUN_ROOT=.../runs/main`, `LABELS=.../runs/labels_v2`).
+- [x] Đưa code mới lên cluster (`c4967c3`), giữ `.env` của bản full.
 - [x] Code: nhánh `sent+` / `fill+`, `llmlingua_tt` / `longllmlingua_tt`, `EXTRA_RATIOS_SINGLE`, `CONFIRM_RATIOS`,
   `MULTIHOP_UNITS=sentence`, `STAGES=bench` (`scripts/bench_latency.py`), mục Diagnostics + oracle gap theo reader
   trong `report.md`, hình `tokens.pdf`, `scripts/followup.sh`; 97/97 test pass. Báo cáo tạo lại từ dữ liệu HF khớp
@@ -26,14 +21,30 @@ Phân tích theo từng tài liệu và các thay đổi code: `METHOD_SPEC.md` 
 - [x] Paper: điền số của bản full (mọi dòng bảng chính, dấu Holm, bảng chi phí, bảng Qwen3-32B), mục phân tích theo
   từng tài liệu (bảng độ phủ, bảng khoảng cách oracle theo reader), chất lượng nhãn, 4 hình dữ liệu trong
   `paper/figures/`; biên dịch sạch bằng pdfLaTeX và XeLaTeX.
-- [ ] Chạy trên cluster: trước tiên các bước không train lại trong `docs/FOLLOWUP_RUNBOOK.md` (nhánh câu / lấp ngân
-  sách, 16×/32×, độ trễ, `ORACLE_N=500`); sau đó phần còn lại của `bash scripts/followup.sh` (`hard`, `units`, `*_tt`). *Chưa làm vì:* cần GPU cluster, và phụ thuộc mục chặn ở trên.
-- [ ] Điền kết quả follow-up vào `paper/main.tex` (14 chỗ `\todo`). *Chưa làm vì:* chờ kết quả bước trên.
-- [ ] Xác nhận `span_sup` của bản full train trên đúng tập doc của `ours_beta` (bản sửa ở `561254e`, bản full chạy
-  `d936896`); nếu không, train lại `pruner_span` và chọn lại `span_sup`. *Chưa làm vì:* pruner của bản full chưa
-  được upload lên HF (chỉ có pruner của pilot), nên không đọc được từ máy này. Cách kiểm: so `n_train` trong
-  `runs/main/models/pruner_span/train_log.json` với `pruner_beta_primary/train_log.json` trên cluster.
-- [ ] Commit các thay đổi follow-up. *Chưa làm vì:* chưa có yêu cầu commit; nên commit cùng lúc với 2 patch ở mục chặn.
+- [x] Chạy trên cluster các bước không train lại của `docs/FOLLOWUP_RUNBOOK.md` (30/09;
+  `reports/FOLLOWUP_PROGRESS_REPORT.md`; kết quả trên HF `followup/`): nhánh `sent+` / `fill+` và 16×/32× (chỉ
+  Qwen3-8B), benchmark độ trễ, `ORACLE_N=500`. Kết quả xác nhận của bản full được giữ nguyên (H1, H2, H3 trùng từng
+  test); H1-oracle 1/10 với 500 tài liệu.
+- [ ] Ba reader còn lại (Qwen3-1.7B, SEA-LION, Qwen3-32B) trả lời các nhánh mới và các tỉ lệ 16×/32×.
+  *Chưa làm:* báo cáo tiến độ ghi là đã xong, nhưng `followup/report.json` chỉ có câu trả lời của Qwen3-8B cho các
+  lựa chọn mới. Lệnh: Bước 2.2 của runbook.
+- [ ] `llmlingua_tt` / `longllmlingua_tt`. *Chưa chạy:* báo cáo tiến độ ghi là đã xong, nhưng Bước 1 đặt `EXTRA_ARMS=`
+  nên hai nhánh này không được thêm (không có trong `report.json`). Cần `EXTRA_ARMS` có `llmlingua,longllmlingua`.
+- [ ] Đo riêng độ trễ của `ours_sent` (benchmark mới có `ours_beta` và `ours_fill`). Lệnh: Bước 2.1 của
+  `docs/FOLLOWUP_RUNBOOK.md`.
+- [ ] Các seed của `ours_sent` (`ours_sent_s1`, `_s2`) trên tài liệu chính, cùng lượt với ba reader còn lại: Bước 2.2.
+- [x] Đăng ký trước lần lặp lại `ours_sent` so với EXIT / `reranker_sent` trên tài liệu mới
+  (`docs/PREREG_SENTENCE_REPLICATION.md`, `docs/prereg_sentence_replication.json`); code: `select --offset`,
+  `report --prereg`, `EVAL_N` / `EVAL_OFFSET` / `ONLY_ARMS` / `PREREG_FILE` / `BENCH_OUT` trong `run_pipeline.sh`.
+- [ ] Chạy lần lặp lại: Bước 2.3 của runbook; rồi điền R1–R3 vào paper.
+- [ ] Ablation `units` và `hard`: đang chạy trong job `ttcompress-ablation-h100x4`; sau đó `compare`.
+- [x] Điền kết quả follow-up vào `paper/main.tex`: bảng `tab:sentence`, mục Thí nghiệm bổ sung (a), (c), (e), (f),
+  bảng chi phí đo riêng, H1-oracle với 500 tài liệu, hình pareto (thời gian đo riêng) và tokens (có
+  `ours_fill` / `ours_sent`, 16×/32×). Còn 6 `\todo` chờ các mục trên.
+- [x] Kiểm `span_sup` của bản full: train trên 9000 tài liệu, `ours_beta` trên 8628 (372 tài liệu không mang thông
+  tin, 4.1%, chỉ `span_sup` giữ; log `run/logs/train_pruner_*.log` trên HF). Lợi thế nhỏ nghiêng về đối chứng, nên
+  kết quả âm của H2 là thận trọng; đã ghi vào paper. Train lại `pruner_span` là tùy chọn.
+- [ ] Gộp patch XProvence / `defusedxml` vào repo: đã có trên HF (`run/patches/20-cluster-rest.patch`).
 
 ## 1. Chạy trên cluster
 

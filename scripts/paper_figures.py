@@ -95,11 +95,20 @@ def _mark(ax, x, y, color, marker='o', size=5.5, hollow=False, zorder=3):
             markeredgewidth=1.1 if hollow else 0.8)
 
 
-def pareto(report, reader, ratio, plt):
+def pareto(report, reader, ratio, plt, bench=None):
     """F1 against compression time: the amortization claim (RQ1) is ours_beta near oracle_beta in F1 at a
     small fraction of its time. oracle_beta's time is its Stage A labeling cost (K+1 reader calls per test
-    document), not the table lookup `select` records for it; without label costs in the report it is left out."""
+    document), not the table lookup `select` records for it; without label costs in the report it is left out.
+    bench: {(source, arm): median ms} from scripts/bench_latency.py -- then only the arms it timed are drawn,
+    at their isolated time (the select stage times four shards side by side)."""
     from matplotlib.lines import Line2D
+
+    def ms(src, arm, c):
+        if bench is None:
+            return max(c['select_ms'], 1e-2)
+        v = bench.get((src, arm))
+        return None if v is None else max(v, 1e-2)
+    drawn = set()
     sources = _present_sources(report)
     cells = {(c['source'], c['arm']): c for c in report['cells']
              if c['reader'] == reader and _ratio_match(c['ratio'], ratio)}
@@ -121,12 +130,14 @@ def pareto(report, reader, ratio, plt):
                         xytext=(0, 1.5), textcoords='offset points', color=MUTED, fontsize=5.5, va='bottom')
         for arm in SIMPLE:
             c = cells.get((src, arm))
-            if c:
-                _mark(ax, max(c['select_ms'], 1e-2), c['f1']['mean'], MUTED, size=4.5)
+            if c and ms(src, arm, c) is not None:
+                _mark(ax, ms(src, arm, c), c['f1']['mean'], MUTED, size=4.5)
+                drawn.add('simple')
         for arm, _, marker in PUBLISHED:
             c = cells.get((src, arm))
-            if c:
-                _mark(ax, max(c['select_ms'], 1e-2), c['f1']['mean'], INK2, marker=marker, size=5)
+            if c and ms(src, arm, c) is not None:
+                _mark(ax, ms(src, arm, c), c['f1']['mean'], INK2, marker=marker, size=5)
+                drawn.add(arm)
         ob = cells.get((src, 'oracle_beta'))
         if ob and src in label_ms:
             # its F1 is over the ORACLE_N labeled test documents only (the caption says so); no line to
@@ -134,19 +145,21 @@ def pareto(report, reader, ratio, plt):
             _mark(ax, label_ms[src], ob['f1']['mean'], BLUE, hollow=True)
         for arm, _, color in OURS:
             c = cells.get((src, arm))
-            if c:
-                _mark(ax, max(c['select_ms'], 1e-2), c['f1']['mean'], color, zorder=4)
+            if c and ms(src, arm, c) is not None:
+                _mark(ax, ms(src, arm, c), c['f1']['mean'], color, zorder=4)
+                drawn.add(arm)
         ax.margins(x=0.12, y=0.15)
     axes[0][0].set_ylabel('F1')
     fig.supxlabel('Thời gian nén (ms/tài liệu, thang log)', fontsize=7, color=INK2)
     handles = [Line2D([], [], linestyle='none', marker='o', markersize=5, markerfacecolor=color,
-                      markeredgecolor='white', label=label) for _, label, color in OURS]
+                      markeredgecolor='white', label=label) for arm, label, color in OURS if arm in drawn]
     handles.append(Line2D([], [], linestyle='none', marker='o', markersize=5, markerfacecolor='white',
                           markeredgecolor=BLUE, markeredgewidth=1.1, label='oracle-β (chưa chưng cất)'))
-    handles.append(Line2D([], [], linestyle='none', marker='o', markersize=4.5, markerfacecolor=MUTED,
-                          markeredgecolor='white', label='baseline đơn giản'))
+    if 'simple' in drawn:
+        handles.append(Line2D([], [], linestyle='none', marker='o', markersize=4.5, markerfacecolor=MUTED,
+                              markeredgecolor='white', label='baseline đơn giản'))
     handles += [Line2D([], [], linestyle='none', marker=marker, markersize=5, markerfacecolor=INK2,
-                       markeredgecolor='white', label=label) for _, label, marker in PUBLISHED]
+                       markeredgecolor='white', label=label) for arm, label, marker in PUBLISHED if arm in drawn]
     _legend(fig, handles, ncol=6, handletextpad=0.2, columnspacing=1.0)
     return fig
 
@@ -276,6 +289,8 @@ def main():
                     help="comma list of held-out reader tags to star (default: the report's own)")
     ap.add_argument('--out-dir', default=None, help="default: <report dir>/paper/figures")
     ap.add_argument('--png', action='store_true', help="also write PNG previews")
+    ap.add_argument('--bench', default=None,
+                    help="bench_latency.json (scripts/bench_latency.py): pareto uses its isolated times")
     args = ap.parse_args()
 
     with open(args.report, encoding='utf-8') as f:
@@ -286,7 +301,11 @@ def main():
     out_dir = args.out_dir or os.path.join(os.path.dirname(os.path.abspath(args.report)), 'paper', 'figures')
     os.makedirs(out_dir, exist_ok=True)
     plt = setup_matplotlib()
-    for name, fig in (('pareto', pareto(report, reader, args.ratio, plt)),
+    bench = None
+    if args.bench:
+        with open(args.bench, encoding='utf-8') as f:
+            bench = {(r['source'], r['arm']): r['median_ms'] for r in json.load(f)['rows']}
+    for name, fig in (('pareto', pareto(report, reader, args.ratio, plt, bench)),
                       ('retention', retention(report, args.ratio, heldout, plt)),
                       ('depth', depth(report, reader, args.ratio, plt)),
                       ('tokens', tokens(report, reader, plt))):

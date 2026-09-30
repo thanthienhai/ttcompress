@@ -82,6 +82,15 @@ EXTRA_RATIOS_SINGLE=${EXTRA_RATIOS_SINGLE:-}
 # ours_beta, span_sup and the reranker scoring sentences (sent+) and filling the budget paragraphs leave with
 # sentences (fill+), and LLMLingua / LongLLMLingua asked for the budget in tokens (_tt) when EXTRA_ARMS runs them.
 FOLLOWUP_ARMS=${FOLLOWUP_ARMS:-0}
+# A replication on documents no earlier result has seen (docs/PREREG_*.md): EVAL_N documents per source after
+# skipping the first EVAL_OFFSET (hash order; the main test set is the first N_TEST), into its own EVAL_DIR.
+# N_TEST itself stays the run's (run_config.txt). ONLY_ARMS replaces the arm list of `select` (full specs);
+# PREREG_FILE adds the families fixed in that file to the report.
+EVAL_N=${EVAL_N:-}
+EVAL_OFFSET=${EVAL_OFFSET:-0}
+ONLY_ARMS=${ONLY_ARMS:-}
+ONLY_ARMS=${ONLY_ARMS// /}
+PREREG_FILE=${PREREG_FILE:-}
 # oracle_beta (H1 upper bound = the unamortized attribution): Stage A labels of the first ORACLE_N test
 # documents per eval source, primary reader only (test docs are nested across n). 0 disables the arm.
 ORACLE_N=${ORACLE_N:-100}
@@ -564,6 +573,8 @@ if has_stage select; then
     for pair in "ours|pruner:$MODELS/pruner_beta_primary" "span|pruner:$MODELS/pruner_span" "reranker|reranker:$BACKBONE"; do
       ARMS="$ARMS,${pair%%|*}_sent=sent+${pair#*|},${pair%%|*}_fill=fill+${pair#*|}"
     done
+    # seed reruns of the sentence arm: "every seed agrees" for ours_sent, like H1's for ours_beta
+    for seed in $EXTRA_SEEDS; do ARMS="$ARMS,ours_sent_s$seed=sent+pruner:$MODELS/pruner_beta_primary_s$seed"; done
     has_arm llmlingua && ARMS="$ARMS,llmlingua_tt"
     has_arm longllmlingua && ARMS="$ARMS,longllmlingua_tt"
   fi
@@ -578,6 +589,13 @@ if has_stage select; then
     ARMS="$ARMS,oracle_beta"
     oracle_flags=(--oracle-beta-dir "${oracle_dirs#,}")
   fi
+  if [[ -n "$ONLY_ARMS" ]]; then
+    ARMS="${ONLY_ARMS//@MODELS@/$MODELS}"   # @MODELS@ / @BACKBONE@: this run's paths, as in the arms above
+    ARMS="${ARMS//@BACKBONE@/$BACKBONE}"
+    [[ ",$ARMS," == *",oracle_beta,"* ]] || oracle_flags=()
+  fi
+  doc_set_flags=(--n "${EVAL_N:-$N_TEST}")
+  (( EVAL_OFFSET > 0 )) && doc_set_flags+=(--offset "$EVAL_OFFSET")
   # our checkpoints must exist before 4 shards start (e.g. STAGES="select ..." after a failed train)
   for ckpt in $(echo "$ARMS" | tr ',' '\n' | sed -nE 's/^([^=]*=)?((sent|fill)\+)?pruner:(.+)$/\4/p'); do
     if [[ "$ckpt" == "$MODELS"/* && ! -f "$ckpt/pruner_config.json" ]]; then
@@ -590,12 +608,12 @@ if has_stage select; then
   legacy_arms=$(echo "$ARMS" | tr ',' '\n' | { grep -E "$LEGACY_ARM_RE" || true; } | paste -sd, -)
   echo "== select ($main_arms)"
   run_sharded select 1 env PYTHONPATH="$BASELINE_SITE${PYTHONPATH:+:$PYTHONPATH}" python evaluate.py select \
-    --sources "$EVAL_SOURCES" --split test --n "$N_TEST" \
+    --sources "$EVAL_SOURCES" --split test "${doc_set_flags[@]}" \
     --arms "$main_arms" --ratios "$RATIOS" --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" ${oracle_flags[@]+"${oracle_flags[@]}"} $SELECT_ARGS
   if [[ -n "$legacy_arms" ]]; then
     echo "== select with transformers 4.46.3 from $LLMLINGUA_SITE ($legacy_arms)"
     run_sharded select_llmlingua 1 env PYTHONPATH="$LLMLINGUA_SITE${PYTHONPATH:+:$PYTHONPATH}" python evaluate.py select \
-      --sources "$EVAL_SOURCES" --split test --n "$N_TEST" --arms "$legacy_arms" --ratios "$RATIOS" \
+      --sources "$EVAL_SOURCES" --split test "${doc_set_flags[@]}" --arms "$legacy_arms" --ratios "$RATIOS" \
       --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" $SELECT_ARGS
   fi
   if [[ -n "$EXTRA_RATIOS_SINGLE" ]]; then
@@ -605,12 +623,12 @@ if has_stage select; then
     if [[ -n "$single_eval" ]]; then
       echo "== select, single-hop only ($single_eval) at $EXTRA_RATIOS_SINGLE"
       run_sharded select_single 1 env PYTHONPATH="$BASELINE_SITE${PYTHONPATH:+:$PYTHONPATH}" python evaluate.py select \
-        --sources "$EVAL_SOURCES" --split test --n "$N_TEST" --restrict-sources "$single_eval" \
+        --sources "$EVAL_SOURCES" --split test "${doc_set_flags[@]}" --restrict-sources "$single_eval" \
         --arms "$main_arms" --ratios "$EXTRA_RATIOS_SINGLE" --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" \
         ${oracle_flags[@]+"${oracle_flags[@]}"} $SELECT_ARGS
       if [[ -n "$legacy_arms" ]]; then
         run_sharded select_single_llmlingua 1 env PYTHONPATH="$LLMLINGUA_SITE${PYTHONPATH:+:$PYTHONPATH}" python evaluate.py select \
-          --sources "$EVAL_SOURCES" --split test --n "$N_TEST" --restrict-sources "$single_eval" --arms "$legacy_arms" \
+          --sources "$EVAL_SOURCES" --split test "${doc_set_flags[@]}" --restrict-sources "$single_eval" --arms "$legacy_arms" \
           --ratios "$EXTRA_RATIOS_SINGLE" --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" $SELECT_ARGS
       fi
     fi
@@ -640,7 +658,7 @@ if has_stage report; then
   # families always test ours_beta / ours_ens by name
   python evaluate.py report --out-dir "$EVAL_DIR" --ours "${REPORT_OURS:-ours_beta,ours_ens}" --primary-reader "$PRIMARY" \
     --heldout-readers "${heldout#,}" --equiv-margin "$EQUIV_MARGIN" --oracle-margin "$ORACLE_MARGIN" \
-    --confirm-ratios "$CONFIRM_RATIOS" \
+    --confirm-ratios "$CONFIRM_RATIOS" ${PREREG_FILE:+--prereg "$PREREG_FILE"} \
     --min-upgrade-gap "$MIN_UPGRADE_GAP" --labels-dir "$(echo "$LABELS,$LABELS_MAIN" | tr ',' '\n' | awk '!seen[$0]++' | paste -sd, -)" --fit-dir "$FIT" > "$LOGS/report.log" 2>&1 \
     || { tail -n 25 "$LOGS/report.log"; exit 1; }
   python scripts/paper_tables.py --report "$EVAL_DIR/report.json" --primary-reader "$PRIMARY" >> "$LOGS/report.log" 2>&1 \
@@ -659,7 +677,7 @@ if has_stage bench; then
   # stage's per-document times come from four shards side by side). BENCH_ARMS overrides the default list.
   # default: ours (paragraphs, and with the sentence fill), its backbone, embed, bm25 and every published arm of
   # EXTRA_ARMS that runs with the image's transformers (llmlingua / longllmlingua need the old one: not here)
-  bench_arms=${BENCH_ARMS:-"ours_beta=pruner:$MODELS/pruner_beta_primary,ours_fill=fill+pruner:$MODELS/pruner_beta_primary,reranker=reranker:$BACKBONE,embed=embed:$EMBED_MODEL,bm25"}
+  bench_arms=${BENCH_ARMS:-"ours_beta=pruner:$MODELS/pruner_beta_primary,ours_fill=fill+pruner:$MODELS/pruner_beta_primary,ours_sent=sent+pruner:$MODELS/pruner_beta_primary,reranker=reranker:$BACKBONE,embed=embed:$EMBED_MODEL,bm25"}
   if [[ -z "${BENCH_ARMS:-}" && -n "${EXTRA_ARMS:-}" ]]; then
     published=$(echo "$EXTRA_ARMS" | tr ',' '\n' | { grep -vE "$LEGACY_ARM_RE" || true; } | paste -sd, -)
     bench_arms="$bench_arms${published:+,$published}"
@@ -669,7 +687,7 @@ if has_stage bench; then
   echo "== bench (GPU ${GPU_IDS[0]}): $bench_arms"
   CUDA_VISIBLE_DEVICES="${GPU_IDS[0]}" PYTHONPATH="$BASELINE_SITE${PYTHONPATH:+:$PYTHONPATH}" python scripts/bench_latency.py \
     --eval-dir "$EVAL_DIR" --arms "$bench_arms" --budget-tokenizer "$PRIMARY_MODEL" \
-    --n-per-source "${BENCH_N:-100}" --out "$EVAL_DIR/bench_latency.json" 2>&1 | tee "$LOGS/bench.log"
+    --n-per-source "${BENCH_N:-100}" --out "${BENCH_OUT:-$EVAL_DIR/bench_latency.json}" 2>&1 | tee "$LOGS/bench.log"
 fi
 
 if has_stage upload; then
