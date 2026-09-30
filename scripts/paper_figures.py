@@ -6,6 +6,8 @@
   pareto.pdf     RQ1: F1 vs compression time per compressor, one panel per source (primary reader)
   retention.pdf  RQ3: upgrade retention of ours_beta vs ours_ens per reader pair, one panel per source
   depth.pdf      single-hop: F1 by needle-depth quintile (appendix)
+  tokens.pdf     F1 vs REALIZED compression over every ratio run, per source: arms that select whole paragraphs
+                 under-fill the budget, so comparisons at a nominal ratio are not token-matched
 
 Written to <report dir>/paper/figures (copy them to paper/figures/, where main.tex looks for them).
 Static print figures, one color per entity across every figure (ours_beta blue, ours_ens orange, the
@@ -32,6 +34,9 @@ PUBLISHED = [('provence', 'Provence', 's'), ('xprovence', 'XProvence', 'D'), ('r
              ('exit', 'EXIT', 'v'), ('llmlingua', 'LLMLingua', 'P'), ('longllmlingua', 'LongLLMLingua', 'X'),
              ('llmlingua2', 'LLMLingua-2', 'h')]
 OURS = [('ours_beta', 'Ours-β', BLUE), ('ours_ens', 'Ours-ens', ORANGE)]
+TOKEN_ARMS = [('ours_beta', 'Ours-β', BLUE, '-', 'o'), ('ours_fill', 'Ours-β + lấp bằng câu', BLUE, '--', 'o'),
+              ('ours_sent', 'Ours-β theo câu', BLUE, ':', 'o'), ('reranker', 'bge-reranker', MUTED, '-', 'o'),
+              ('exit', 'EXIT', INK2, '-', 'v'), ('recomp', 'RECOMP', INK2, '--', '^')]
 DEPTH_ARMS = [('ours_beta', 'Ours-β', BLUE, '-'), ('abl_posadj', 'Ours-β, position-adjusted', BLUE, '--'),
               ('ours_ens', 'Ours-ens', ORANGE, '-'), ('reranker', 'bge-reranker', INK2, '-'), ('lead', 'lead', MUTED, '-')]
 
@@ -223,6 +228,45 @@ def depth(report, reader, ratio, plt):
     return fig
 
 
+def tokens(report, reader, plt):
+    """F1 against the realized compression (full tokens / kept tokens), one point per ratio run: the token-matched
+    view of the fixed-budget comparison. Paragraph arms keep fewer tokens than the budget allows on the
+    10-paragraph multi-hop documents (9.1-10x at a nominal 8x), sentence arms fill it."""
+    from matplotlib.lines import Line2D
+    by = defaultdict(list)
+    for c in report['cells']:
+        if c['reader'] == reader and c['ratio'] != 'full':
+            by[(c['source'], c['arm'])].append((c['compression'], c['f1']['mean']))
+    present = [a for a in TOKEN_ARMS if any((s, a[0]) in by for s, _ in SOURCES)]
+    if not any(a[0].startswith('ours') for a in present):
+        return None
+    sources = [(s, n) for s, n in _present_sources(report) if any((s, a[0]) in by for a in present)]
+    fig, axes = plt.subplots(1, len(sources), figsize=(6.3, 2.0), squeeze=False, layout='constrained')
+    for ax, (src, name) in zip(axes[0], sources):
+        ax.set_title(name, color=INK)
+        ax.set_xscale('log', base=2)
+        for arm, _, color, style, marker in present:
+            pts = sorted(by.get((src, arm), []))
+            if not pts:
+                continue
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            ax.plot(xs, ys, color=color, linestyle=style, linewidth=1.1, zorder=3 if arm.startswith('ours') else 2)
+            for x, y in pts:
+                _mark(ax, x, y, color, marker=marker, size=4, zorder=4 if arm.startswith('ours') else 2)
+        xs = [p[0] for a in present for p in by.get((src, a[0]), [])]
+        ticks = [t for t in (2, 4, 8, 16, 32, 64) if min(xs) / 1.3 <= t <= max(xs) * 1.3]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f'{t}×' for t in ticks])
+        ax.minorticks_off()
+        ax.margins(x=0.08, y=0.12)
+    axes[0][0].set_ylabel('F1')
+    fig.supxlabel('Tỉ lệ nén thực tế (số token toàn ngữ cảnh / số token giữ lại, thang log)', fontsize=7, color=INK2)
+    handles = [Line2D([], [], color=color, linestyle=style, linewidth=1.1, marker=marker, markersize=4,
+                      markeredgecolor='white', label=label) for _, label, color, style, marker in present]
+    _legend(fig, handles, ncol=len(handles), handletextpad=0.3, columnspacing=0.8)
+    return fig
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--report', required=True)
@@ -244,7 +288,8 @@ def main():
     plt = setup_matplotlib()
     for name, fig in (('pareto', pareto(report, reader, args.ratio, plt)),
                       ('retention', retention(report, args.ratio, heldout, plt)),
-                      ('depth', depth(report, reader, args.ratio, plt))):
+                      ('depth', depth(report, reader, args.ratio, plt)),
+                      ('tokens', tokens(report, reader, plt))):
         if fig is None:
             print(f"{name}: no data in the report, skipped")
             continue

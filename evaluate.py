@@ -41,11 +41,13 @@ from ttcompress.metrics import (
     upgrade_retention_array,
 )
 from ttcompress.reader import MAX_NEW_TOKENS, load_reader, reader_tag
-from ttcompress.selection import Selection, budget_for, make_arm, select_by_scores, select_sentences
-from ttcompress.sources import load_documents, parse_source_list
+from ttcompress.selection import (
+    WRAPPERS, Selection, budget_for, make_arm, select_by_scores, select_sentences, select_with_fill,
+)
+from ttcompress.sources import contains_answer, load_documents, parse_source_list
 
 _PREFIXES = ('pruner:', 'provence:', 'embed:', 'reranker:', 'llmlingua2:', 'llmlingua:', 'longllmlingua:',
-             'recomp:', 'exit:')
+             'llmlingua_tt:', 'longllmlingua_tt:', 'recomp:', 'exit:') + tuple(WRAPPERS)
 
 
 def parse_arms(spec: str):
@@ -134,7 +136,18 @@ def _text_within_budget(arm, doc, ratio, budget, tok, count, attempts=3):
     """Text arms (LLMLingua-2) compress to a rate in THEIR tokenizer (XLM-R), so the result can overshoot
     the budget counted in the reference tokenizer. Tighten the rate by the observed overshoot and retry;
     if it still does not fit, cut the tail to the budget (flagged `truncated`, like a chunk arm whose best
-    chunk had to be cut). -> (text, truncated)"""
+    chunk had to be cut). Arms that take a token target (llmlingua_tt, longllmlingua_tt) are asked for the
+    budget itself, then for less by the observed overshoot. -> (text, truncated)"""
+    if getattr(arm, 'by_tokens', False):
+        target_tokens = float(budget)
+        for _ in range(attempts + 2):
+            text = arm.compress_text(doc, ratio, target_tokens=max(1, int(target_tokens)))
+            n = count(text)
+            if n <= budget:
+                return text, False
+            target_tokens *= 0.98 * budget / n
+        ids = tok.encode(text, add_special_tokens=False)[:budget]
+        return tok.decode(ids), True
     target = ratio
     for _ in range(attempts):
         text = arm.compress_text(doc, target)
@@ -148,6 +161,8 @@ def _text_within_budget(arm, doc, ratio, budget, tok, count, attempts=3):
 
 # published compressors (third-party code): a failure on one document is recorded, not fatal
 PUBLISHED_ARMS = ('provence', 'recomp', 'exit', 'llmlingua', 'longllmlingua', 'llmlingua2')
+# the same compressors asked for a token target (exploratory: outside the pre-registered H1 family)
+TOLERANT_ARMS = PUBLISHED_ARMS + ('llmlingua_tt', 'longllmlingua_tt')
 
 
 def _arm_rows(arm, d, label, ratios, full_tokens, lengths, tok, count):
@@ -178,6 +193,19 @@ def _arm_rows(arm, d, label, ratios, full_tokens, lengths, tok, count):
             rows.append({**base, 'ratio': r, 'kept': sel.kept, 'text': sel.text, 'kept_tokens': sel.kept_tokens,
                          'budget': sel.budget, 'truncated': sel.truncated, 'gold_recall': None, 'seconds': seconds})
         return rows
+    if arm.kind == 'fill':
+        t0 = time.time()
+        scores = arm.scores(d)
+        units, unit_scores = arm.sentence_scores(d)
+        seconds = time.time() - t0
+        for r in ratios:
+            sel = select_with_fill(d, scores, lengths, units, unit_scores, count, budget_for(full_tokens, r), tok)
+            # `kept` = whole chunks (gold recall counts whole evidence), `partial` = chunks cut to sentences
+            rows.append({**base, 'ratio': r, 'kept': sel.kept, 'partial': sel.partial, 'text': sel.text,
+                         'kept_tokens': sel.kept_tokens, 'budget': sel.budget, 'truncated': sel.truncated,
+                         'gold_recall': gold_chunk_recall(sel.kept, d.gold_chunks) if sel.kept else 0.0,
+                         'seconds': seconds})
+        return rows
     t0 = time.time()
     scores = arm.scores(d)
     seconds = time.time() - t0
@@ -203,6 +231,8 @@ def cmd_select(args):
     meta = {'split': args.split, 'budget_tokenizer': args.budget_tokenizer, 'sources': args.sources, 'n': args.n,
             'num_shards': args.num_shards, 'haystack_chars': args.haystack_chars, 'distractors': args.distractors,
             'multihop_pad_chars': args.multihop_pad_chars}
+    if args.multihop_units != 'paragraph':   # only then: select_config.json files written before the option match
+        meta['multihop_units'] = args.multihop_units
     config_path = os.path.join(args.out_dir, 'select_config.json')
     matched = os.path.exists(config_path)
     if matched:
@@ -222,12 +252,17 @@ def cmd_select(args):
         docs = []
         for src in parse_source_list(args.sources):
             docs.extend(load_documents(src, args.split, args.n, args.haystack_chars, args.distractors,
-                                       args.multihop_pad_chars))
+                                       args.multihop_pad_chars, args.multihop_units))
         docs = [d for i, d in enumerate(docs) if i % args.num_shards == args.shard]
         tmp = f'{doc_path}.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
             f.writelines(json.dumps(d.to_dict(), ensure_ascii=False) + '\n' for d in docs)
         os.replace(tmp, doc_path)
+    if args.restrict_sources:
+        # a pass over part of the document set (e.g. extra ratios for single-hop only); the set itself and its
+        # shard assignment stay the ones select_config.json fixed
+        keep = set(parse_source_list(args.restrict_sources))
+        docs = [d for d in docs if d.source in keep]
     sel_path = os.path.join(args.out_dir, f'selections_shard{args.shard}.jsonl')
     done = {(r['doc_id'], r['arm'], r['ratio']) for r in _read_jsonl(sel_path)}
 
@@ -250,7 +285,7 @@ def cmd_select(args):
         if not pending:
             continue
         arm = make_arm(spec, args.device, args.oracle_beta_dir)
-        tolerant = spec.partition(':')[0] in PUBLISHED_ARMS   # third-party compressors
+        tolerant = spec.partition(':')[0] in TOLERANT_ARMS   # third-party compressors
         if arm.kind != 'full':
             # untimed warm-up: the first call pays model start-up (CUDA kernels, caches, lazy imports), which
             # would otherwise land in one document's time in the RQ1 cost table
@@ -376,6 +411,7 @@ def cmd_report(args):
                  'n_clusters': len(set(clusters)),
                  'compression': float(np.mean([by_doc[d]['full_tokens'] / max(1, by_doc[d]['kept_tokens']) for d in docs])),
                  'select_ms': 1000 * float(np.mean([by_doc[d]['seconds'] for d in docs])),
+                 'select_ms_median': 1000 * float(np.median([by_doc[d]['seconds'] for d in docs])),
                  'truncated_rate': float(np.mean([bool(by_doc[d].get('truncated')) for d in docs])),
                  # text arms (LLMLingua-2) compress to a rate, not a hard budget: realized tokens may overshoot
                  'over_budget_rate': 0.0 if ratio == 'full' else float(np.mean(
@@ -440,14 +476,24 @@ def cmd_report(args):
                                                         'ci95': [lo, hi], 'n': len(common), 'gap': gap,
                                                         'stable': gap >= args.min_upgrade_gap})
 
-    report['hypotheses'] = hypothesis_families(cell, rows, readers, sources, ratios, args)
+    # the confirmatory families are fixed to the pre-registered ratios: ratios added later (e.g. 16x/32x on
+    # single-hop) are reported and compared, never tested in a family
+    confirm = ratios
+    if args.confirm_ratios:
+        wanted = {_ratio_key(float(x)) for x in args.confirm_ratios.split(',') if x.strip()}
+        confirm = [r for r in ratios if r in wanted]
+    report['confirm_ratios'] = confirm
+    report['hypotheses'] = hypothesis_families(cell, rows, readers, sources, confirm, args)
     report['outside_families'] = arms_outside_families(arms)
-    report['h2a_multi_support'] = multi_support_slice(cell, readers, rows, ratios, args)
+    report['h2a_multi_support'] = multi_support_slice(cell, readers, rows, confirm, args)
     report['seeds'] = seed_table(report['cells'])
     if args.labels_dir:
         report['cost'] = cost_tables(report['cells'], args)
     if args.fit_dir:
         report['label_quality'] = label_quality(args.fit_dir)
+    report['oracle_gap_by_reader'] = oracle_gap_by_reader(cell, readers, confirm, args.n_boot)
+    if not args.no_diagnostics:
+        report['diagnostics'] = selection_diagnostics(args.out_dir, cell, args.primary_reader, ours)
 
     # single-hop: gold recall and F1 by needle depth (quintiles of relative position)
     for (reader, source, ratio, arm), by_doc in sorted(cell.items()):
@@ -469,6 +515,127 @@ def cmd_report(args):
     with open(os.path.join(args.out_dir, 'report.md'), 'w', encoding='utf-8') as f:
         f.write(md)
     print(md)
+
+
+def oracle_gap_by_reader(cell, readers, ratios, n_boot):
+    """ours_beta - oracle_beta for EVERY reader, on the oracle documents (exploratory). oracle_beta's labels
+    were measured with the primary reader on these very documents, so its lead on that reader mixes what
+    distillation loses with what only fits that reader's behaviour; the lead on the other readers is the part
+    that transfers."""
+    out = []
+    for reader, source, ratio in sorted({(k[0], k[1], k[2]) for k in cell if k[3] == 'oracle_beta'}):
+        if ratio not in ratios:
+            continue
+        a, b = cell.get((reader, source, ratio, 'ours_beta')), cell.get((reader, source, ratio, 'oracle_beta'))
+        if not (a and b):
+            continue
+        common = sorted(set(a) & set(b))
+        if len(common) < 2:
+            continue
+        res = paired_bootstrap_diff([a[d]['f1'] for d in common], [b[d]['f1'] for d in common],
+                                    [a[d]['cluster_id'] for d in common], n_boot=n_boot)
+        out.append({'reader': reader, 'source': source, 'ratio': ratio, 'n': len(common), **res})
+    return out
+
+
+def _jaccard(a, b):
+    a, b = set(a), set(b)
+    return len(a & b) / len(a | b) if a | b else 1.0
+
+
+def selection_diagnostics(out_dir, cell, primary_reader, ours):
+    """Exploratory, from the selection files (METHOD_SPEC.md §6, run report 2026-09-30):
+    - coverage: share of selections whose text contains a gold answer string, share keeping every gold chunk
+      whole, chunks touched, share of the budget used -- with 10-paragraph documents, whether the answer
+      survives decides most of the F1 difference between arms;
+    - F1 of the primary reader given the answer string is / is not in the compressed context;
+    - bridge effect: F1 given an answer chunk is kept, split by whether every gold chunk is kept (chunk arms);
+    - overlap (Jaccard of kept chunks) of our arms with their seed reruns, each other, span_sup, reranker and
+      oracle_beta: a label change that moves the selection less than a new training seed cannot show up in
+      any F1 comparison."""
+    docs = {}
+    for path in glob.glob(os.path.join(out_dir, 'documents_shard*.jsonl')):
+        for d in _read_jsonl(path):
+            docs[d['doc_id']] = {'source': d['source'], 'hop': d['hop'], 'answers': d['answers'],
+                                 'gold': set(d['gold_chunks']),
+                                 'ans_chunks': {i for i, c in enumerate(d['chunks']) if contains_answer(c, d['answers'])}}
+    if not docs:
+        return {}
+    cov = defaultdict(lambda: defaultdict(list))
+    kept_sets = {}   # (doc, arm, ratio) -> kept, chunk arms only
+    in_ctx = {}      # (doc, arm, ratio) -> answer in context
+    for path in glob.glob(os.path.join(out_dir, 'selections_shard*.jsonl')):
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    s = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                d = docs.get(s['doc_id'])
+                if d is None or s['ratio'] == 'full':
+                    continue
+                ratio = _ratio_key(s['ratio'])
+                key = (s['doc_id'], s['arm'], ratio)
+                inside = contains_answer(s.get('text', ''), d['answers'])
+                in_ctx[key] = inside
+                c = cov[(d['source'], ratio, s['arm'])]
+                c['ans_in_ctx'].append(float(inside))
+                c['budget_use'].append(s['kept_tokens'] / max(1, s['budget']))
+                touched = set(s.get('kept') or []) | set(s.get('partial') or [])
+                if touched:
+                    c['touched'].append(len(touched))
+                if s.get('gold_recall') is not None and d['gold']:
+                    whole = set(s.get('kept') or [])
+                    c['all_gold'].append(float(d['gold'] <= whole))
+                    kept_sets[key] = whole
+    coverage = []
+    for (source, ratio, arm), c in sorted(cov.items()):
+        row = {'source': source, 'ratio': ratio, 'arm': arm, 'n': len(c['ans_in_ctx']),
+               'answer_in_context': float(np.mean(c['ans_in_ctx'])), 'budget_use': float(np.mean(c['budget_use'])),
+               'touched': float(np.mean(c['touched'])) if c['touched'] else None,
+               'all_gold': float(np.mean(c['all_gold'])) if c['all_gold'] else None}
+        by_doc = cell.get((primary_reader, source, ratio, arm)) if primary_reader else None
+        if by_doc:
+            f_in = [v['f1'] for doc_id, v in by_doc.items() if in_ctx.get((doc_id, arm, ratio)) is True]
+            f_out = [v['f1'] for doc_id, v in by_doc.items() if in_ctx.get((doc_id, arm, ratio)) is False]
+            row['f1_answer_in'] = float(np.mean(f_in)) if f_in else None
+            row['f1_answer_out'] = float(np.mean(f_out)) if f_out else None
+        coverage.append(row)
+
+    bridge = []
+    if primary_reader:
+        acc = defaultdict(lambda: ([], []))
+        for (doc_id, arm, ratio), whole in kept_sets.items():
+            d = docs[doc_id]
+            if d['hop'] != 'multi' or not (d['ans_chunks'] & whole) or arm.startswith('oracle'):
+                continue
+            v = cell.get((primary_reader, d['source'], ratio, arm), {}).get(doc_id)
+            if v is not None:
+                acc[(d['source'], ratio)][0 if d['gold'] <= whole else 1].append(v['f1'])
+        for (source, ratio), (all_gold, missing) in sorted(acc.items()):
+            bridge.append({'source': source, 'ratio': ratio,
+                           'f1_all_gold': float(np.mean(all_gold)) if all_gold else None, 'n_all_gold': len(all_gold),
+                           'f1_some_gold_missing': float(np.mean(missing)) if missing else None,
+                           'n_some_gold_missing': len(missing)})
+
+    overlap = []
+    arms_present = {k[1] for k in kept_sets}
+    for base in ours:
+        others = [a for a in sorted(arms_present) if a != base and (
+            SEED_ARM.match(a) and SEED_ARM.match(a).group(1) == base or a in ours
+            or a in ('span_sup', 'reranker', 'oracle_beta', 'abl_logprob', 'abl_posadj'))]
+        for source, ratio in sorted({(docs[k[0]]['source'], k[2]) for k in kept_sets if k[1] == base}):
+            row = {'source': source, 'ratio': ratio, 'arm': base}
+            for other in others:
+                js = [_jaccard(kept_sets[k], kept_sets[(k[0], other, k[2])]) for k in kept_sets
+                      if k[1] == base and k[2] == ratio and docs[k[0]]['source'] == source
+                      and (k[0], other, k[2]) in kept_sets]
+                if js:
+                    row[other] = float(np.mean(js))
+            overlap.append(row)
+    return {'coverage': coverage, 'bridge': bridge, 'overlap': overlap}
 
 
 def _retention_ci(arr: np.ndarray, clusters, n_boot: int, seed: int = 42):
@@ -751,6 +918,8 @@ def _markdown(report) -> str:
     lines += _cost_markdown(report.get('cost'))
     lines += _label_quality_markdown(report.get('label_quality'))
     lines += _seeds_markdown(report.get('seeds'))
+    lines += _oracle_gap_markdown(report.get('oracle_gap_by_reader'))
+    lines += _diagnostics_markdown(report.get('diagnostics'))
     groups = defaultdict(list)
     for c in report['cells']:
         groups[(c['reader'], c['source'])].append(c)
@@ -846,6 +1015,46 @@ def _seeds_markdown(rows) -> list:
     return lines
 
 
+def _oracle_gap_markdown(rows) -> list:
+    if not rows:
+        return []
+    lines = ['## ours_beta − oracle_beta by reader (exploratory)', '',
+             "oracle_beta's labels come from the primary reader on these documents: its lead on the other readers is "
+             'the part of the gap that transfers.', '',
+             '| reader | source | ratio | n | Δ F1 [95% CI] |', '|---|---|---|---|---|']
+    for r in rows:
+        lo, hi = r['ci95']
+        ci = f" [{lo:+.3f}, {hi:+.3f}]" if lo is not None else ''
+        lines.append(f"| {r['reader']} | {r['source']} | {r['ratio']} | {r['n']} | {r['diff']:+.3f}{ci} |")
+    return lines + ['']
+
+
+def _diagnostics_markdown(diag) -> list:
+    if not diag:
+        return []
+    num = lambda v: '' if v is None else f"{v:.3f}"  # noqa: E731
+    lines = ['## Diagnostics (exploratory): answer coverage, bridge effect, selection overlap', '',
+             '| source | ratio | arm | answer in context | every gold chunk kept | chunks touched | budget used | '
+             'F1 answer in | F1 answer out |', '|---|---|---|---|---|---|---|---|---|']
+    for r in diag.get('coverage', []):
+        touched = '' if r['touched'] is None else f"{r['touched']:.2f}"
+        lines.append(f"| {r['source']} | {r['ratio']} | {r['arm']} | {r['answer_in_context']:.3f} | {num(r['all_gold'])} | "
+                     f"{touched} | {r['budget_use']:.2f} | {num(r.get('f1_answer_in'))} | {num(r.get('f1_answer_out'))} |")
+    if diag.get('bridge'):
+        lines += ['', 'Bridge effect (primary reader, chunk arms pooled, documents where an answer chunk is kept):', '',
+                  '| source | ratio | F1, every gold chunk kept (n) | F1, some gold chunk missing (n) |', '|---|---|---|---|']
+        for b in diag['bridge']:
+            lines.append(f"| {b['source']} | {b['ratio']} | {num(b['f1_all_gold'])} ({b['n_all_gold']}) | "
+                         f"{num(b['f1_some_gold_missing'])} ({b['n_some_gold_missing']}) |")
+    if diag.get('overlap'):
+        cols = sorted({k for r in diag['overlap'] for k in r} - {'source', 'ratio', 'arm'})
+        lines += ['', 'Selection overlap (mean Jaccard of kept chunks):', '',
+                  '| source | ratio | arm | ' + ' | '.join(cols) + ' |', '|---|---|---|' + '---|' * len(cols)]
+        for r in diag['overlap']:
+            lines.append(f"| {r['source']} | {r['ratio']} | {r['arm']} | " + ' | '.join(num(r.get(c)) for c in cols) + ' |')
+    return lines + ['']
+
+
 def _label_quality_markdown(rows) -> list:
     if not rows:
         return []
@@ -892,8 +1101,11 @@ def main():
     s.add_argument('--haystack-chars', type=int, default=30000)
     s.add_argument('--distractors', choices=['random', 'hard'], default='random')
     s.add_argument('--multihop-pad-chars', type=int, default=0)
+    s.add_argument('--multihop-units', choices=['paragraph', 'sentence'], default='paragraph')
     s.add_argument('--arms', required=True, help="comma list; 'label=spec' to name an arm, e.g. beta=pruner:models/x")
     s.add_argument('--ratios', default='4,8')
+    s.add_argument('--restrict-sources', default='',
+                   help="select only the documents of these sources (comma list); the document set is unchanged")
     s.add_argument('--budget-tokenizer', required=True, help="reference tokenizer for budgets (usually the first reader)")
     s.add_argument('--oracle-beta-dir', default=None,
                    help="Stage A fit dir(s) of the evaluated documents (comma list) for the oracle_beta arm")
@@ -938,6 +1150,10 @@ def main():
                    help="labels root(s), comma list (raw/<reader>/...), for the RQ1 cost table")
     r.add_argument('--fit-dir', default=None, help="this run's fit dir (<reader|ensemble>/<target>/<set>/summary.json) "
                                                     "for the label-quality table")
+    r.add_argument('--confirm-ratios', default='',
+                   help="ratios the confirmatory families test (the pre-registered ones, e.g. 4,8); default: every ratio")
+    r.add_argument('--no-diagnostics', action='store_true',
+                   help="skip the exploratory diagnostics read from the selection files")
     r.set_defaults(func=cmd_report)
 
     args = ap.parse_args()

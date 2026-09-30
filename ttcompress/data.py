@@ -37,10 +37,24 @@ class QADocument:
         return len(self.chunks)
 
     def text(self, keep: Optional[Sequence[int]] = None) -> str:
-        """Kept chunks joined in ORIGINAL order (keep=None -> full context)."""
-        if keep is None:
-            return CHUNK_SEP.join(self.chunks)
-        return CHUNK_SEP.join(self.chunks[i] for i in sorted(set(keep)))
+        """Kept chunks joined in ORIGINAL order (keep=None -> full context). Sentence-unit documents
+        (metadata units='sentence': one 'Title\\nsentence' chunk per sentence, metadata para = paragraph of each
+        chunk) are written as paragraphs: the title once, then the kept sentences of that paragraph."""
+        idx = range(len(self.chunks)) if keep is None else sorted(set(keep))
+        para = self.metadata.get('para') if self.metadata.get('units') == 'sentence' else None
+        if not para:
+            return CHUNK_SEP.join(self.chunks[i] for i in idx)
+        parts, current, title, body = [], None, '', []
+        for i in idx:
+            t, _, s = self.chunks[i].partition('\n')
+            if para[i] != current:
+                if current is not None:
+                    parts.append(f"{title}\n{' '.join(body)}")
+                current, title, body = para[i], t, []
+            body.append(s)
+        if current is not None:
+            parts.append(f"{title}\n{' '.join(body)}")
+        return CHUNK_SEP.join(parts)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

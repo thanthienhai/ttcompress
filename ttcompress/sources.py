@@ -228,24 +228,57 @@ def _read_parquet(repo_id: str, filename: str):
     return pd.read_parquet(hf_hub_download(repo_id=repo_id, repo_type='dataset', filename=filename))
 
 
-def multihop_row_to_doc(row, source: str, split: str) -> Optional[QADocument]:
-    """One HotpotQA-schema row (context.title/sentences, supporting_facts.title)
+MULTIHOP_UNITS = ('paragraph', 'sentence')
+
+
+def multihop_row_to_doc(row, source: str, split: str, units: str = 'paragraph') -> Optional[QADocument]:
+    """One HotpotQA-schema row (context.title/sentences, supporting_facts.title/sent_id)
     -> QADocument with one chunk per titled paragraph, or None if the row is
-    unusable (yes/no or empty answer, supporting title missing from context)."""
+    unusable (yes/no or empty answer, supporting title missing from context).
+
+    units='sentence': one 'Title\\nsentence' chunk per sentence (metadata para = its paragraph, so
+    QADocument.text writes each title once), gold = the supporting-fact sentences. Paragraph selection keeps
+    about one paragraph at 1/8 of a 10-paragraph document; sentence units let Stage A, the pruner and every
+    chunk arm keep the evidence sentences of two paragraphs instead. The same rows are kept in both units
+    (a supporting paragraph whose sent_id is out of range falls back to all its sentences), so the document
+    sets match by doc_id."""
+    if units not in MULTIHOP_UNITS:
+        raise ValueError(f"units must be one of {MULTIHOP_UNITS}, not {units!r}")
     answer = str(row['answer']).strip()
     if not answer or is_yes_no(answer):
         return None
     titles = [str(t) for t in row['context']['title']]
-    chunks = [f"{t}\n{' '.join(str(s).strip() for s in sents)}".strip()
-              for t, sents in zip(titles, row['context']['sentences'])]
+    paragraphs = [[str(s).strip() for s in sents] for sents in row['context']['sentences']]
     gold = sorted({titles.index(str(t)) for t in row['supporting_facts']['title'] if str(t) in titles})
     if not gold:
         return None
     doc_id = f"{source}_{split}_{row['id']}"
+    metadata = {'source_id': str(row['id']), 'type': str(row.get('type', ''))}
+    if units == 'paragraph':
+        chunks = [f"{t}\n{' '.join(sents)}".strip() for t, sents in zip(titles, paragraphs)]
+    else:
+        facts = set(zip((str(t) for t in row['supporting_facts']['title']),
+                        (int(k) for k in row['supporting_facts'].get('sent_id', []))))
+        chunks, para, sent_gold, gold_para_sents = [], [], [], {}
+        for p, (t, sents) in enumerate(zip(titles, paragraphs)):
+            for k, s in enumerate(sents):
+                if not s:
+                    continue
+                if p in gold:
+                    gold_para_sents.setdefault(p, []).append(len(chunks))
+                if (t, k) in facts:
+                    sent_gold.append(len(chunks))
+                chunks.append(f"{t}\n{s}")
+                para.append(p)
+        covered = {para[i] for i in sent_gold}
+        gold = sorted(set(sent_gold) | {i for p in gold if p not in covered for i in gold_para_sents.get(p, [])})
+        if not gold:
+            return None
+        metadata.update(units='sentence', para=para)
     return QADocument(
         doc_id=doc_id, source=source, language=LANGUAGE[source], hop='multi', split=split,
         question=str(row['question']), answers=[answer], chunks=chunks, gold_chunks=gold,
-        cluster_id=doc_id, metadata={'source_id': str(row['id']), 'type': str(row.get('type', ''))},
+        cluster_id=doc_id, metadata=metadata,
     )
 
 
@@ -260,7 +293,7 @@ _MULTIHOP_FILES = {
 }
 
 
-def _multihop_docs(source: str, split: str) -> List[QADocument]:
+def _multihop_docs(source: str, split: str, units: str = 'paragraph') -> List[QADocument]:
     repo, files = _MULTIHOP_FILES[source]
     hashed = 'eval' in files and split != 'train'
     docs = []
@@ -269,7 +302,7 @@ def _multihop_docs(source: str, split: str) -> List[QADocument]:
         for _, row in df.iterrows():
             if hashed and dev_or_test(f"{source}:{row['id']}", 0.5) != split:
                 continue
-            doc = multihop_row_to_doc(row, source, split)
+            doc = multihop_row_to_doc(row, source, split, units)
             if doc is not None:
                 docs.append(doc)
     return docs
@@ -301,9 +334,10 @@ def pad_with_distractors(doc: QADocument, pool: Sequence[str], target_chars: int
 
 def load_documents(
     source: str, split: str, n: Optional[int] = None, haystack_chars: int = DEFAULT_HAYSTACK_CHARS,
-    distractors: str = 'random', multihop_pad_chars: int = 0,
+    distractors: str = 'random', multihop_pad_chars: int = 0, multihop_units: str = 'paragraph',
 ) -> List[QADocument]:
-    """Up to `n` documents of `source`/`split`, chosen by hash (no seed)."""
+    """Up to `n` documents of `source`/`split`, chosen by hash (no seed). multihop_units: 'paragraph' (one
+    chunk per titled paragraph) or 'sentence' (one per sentence; see multihop_row_to_doc)."""
     if source not in SOURCES:
         raise ValueError(f"unknown source {source!r}; choose from {SOURCES}")
     if split not in AVAILABLE_SPLITS[source]:
@@ -317,7 +351,9 @@ def load_documents(
         chosen = take_n(rows, n, key=lambda r: r['id'])
         return _squad_rows_to_docs(rows, chosen, source, split, haystack_chars, distractors)
 
-    docs = _multihop_docs(source, split)
+    if multihop_units != 'paragraph' and multihop_pad_chars:
+        raise ValueError("multihop_pad_chars pads with whole paragraphs: it cannot be combined with sentence units")
+    docs = _multihop_docs(source, split, multihop_units)
     pool = list(dict.fromkeys(c for d in docs for c in d.chunks)) if multihop_pad_chars else []
     docs = take_n(docs, n, key=lambda d: d.doc_id)
     if multihop_pad_chars:

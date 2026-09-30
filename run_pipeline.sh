@@ -14,6 +14,9 @@
 #   N_TRAIN=50 N_DEV=20 N_TEST=30 RUN_ROOT=runs/pilot ./run_pipeline.sh   # pilot
 #   SMOKE=1 ./run_pipeline.sh                             # every stage on a few documents -> <runs>/smoke
 #   DISTRACTORS=hard ./run_pipeline.sh                    # hard-distractor ablation -> <RUN_ROOT>_distractors-hard
+#   MULTIHOP_UNITS=sentence ./run_pipeline.sh             # multi-hop sentence units -> <RUN_ROOT>_units-sentence
+#   STAGES=bench ./run_pipeline.sh                        # selection latency, one arm at a time on one GPU
+#   (scripts/followup.sh runs the 2026-09-30 follow-up experiments on an existing RUN_ROOT)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -68,6 +71,17 @@ N_TRAIN=${N_TRAIN:-3000}
 N_DEV=${N_DEV:-300}
 N_TEST=${N_TEST:-500}
 RATIOS=${RATIOS:-"4,8"}
+# The ratios the confirmatory hypothesis families test (METHOD_SPEC.md §1, fixed before the full run). Ratios
+# added later (RATIOS, EXTRA_RATIOS_SINGLE) are reported and compared, never tested in a family.
+CONFIRM_RATIOS=${CONFIRM_RATIOS:-4,8}
+# Extra ratios for the single-hop sources only (e.g. "16,32"): their ~30-chunk haystacks keep 5-9 chunks at
+# 4x-8x, so every chunk arm keeps the needle and the sources cannot separate the methods. Multi-hop documents
+# (10 paragraphs) are not compressed further than 8x.
+EXTRA_RATIOS_SINGLE=${EXTRA_RATIOS_SINGLE:-}
+# FOLLOWUP_ARMS=1: the exploratory arms of the 2026-09-30 follow-up (outside every confirmatory family) --
+# ours_beta, span_sup and the reranker scoring sentences (sent+) and filling the budget paragraphs leave with
+# sentences (fill+), and LLMLingua / LongLLMLingua asked for the budget in tokens (_tt) when EXTRA_ARMS runs them.
+FOLLOWUP_ARMS=${FOLLOWUP_ARMS:-0}
 # oracle_beta (H1 upper bound = the unamortized attribution): Stage A labels of the first ORACLE_N test
 # documents per eval source, primary reader only (test docs are nested across n). 0 disables the arm.
 ORACLE_N=${ORACLE_N:-100}
@@ -85,7 +99,7 @@ EMBED_MODEL=${EMBED_MODEL:-BAAI/bge-m3}
 # llmlingua / longllmlingua arms need transformers<=4.47.1 (microsoft/LLMLingua#210), the vLLM image ships 5.x:
 # that transformers + llmlingua are installed into this directory and put on PYTHONPATH for those arms only.
 LLMLINGUA_SITE=${LLMLINGUA_SITE:-$PWD/.llmlingua_site}
-LEGACY_ARM_RE='^([^=]*=)?(llmlingua|longllmlingua)(:.*)?$'
+LEGACY_ARM_RE='^([^=]*=)?(llmlingua|longllmlingua)(_tt)?(:.*)?$'
 # Baseline packages go into the image's environment when its python has pip. An image whose venv has no pip
 # (the 2026-09-28 smoke image) gets them here instead, installed with the system pip3 for the venv's Python
 # version; this dir is on PYTHONPATH for the select stage only, never for the vLLM stages.
@@ -102,13 +116,18 @@ RUN_ROOT=${RUN_ROOT:-.}
 # multi-hop only), which are read from the main run's LABELS instead of being measured again (raw_root).
 DISTRACTORS=${DISTRACTORS:-}
 MULTIHOP_PAD_CHARS=${MULTIHOP_PAD_CHARS:-}
+# MULTIHOP_UNITS=sentence: multi-hop documents with one chunk per sentence (supporting-fact sentences as gold),
+# for labels, pruners and evaluation alike -- paragraph selection keeps ~1 of 10 paragraphs at 8x. An ablation
+# like the two above (own suffixed dirs, single-hop labels read from the main run).
+MULTIHOP_UNITS=${MULTIHOP_UNITS:-}
+[[ "$MULTIHOP_UNITS" == paragraph ]] && MULTIHOP_UNITS=""
 LABELS_MAIN=${LABELS:-$RUN_ROOT/labels}
-ABLATION=${DISTRACTORS:+_distractors-$DISTRACTORS}${MULTIHOP_PAD_CHARS:+_pad-$MULTIHOP_PAD_CHARS}
+ABLATION=${DISTRACTORS:+_distractors-$DISTRACTORS}${MULTIHOP_PAD_CHARS:+_pad-$MULTIHOP_PAD_CHARS}${MULTIHOP_UNITS:+_units-$MULTIHOP_UNITS}
 if [[ -n "$ABLATION" ]]; then
   RUN_ROOT="$RUN_ROOT$ABLATION"
   [[ -n "${LABELS:-}" ]] && LABELS="$LABELS$ABLATION"
   HF_RUN_NAME=$(basename "$RUN_ROOT")
-  doc_flags="${DISTRACTORS:+ --distractors $DISTRACTORS}${MULTIHOP_PAD_CHARS:+ --multihop-pad-chars $MULTIHOP_PAD_CHARS}"
+  doc_flags="${DISTRACTORS:+ --distractors $DISTRACTORS}${MULTIHOP_PAD_CHARS:+ --multihop-pad-chars $MULTIHOP_PAD_CHARS}${MULTIHOP_UNITS:+ --multihop-units $MULTIHOP_UNITS}"
   MEASURE_ARGS="${MEASURE_ARGS:-}$doc_flags"   # argparse: the last --distractors wins over .env's
   SELECT_ARGS="${SELECT_ARGS:-}$doc_flags"
 fi
@@ -120,7 +139,7 @@ SINGLE_HOP_SOURCES=$(python -c "from ttcompress.sources import HOP; print(' '.jo
 raw_root() {  # raw_root <source>: where this run's Stage A records of <source> live (the main run's unless
               # the ablation changes that source's documents)
   local single=0; [[ " $SINGLE_HOP_SOURCES " == *" $1 "* ]] && single=1
-  if { (( single )) && [[ -n "$DISTRACTORS" ]]; } || { (( ! single )) && [[ -n "$MULTIHOP_PAD_CHARS" ]]; }; then
+  if { (( single )) && [[ -n "$DISTRACTORS" ]]; } || { (( ! single )) && [[ -n "$MULTIHOP_PAD_CHARS$MULTIHOP_UNITS" ]]; }; then
     echo "$LABELS/raw"
   else
     echo "$LABELS_MAIN/raw"
@@ -315,8 +334,8 @@ pip_pinned() {
   fi
   rm -f "$pins"
 }
-has_arm() {  # has_arm <arm name>: EXTRA_ARMS has it, bare or labeled, with or without ':<arg>'
-  local re=",([^=,]*=)?$1(:[^,]*)?,"
+has_arm() {  # has_arm <arm name>: EXTRA_ARMS has it, bare or labeled, with or without ':<arg>' (or its _tt variant)
+  local re=",([^=,]*=)?$1(_tt)?(:[^,]*)?,"
   [[ ",${EXTRA_ARMS:-}," =~ $re ]]
 }
 llmlingua_site_ok() {
@@ -541,6 +560,13 @@ if has_stage select; then
     ARMS="$ARMS,ours_ens_s$seed=pruner:$MODELS/pruner_beta_ensemble_s$seed"
   done
   ARMS="$ARMS${EXTRA_ARMS:+,$EXTRA_ARMS}"   # published compressors, see .env.example
+  if [[ "$FOLLOWUP_ARMS" == 1 ]]; then
+    for pair in "ours|pruner:$MODELS/pruner_beta_primary" "span|pruner:$MODELS/pruner_span" "reranker|reranker:$BACKBONE"; do
+      ARMS="$ARMS,${pair%%|*}_sent=sent+${pair#*|},${pair%%|*}_fill=fill+${pair#*|}"
+    done
+    has_arm llmlingua && ARMS="$ARMS,llmlingua_tt"
+    has_arm longllmlingua && ARMS="$ARMS,longllmlingua_tt"
+  fi
   oracle_flags=()
   if (( ORACLE_N > 0 )); then
     oracle_dirs=""
@@ -553,7 +579,7 @@ if has_stage select; then
     oracle_flags=(--oracle-beta-dir "${oracle_dirs#,}")
   fi
   # our checkpoints must exist before 4 shards start (e.g. STAGES="select ..." after a failed train)
-  for ckpt in $(echo "$ARMS" | tr ',' '\n' | sed -nE 's/^([^=]*=)?pruner:(.+)$/\2/p'); do
+  for ckpt in $(echo "$ARMS" | tr ',' '\n' | sed -nE 's/^([^=]*=)?((sent|fill)\+)?pruner:(.+)$/\4/p'); do
     if [[ "$ckpt" == "$MODELS"/* && ! -f "$ckpt/pruner_config.json" ]]; then
       echo "!! $ckpt is not a finished pruner checkpoint; run the train stage first (logs: $LOGS/train_*.log)"; exit 1
     fi
@@ -572,6 +598,23 @@ if has_stage select; then
       --sources "$EVAL_SOURCES" --split test --n "$N_TEST" --arms "$legacy_arms" --ratios "$RATIOS" \
       --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" $SELECT_ARGS
   fi
+  if [[ -n "$EXTRA_RATIOS_SINGLE" ]]; then
+    # same document set (select_config.json), only its single-hop documents, only the extra ratios.
+    # oracle_beta has labels for ORACLE_N documents of every source: it joins this pass too.
+    single_eval=$(for s in ${EVAL_SOURCES//,/ }; do if [[ " $SINGLE_HOP_SOURCES " == *" $s "* ]]; then echo "$s"; fi; done | paste -sd, -)
+    if [[ -n "$single_eval" ]]; then
+      echo "== select, single-hop only ($single_eval) at $EXTRA_RATIOS_SINGLE"
+      run_sharded select_single 1 env PYTHONPATH="$BASELINE_SITE${PYTHONPATH:+:$PYTHONPATH}" python evaluate.py select \
+        --sources "$EVAL_SOURCES" --split test --n "$N_TEST" --restrict-sources "$single_eval" \
+        --arms "$main_arms" --ratios "$EXTRA_RATIOS_SINGLE" --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" \
+        ${oracle_flags[@]+"${oracle_flags[@]}"} $SELECT_ARGS
+      if [[ -n "$legacy_arms" ]]; then
+        run_sharded select_single_llmlingua 1 env PYTHONPATH="$LLMLINGUA_SITE${PYTHONPATH:+:$PYTHONPATH}" python evaluate.py select \
+          --sources "$EVAL_SOURCES" --split test --n "$N_TEST" --restrict-sources "$single_eval" --arms "$legacy_arms" \
+          --ratios "$EXTRA_RATIOS_SINGLE" --budget-tokenizer "$PRIMARY_MODEL" --out-dir "$EVAL_DIR" $SELECT_ARGS
+      fi
+    fi
+  fi
 fi
 
 if has_stage answer; then
@@ -586,10 +629,18 @@ fi
 
 if has_stage report; then
   echo "== report"
+  # the first report of a run is kept: a later report over added arms / ratios / oracle documents rewrites
+  # report.json, and the numbers quoted from the first one must stay checkable
+  for f in report.json report.md; do
+    [[ -f "$EVAL_DIR/$f" && ! -f "$EVAL_DIR/first_$f" ]] && cp "$EVAL_DIR/$f" "$EVAL_DIR/first_$f"
+  done
   heldout=""
   for reader in $EVAL_READERS; do [[ " $LABEL_READERS " == *" $reader "* ]] || heldout="$heldout,$(tag "$reader")"; done
-  python evaluate.py report --out-dir "$EVAL_DIR" --ours ours_beta,ours_ens --primary-reader "$PRIMARY" \
+  # REPORT_OURS: the arms compared against every other arm in the (exploratory) paired table; the confirmatory
+  # families always test ours_beta / ours_ens by name
+  python evaluate.py report --out-dir "$EVAL_DIR" --ours "${REPORT_OURS:-ours_beta,ours_ens}" --primary-reader "$PRIMARY" \
     --heldout-readers "${heldout#,}" --equiv-margin "$EQUIV_MARGIN" --oracle-margin "$ORACLE_MARGIN" \
+    --confirm-ratios "$CONFIRM_RATIOS" \
     --min-upgrade-gap "$MIN_UPGRADE_GAP" --labels-dir "$(echo "$LABELS,$LABELS_MAIN" | tr ',' '\n' | awk '!seen[$0]++' | paste -sd, -)" --fit-dir "$FIT" > "$LOGS/report.log" 2>&1 \
     || { tail -n 25 "$LOGS/report.log"; exit 1; }
   python scripts/paper_tables.py --report "$EVAL_DIR/report.json" --primary-reader "$PRIMARY" >> "$LOGS/report.log" 2>&1 \
@@ -601,6 +652,24 @@ if has_stage report; then
     echo "   (no matplotlib: run scripts/paper_figures.py --report $EVAL_DIR/report.json locally for the figures)"
   fi
   echo "report: $EVAL_DIR/report.md (paper tables + CSVs + figures: $EVAL_DIR/paper/)"
+fi
+
+if has_stage bench; then
+  # selection latency for the RQ1 cost table: one arm at a time on ONE GPU, nothing else running (the select
+  # stage's per-document times come from four shards side by side). BENCH_ARMS overrides the default list.
+  # default: ours (paragraphs, and with the sentence fill), its backbone, embed, bm25 and every published arm of
+  # EXTRA_ARMS that runs with the image's transformers (llmlingua / longllmlingua need the old one: not here)
+  bench_arms=${BENCH_ARMS:-"ours_beta=pruner:$MODELS/pruner_beta_primary,ours_fill=fill+pruner:$MODELS/pruner_beta_primary,reranker=reranker:$BACKBONE,embed=embed:$EMBED_MODEL,bm25"}
+  if [[ -z "${BENCH_ARMS:-}" && -n "${EXTRA_ARMS:-}" ]]; then
+    published=$(echo "$EXTRA_ARMS" | tr ',' '\n' | { grep -vE "$LEGACY_ARM_RE" || true; } | paste -sd, -)
+    bench_arms="$bench_arms${published:+,$published}"
+  fi
+  [[ -f "$EVAL_DIR/documents_shard0.jsonl" ]] || { echo "!! bench reads $EVAL_DIR/documents_shard*.jsonl: run select first"; exit 1; }
+  ensure_baseline_deps   # published arms in BENCH_ARMS need their packages (installed for the arms in EXTRA_ARMS)
+  echo "== bench (GPU ${GPU_IDS[0]}): $bench_arms"
+  CUDA_VISIBLE_DEVICES="${GPU_IDS[0]}" PYTHONPATH="$BASELINE_SITE${PYTHONPATH:+:$PYTHONPATH}" python scripts/bench_latency.py \
+    --eval-dir "$EVAL_DIR" --arms "$bench_arms" --budget-tokenizer "$PRIMARY_MODEL" \
+    --n-per-source "${BENCH_N:-100}" --out "$EVAL_DIR/bench_latency.json" 2>&1 | tee "$LOGS/bench.log"
 fi
 
 if has_stage upload; then

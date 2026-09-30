@@ -32,6 +32,12 @@ def test_prompt_without_chat_template_contains_context_and_question(reader):
     assert 'Context' in reader.build_prompt('c', 'q', 'en')
 
 
+def test_base_prompt_puts_the_answer_on_the_next_line(reader):
+    # BASE_PROMPT_VERSION 2: without the newline SEA-LION ended most Vietnamese prompts with <|end_of_text|>
+    assert reader.build_prompt('NGỮ CẢNH', 'CÂU HỎI', 'vi').endswith('### Đáp án:\n')
+    assert reader.answer_target('Hà Nội') == reader.tokenizer.encode('Hà Nội', add_special_tokens=False)
+
+
 def test_batched_generation_equals_one_at_a_time(reader):
     prompts = [reader.build_prompt('ab ' * n, 'q', 'en') for n in (1, 7, 3, 12, 5)]
     batched = reader.generate(prompts, max_new_tokens=5)

@@ -236,7 +236,77 @@ def test_paper_figures_from_report(tmp_path):
     res = subprocess.run([sys.executable, 'scripts/paper_figures.py', '--report', str(tmp_path / 'report.json'),
                           '--primary-reader', 'strong', '--out-dir', str(out)], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
-    for name in ('pareto', 'retention', 'depth'):          # the synthetic run has single-hop depth bins too
+    for name in ('pareto', 'retention', 'depth', 'tokens'):   # the synthetic run has single-hop depth bins too
         assert (out / f'{name}.pdf').stat().st_size > 1000
     report = json.loads((tmp_path / 'report.json').read_text(encoding='utf-8'))
     assert report['heldout_readers'] == ['heldout']     # figures star the held-out pairs from the report itself
+
+
+def test_report_confirm_ratios_and_selection_diagnostics(tmp_path):
+    """Families stay on the pre-registered ratios when another ratio is added; the diagnostics read the
+    selection files: answer coverage, F1 given the answer, bridge effect, selection overlap, oracle gap."""
+    kept = {'ours_beta': [0, 1], 'ours_beta_s1': [0, 1], 'ours_ens': [0, 2], 'reranker': [2], 'oracle_beta': [0, 1]}
+    chunks = ['T0\nthe ans is here', 'T1\nbridge fact', 'T2\nother text']
+    docs, sels = [], []
+    rows = {'strong': [], 'weak': []}
+    for i in range(20):
+        doc_id = f'hotpotqa-{i}'
+        docs.append({'doc_id': doc_id, 'source': 'hotpotqa', 'language': 'en', 'hop': 'multi', 'split': 'test',
+                     'question': 'q', 'answers': ['ans'], 'chunks': chunks, 'gold_chunks': [0, 1],
+                     'cluster_id': doc_id, 'metadata': {}})
+        for ratio in (4.0, 16.0):
+            for arm, k in kept.items():
+                if arm == 'oracle_beta' and i >= 10:
+                    continue
+                text = '\n\n'.join(chunks[j] for j in k)
+                sels.append({'doc_id': doc_id, 'arm': arm, 'ratio': ratio, 'source': 'hotpotqa', 'hop': 'multi',
+                             'kept': k, 'text': text, 'kept_tokens': 5, 'budget': 6, 'gold_recall': 0.5,
+                             'full_tokens': 9})
+                f1 = 1.0 if 'ans' in text else 0.0
+                for reader, scale in (('strong', 1.0), ('weak', 0.5)):
+                    rows[reader].append(_hrow(reader, arm, ratio, i, scale * f1 - (0.01 * i % 3) * 0.01, 'hotpotqa'))
+    (tmp_path / 'documents_shard0.jsonl').write_text(''.join(json.dumps(d) + '\n' for d in docs), encoding='utf-8')
+    (tmp_path / 'selections_shard0.jsonl').write_text(''.join(json.dumps(s) + '\n' for s in sels), encoding='utf-8')
+    for reader, rs in rows.items():
+        with open(tmp_path / f'answers_{reader}_shard0.jsonl', 'w', encoding='utf-8') as f:
+            f.writelines(json.dumps(r) + '\n' for r in rs)
+    res = subprocess.run([sys.executable, 'evaluate.py', 'report', '--out-dir', str(tmp_path), '--ours', 'ours_beta,ours_ens',
+                          '--primary-reader', 'strong', '--n-boot', '200', '--confirm-ratios', '4'],
+                         capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    report = json.loads((tmp_path / 'report.json').read_text(encoding='utf-8'))
+    assert report['confirm_ratios'] == ['4.0']
+    tests = [t for f in report['hypotheses'] for t in f['tests']]
+    assert tests and {t['ratio'] for t in tests} == {'4.0'}
+    assert {c['ratio'] for c in report['cells']} >= {'4.0', '16.0'}     # 16x is still reported
+    cov = {(c['ratio'], c['arm']): c for c in report['diagnostics']['coverage']}
+    assert cov[('4.0', 'ours_beta')]['answer_in_context'] == 1.0 and cov[('4.0', 'reranker')]['answer_in_context'] == 0.0
+    assert cov[('4.0', 'ours_beta')]['all_gold'] == 1.0 and cov[('4.0', 'ours_ens')]['all_gold'] == 0.0
+    assert cov[('4.0', 'ours_beta')]['f1_answer_in'] > 0.9 and cov[('4.0', 'reranker')]['f1_answer_in'] is None
+    ov = {(o['ratio'], o['arm']): o for o in report['diagnostics']['overlap']}
+    assert ov[('4.0', 'ours_beta')]['ours_beta_s1'] == 1.0 and abs(ov[('4.0', 'ours_beta')]['ours_ens'] - 1 / 3) < 1e-9
+    bridge = {b['ratio']: b for b in report['diagnostics']['bridge']}
+    assert bridge['4.0']['n_all_gold'] == 40 and bridge['4.0']['n_some_gold_missing'] == 20
+    gaps = report['oracle_gap_by_reader']
+    assert {g['reader'] for g in gaps} == {'strong', 'weak'} and all(g['n'] == 10 and g['ratio'] == '4.0' for g in gaps)
+    md = (tmp_path / 'report.md').read_text(encoding='utf-8')
+    assert '## Diagnostics (exploratory)' in md and '## ours_beta − oracle_beta by reader' in md
+
+
+def test_bench_latency_times_each_arm_per_source(tmp_path):
+    from tests.conftest import TINY_ENCODER
+    docs = [{'doc_id': f'{src}-{i}', 'source': src, 'language': 'en', 'hop': 'multi', 'split': 'test', 'question': 'q a',
+             'answers': ['a'], 'chunks': ['T\na b. c d.', 'U\ne f.'], 'gold_chunks': [0], 'cluster_id': f'{src}-{i}',
+             'metadata': {}} for src in ('hotpotqa', '2wiki') for i in range(4)]
+    (tmp_path / 'documents_shard0.jsonl').write_text(''.join(json.dumps(d) + '\n' for d in docs), encoding='utf-8')
+    out = tmp_path / 'bench.json'
+    res = subprocess.run([sys.executable, 'scripts/bench_latency.py', '--eval-dir', str(tmp_path), '--arms',
+                          'bm25,bm25_fill=fill+bm25', '--budget-tokenizer', TINY_ENCODER, '--n-per-source', '3',
+                          '--warmup', '1', '--device', 'cpu', '--out', str(out)],
+                         capture_output=True, text=True, env={**__import__('os').environ, 'HF_HUB_OFFLINE': '1'})
+    assert res.returncode == 0, res.stderr
+    bench = json.loads(out.read_text(encoding='utf-8'))
+    assert {(r['arm'], r['source']) for r in bench['rows']} == {
+        (a, s) for a in ('bm25', 'bm25_fill') for s in ('hotpotqa', '2wiki')}
+    assert all(r['n'] == 6 and len(r['pass_medians_ms']) == 2 for r in bench['rows'])   # 3 docs x 2 passes
+    assert (tmp_path / 'bench.md').read_text(encoding='utf-8').startswith('# Selection latency')

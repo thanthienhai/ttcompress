@@ -110,11 +110,12 @@ def test_append_after_a_torn_line_repairs_the_file(tmp_path):
     assert [r['a'] for r in _read_jsonl(str(p))] == [1, 2, 3, 4]
 
 
-def _select_args(out_dir, arms, ratios):
+def _select_args(out_dir, arms, ratios, sources='hotpotqa', restrict_sources=''):
     import argparse
-    return argparse.Namespace(split='test', budget_tokenizer=TINY_CAUSAL_LM, sources='hotpotqa', n=1, num_shards=1,
-                              shard=0, haystack_chars=30000, distractors='random', multihop_pad_chars=0, arms=arms,
-                              ratios=ratios, oracle_beta_dir=None, device='cpu', out_dir=str(out_dir), flush_every=25,
+    return argparse.Namespace(split='test', budget_tokenizer=TINY_CAUSAL_LM, sources=sources, n=1, num_shards=1,
+                              shard=0, haystack_chars=30000, distractors='random', multihop_pad_chars=0,
+                              multihop_units='paragraph', arms=arms, ratios=ratios, restrict_sources=restrict_sources,
+                              oracle_beta_dir=None, device='cpu', out_dir=str(out_dir), flush_every=25,
                               retry_failed=False)
 
 
@@ -136,6 +137,25 @@ def test_reselect_with_an_extra_ratio_adds_only_the_missing_rows(tmp_path):
     cmd_select(_select_args(tmp_path, 'lead', '4,8'))
     keys = [(r['doc_id'], r['arm'], r['ratio']) for r in _read_jsonl(str(tmp_path / 'selections_shard0.jsonl'))]
     assert sorted(keys) == [('d0', 'lead', 4.0), ('d0', 'lead', 8.0)]
+
+
+def test_extra_ratios_for_part_of_the_sources_keep_the_document_set(tmp_path):
+    """EXTRA_RATIOS_SINGLE: a select pass restricted to the single-hop documents at 16x, in the main run's dir."""
+    os.environ.setdefault('HF_HUB_OFFLINE', '1')
+    from evaluate import cmd_select
+    single = make_doc(['a b c d e f g h', 'i j k l m n o p', 'q r s t u v w x'], doc_id='u0', source='uit_viquad')
+    multi = make_doc(['Paris is in France.', 'Berlin is in Germany.'], doc_id='h0', source='hotpotqa', hop='multi')
+    meta = {'split': 'test', 'budget_tokenizer': TINY_CAUSAL_LM, 'sources': 'uit_viquad,hotpotqa', 'n': 1,
+            'num_shards': 1, 'haystack_chars': 30000, 'distractors': 'random', 'multihop_pad_chars': 0}
+    (tmp_path / 'select_config.json').write_text(json.dumps(meta), encoding='utf-8')
+    (tmp_path / 'documents_shard0.jsonl').write_text(
+        ''.join(json.dumps(d.to_dict()) + '\n' for d in (single, multi)), encoding='utf-8')
+    cmd_select(_select_args(tmp_path, 'lead', '4', sources='uit_viquad,hotpotqa'))
+    cmd_select(_select_args(tmp_path, 'lead', '16', sources='uit_viquad,hotpotqa', restrict_sources='uit_viquad'))
+    keys = sorted((r['doc_id'], r['ratio']) for r in _read_jsonl(str(tmp_path / 'selections_shard0.jsonl')))
+    assert keys == [('h0', 4.0), ('u0', 4.0), ('u0', 16.0)]
+    # the option does not enter select_config.json: a run from before it still matches
+    assert json.loads((tmp_path / 'select_config.json').read_text(encoding='utf-8')) == meta
 
 
 def test_a_failing_published_compressor_is_recorded_not_fatal(tmp_path, monkeypatch):

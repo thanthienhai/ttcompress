@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pytest
 
 from ttcompress.metrics import (
     answer_recall, bh_adjust, bootstrap_mean_ci, exact_match, gold_chunk_recall, holm_adjust, ndcg_at_k,
@@ -208,3 +209,81 @@ def test_llmlingua_arms_refuse_a_transformers_they_break_on(monkeypatch):
     for spec in ('llmlingua', 'longllmlingua:some/lm'):
         with pytest.raises(RuntimeError, match='transformers<=4.47.1'):
             make_arm(spec, device='cpu')
+
+
+# --- sentence / fill wrappers around chunk scorers (2026-09-30 follow-up) ------
+
+def test_fill_keeps_whole_chunks_then_the_best_sentences_of_the_rest(fake_tokenizer):
+    from ttcompress.selection import select_with_fill, sentence_units
+    count = lambda t: len(fake_tokenizer.encode(t))  # noqa: E731
+    doc = make_doc(['A\na1 a2 a3.', 'B\nb1 b2 b3 b4 b5 b6. b7.', 'C\nc1. c2 c3 c4.'], hop='multi')
+    lengths = [count(c) for c in doc.chunks]           # 4, 8, 5 words
+    units = sentence_units(doc)                        # a | b(6) | b7 | c1 | c(3)
+    # budget 8: chunk A wins whole (4); B (8) and C (5) do not fit the 4 left; B's best sentence 'b7.' does
+    # (+ its title), C's 'c1.' would not fit after it
+    sel = select_with_fill(doc, [3.0, 2.0, 1.0], lengths, units, [0.0, 0.1, 0.9, 0.5, 0.2], count, 8, fake_tokenizer)
+    assert sel.kept == [0] and sel.partial == [1] and sel.kept_tokens <= 8
+    assert sel.text.startswith('A\na1 a2 a3.\n\nB\nb7.')
+    assert sel.text.count('B\n') == 1                 # the title once per touched chunk
+    # nothing fits whole: plain sentence selection over every chunk
+    tight = select_with_fill(doc, [3.0, 2.0, 1.0], lengths, units, [0.0, 0.1, 0.9, 0.5, 0.2], count, 3, fake_tokenizer)
+    assert tight.kept == [] and tight.text == 'B\nb7.' and tight.partial == [1]
+    # a budget the chunks fill exactly leaves nothing to add
+    exact = select_with_fill(doc, [3.0, 2.0, 1.0], lengths, units, [0.0] * 5, count, 4, fake_tokenizer)
+    assert exact.kept == [0] and exact.partial == [] and exact.text == 'A\na1 a2 a3.'
+
+
+def test_sent_and_fill_wrap_model_chunk_arms():
+    from ttcompress.selection import sentence_units
+    doc = make_doc(['Paris\nParis is in France. It is big.', 'Berlin\nBerlin is in Germany.'], hop='multi',
+                   question='Where is Berlin?')
+    sent = make_arm('sent+bm25', device='cpu')
+    assert sent.kind == 'sentence'
+    units, scores = sent.sentence_scores(doc)
+    assert len(scores) == len(units) == 3 and scores.index(max(scores)) == 2
+    fill = make_arm('fill+bm25', device='cpu')
+    assert fill.kind == 'fill' and fill.scores(doc) == bm25_scores(doc.question, doc.chunks)
+    assert len(fill.sentence_scores(doc)[1]) == len(sentence_units(doc))
+    with pytest.raises(ValueError, match='wraps a model chunk arm'):
+        make_arm('sent+lead', device='cpu')
+
+
+def test_sentence_scorer_reads_titled_sentences():
+    from ttcompress.selection import SentenceAdapter, sentence_units
+
+    class Recorder:
+        def score_chunks(self, question, chunks):
+            self.seen = list(chunks)
+            return [float(len(c)) for c in chunks]
+
+    rec = Recorder()
+    doc = make_doc(['Paris\nParis is in France. It is big.', 'Berlin\nBerlin is in Germany.'], hop='multi')
+    SentenceAdapter(rec).score_sentences(doc, sentence_units(doc))
+    assert rec.seen == ['Paris\nParis is in France.', 'Paris\nIt is big.', 'Berlin\nBerlin is in Germany.']
+
+
+def test_fill_arm_rows_and_token_target_arms(fake_tokenizer):
+    from evaluate import _arm_rows, _text_within_budget
+    count = lambda t: len(fake_tokenizer.encode(t))  # noqa: E731
+    doc = make_doc(['A\na1 a2 a3.', 'B\nb1 b2 b3 b4 b5 b6. b7.', 'C\nc1. c2 c3 c4.'], gold=(0, 1), hop='multi',
+                   question='a1 b7')
+    arm = make_arm('fill+bm25', device='cpu')
+    rows = _arm_rows(arm, doc, 'bm25_fill', [4.0, 1.2], count(doc.text()), [count(c) for c in doc.chunks],
+                     fake_tokenizer, count)
+    assert [r['ratio'] for r in rows] == [4.0, 1.2]
+    assert all(r['kept_tokens'] <= r['budget'] and 'partial' in r for r in rows)
+    assert rows[1]['gold_recall'] == 1.0           # 1.2x keeps both gold chunks whole
+
+    class TokenTarget:   # a compressor that honours a token target, but counts ~10% more than the budget tokenizer
+        by_tokens = True
+
+        def __init__(self):
+            self.asked = []
+
+        def compress_text(self, doc, ratio, target_tokens=None):
+            self.asked.append(target_tokens)
+            return ' '.join(['w'] * int(1.1 * target_tokens))
+
+    tt = TokenTarget()
+    text, truncated = _text_within_budget(tt, make_doc(['x']), 4.0, 100, fake_tokenizer, count)
+    assert not truncated and count(text) <= 100 and tt.asked[0] == 100 and tt.asked[1] < 100

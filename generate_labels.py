@@ -35,7 +35,7 @@ from ttcompress.attribution import (
 )
 from ttcompress.metrics import spearman, token_f1
 from ttcompress.reader import MAX_NEW_TOKENS, load_reader, reader_tag
-from ttcompress.reader import PROMPT_VERSION
+from ttcompress.reader import BASE_PROMPT_VERSION, PROMPT_VERSION, reader_is_chat
 from ttcompress.sources import HOP, SOURCES, data_version, first_n_docs, load_documents
 
 
@@ -46,11 +46,13 @@ def add_document_args(p):
     p.add_argument('--haystack-chars', type=int, default=30000, help="single-hop haystack length")
     p.add_argument('--distractors', choices=['random', 'hard'], default='random')
     p.add_argument('--multihop-pad-chars', type=int, default=0, help="lengthen multi-hop docs with easy distractors")
+    p.add_argument('--multihop-units', choices=['paragraph', 'sentence'], default='paragraph',
+                   help="multi-hop chunk unit: titled paragraphs (default) or sentences (sources.multihop_row_to_doc)")
 
 
 def cmd_measure(args):
     docs = load_documents(args.source, args.split, args.n, args.haystack_chars, args.distractors,
-                          args.multihop_pad_chars)
+                          args.multihop_pad_chars, args.multihop_units)
     docs = [d for i, d in enumerate(docs) if i % args.num_shards == args.shard]
     out_dir = os.path.join(args.out_root, reader_tag(args.reader_model), f'{args.source}_{args.split}')
     todo = [d for d in docs if not os.path.exists(os.path.join(out_dir, f'{d.doc_id}.json'))]
@@ -75,6 +77,11 @@ def cmd_measure(args):
               'max_new_tokens': args.max_new_tokens or MAX_NEW_TOKENS[HOP[args.source]],
               'data_version': data_version(args.source), 'prompt_version': PROMPT_VERSION,
               'backend': args.backend, 'dtype': args.dtype, 'max_model_len': args.max_model_len}
+    if not reader_is_chat(args.reader_model):  # only base readers: the chat readers' label dirs keep their config
+        config['base_prompt_version'] = BASE_PROMPT_VERSION
+    if not single and args.multihop_units != 'paragraph':
+        # only when it differs from the default, so label dirs measured before the option still match
+        config['multihop_units'] = args.multihop_units
     os.makedirs(out_dir, exist_ok=True)
     config_path = os.path.join(out_dir, 'measure_config.json')
     # checked even when every document is on disk: a finished dir from other settings must not be fitted

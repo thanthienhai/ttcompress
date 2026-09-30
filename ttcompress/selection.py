@@ -27,7 +27,15 @@ Arms (name -> what it is):
   exit[:<adapter>] EXIT sentence classifier (Gemma-2B-it + LoRA), sentence-level
   llmlingua[:<lm>]      LLMLingua token-level compression (needs transformers<=4.47.1)
   longllmlingua[:<lm>]  LongLLMLingua, question-aware (needs transformers<=4.47.1)
+  llmlingua_tt / longllmlingua_tt
+                   the same two, asked for the budget in tokens (target_token) instead of a rate: the rate
+                   form overshoots and was cut to the budget on up to half the multi-hop documents
   llmlingua2       LLMLingua-2 token-level compression
+  sent+<chunk arm> any model chunk scorer (pruner:, reranker, embed, bm25) applied to sentences instead of
+                   paragraphs (each sentence scored as a chunk, its paragraph title prefixed), then selected
+                   like RECOMP / EXIT: paragraph selection cannot keep two evidence paragraphs at 1/8
+  fill+<chunk arm> whole chunks by the chunk scorer, then the budget left over filled with the best sentences
+                   (same scorer on sentences) of the chunks left out
 Not included, because their output length cannot be set to a budget: RECOMP abstractive, CompAct,
 CORE-RAG (no released checkpoint). Selective Context is English/Chinese-only and superseded by the
 LLMLingua family.
@@ -39,7 +47,7 @@ import random
 import re
 import unicodedata
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 from .data import CHUNK_SEP, QADocument
@@ -55,6 +63,7 @@ class Selection:
     full_tokens: int
     seconds: float = 0.0       # compressor wall-clock for this document
     truncated: bool = False    # nothing fit: the best chunk was cut to the budget
+    partial: List[int] = field(default_factory=list)   # fill arms: chunks that contributed sentences only
 
 
 def budget_for(full_tokens: int, ratio: float) -> int:
@@ -120,16 +129,43 @@ def sentence_units(doc: QADocument) -> List[SentenceUnit]:
     return units
 
 
-def units_text(doc: QADocument, units: Sequence[SentenceUnit], keep: Sequence[int]) -> str:
-    by_chunk: Dict[int, List[str]] = {}
+def unit_with_title(doc: QADocument, unit: SentenceUnit) -> str:
+    """What a chunk scorer reads for one sentence: the sentence with its paragraph title on multi-hop."""
+    title = chunk_title(doc, unit.chunk)
+    return f'{title}\n{unit.text}' if title else unit.text
+
+
+def _paragraph_key(doc: QADocument, chunk: int):
+    """Sentence-unit documents (sources, multihop_units='sentence') have one chunk per sentence: sentences of
+    the same paragraph share its title, which is written once."""
+    para = doc.metadata.get('para') if doc.metadata.get('units') == 'sentence' else None
+    return para[chunk] if para else chunk
+
+
+def units_text(doc: QADocument, units: Sequence[SentenceUnit], keep: Sequence[int],
+               whole: Sequence[int] = ()) -> str:
+    """Kept sentences re-assembled in original order, title once per paragraph; `whole` chunks (fill arms)
+    are written in full at their place."""
+    whole = set(whole)
+    parts_by_key: Dict[object, List[str]] = {}
+    first: Dict[object, int] = {}
+    for i in whole:
+        key = ('whole', i)
+        parts_by_key[key], first[key] = [doc.chunks[i]], i
     for j in sorted(set(keep)):
-        by_chunk.setdefault(units[j].chunk, []).append(units[j].text)
+        c = units[j].chunk
+        key = ('part', _paragraph_key(doc, c))
+        parts_by_key.setdefault(key, []).append(units[j].text)
+        first.setdefault(key, c)
     parts = []
-    for i in sorted(by_chunk):
-        title = chunk_title(doc, i)
-        body = ' '.join(by_chunk[i])
+    for key in sorted(parts_by_key, key=lambda k: first[k]):
+        if key[0] == 'whole':
+            parts.append(parts_by_key[key][0])
+            continue
+        title = chunk_title(doc, first[key])
+        body = ' '.join(parts_by_key[key])
         parts.append(f'{title}\n{body}' if title else body)
-    return '\n\n'.join(parts)
+    return CHUNK_SEP.join(parts)
 
 
 def select_sentences(doc: QADocument, units: Sequence[SentenceUnit], scores: Sequence[float], count,
@@ -164,6 +200,46 @@ def select_sentences(doc: QADocument, units: Sequence[SentenceUnit], scores: Seq
     return Selection([units[best].chunk], tokenizer.decode(ids), len(ids), budget, full_tokens, truncated=True)
 
 
+def select_with_fill(doc: QADocument, chunk_scores: Sequence[float], lengths: Sequence[int],
+                     units: Sequence[SentenceUnit], unit_scores: Sequence[float], count, budget: int,
+                     tokenizer) -> Selection:
+    """Whole chunks first (select_by_scores), then the budget they leave filled with the best sentences of the
+    chunks left out, greedy by sentence score; a touched chunk costs its title once. Paragraph selection
+    leaves on average a tenth of the budget unused on the 10-paragraph multi-hop documents (9.1-10x realized
+    at 8x) and cannot keep a second evidence paragraph that does not fit whole; the fill keeps its best
+    sentences instead. `kept` = whole chunks (gold recall counts whole evidence only), `partial` = chunks
+    that contributed sentences. If not even one chunk fits whole, this is plain sentence selection.
+    Sentence-unit documents are already at sentence granularity: plain chunk selection."""
+    whole = select_by_scores(doc, chunk_scores, lengths, budget, tokenizer)
+    if doc.metadata.get('units') == 'sentence':
+        return whole
+    if whole.truncated:
+        sel = select_sentences(doc, units, unit_scores, count, budget, tokenizer)
+        return Selection([], sel.text, sel.kept_tokens, budget, whole.full_tokens, truncated=sel.truncated,
+                         partial=[] if sel.truncated else sel.kept)
+    kept = set(whole.kept)
+    sep = count(CHUNK_SEP)
+    candidates = [j for j in sorted(range(len(units)), key=lambda j: (-unit_scores[j], j)) if units[j].chunk not in kept]
+    lengths_u = {j: count(units[j].text) for j in candidates}
+    title_len = {c: count(chunk_title(doc, c)) for c in {units[j].chunk for j in candidates}}
+    fill, opened, used = [], set(), whole.kept_tokens
+    for j in candidates:
+        c = units[j].chunk
+        cost = lengths_u[j] + (1 if _paragraph_key(doc, c) in opened else sep + title_len[c] + 1)
+        if used + cost <= budget:
+            fill.append(j)
+            opened.add(_paragraph_key(doc, c))
+            used += cost
+    while fill:
+        text = units_text(doc, units, fill, whole=kept)
+        n = count(text)
+        if n <= budget:
+            return Selection(sorted(kept), text, n, budget, whole.full_tokens,
+                             partial=sorted({units[j].chunk for j in fill}))
+        fill.pop()  # in score order: drop the weakest sentence
+    return whole
+
+
 # ---------------------------------------------------------------------------
 # chunk scorers
 # ---------------------------------------------------------------------------
@@ -192,6 +268,23 @@ def bm25_scores(question: str, chunks: Sequence[str], k1: float = 1.5, b: float 
             s += idf * tf[t] * (k1 + 1) / (tf[t] + k1 * (1 - b + b * len(d) / max(avgdl, 1e-9)))
         scores.append(s)
     return scores
+
+
+class BM25Scorer:
+    def score_chunks(self, question: str, chunks: Sequence[str]) -> List[float]:
+        return bm25_scores(question, chunks)
+
+
+class SentenceAdapter:
+    """A chunk scorer used on sentence units (the `sent+` / `fill+` arms): every sentence, with its paragraph
+    title on multi-hop, is scored as one chunk of the question's input -- for the pruner in one pass, so the
+    sentences of a paragraph still see each other. No retraining: the pruner was distilled on paragraphs."""
+
+    def __init__(self, scorer):
+        self.scorer = scorer
+
+    def score_sentences(self, doc: QADocument, units: Sequence[SentenceUnit]) -> List[float]:
+        return self.scorer.score_chunks(doc.question, [unit_with_title(doc, u) for u in units])
 
 
 class EmbeddingScorer:
@@ -387,7 +480,8 @@ class LLMLinguaCompressor:
 
     DEFAULT_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
 
-    def __init__(self, model_name: str = DEFAULT_MODEL, long: bool = False, device: str = 'cuda'):
+    def __init__(self, model_name: str = DEFAULT_MODEL, long: bool = False, device: str = 'cuda',
+                 by_tokens: bool = False):
         import transformers
         from packaging.version import Version
         if Version(transformers.__version__) > Version(LLMLINGUA_MAX_TRANSFORMERS):
@@ -397,10 +491,15 @@ class LLMLinguaCompressor:
         from llmlingua import PromptCompressor
         from .reader import resolve_device
         self.long = long
+        # by_tokens: ask for the budget itself (target_token, counted by the compressor's Qwen2.5 tokenizer,
+        # the same BPE family as the Qwen3 budget tokenizer) instead of a rate, which LongLLMLingua overshoots
+        self.by_tokens = by_tokens
         self.compressor = PromptCompressor(model_name=model_name, device_map=resolve_device(device))
 
-    def compress(self, doc: QADocument, ratio: float) -> str:
+    def compress(self, doc: QADocument, ratio: float, target_tokens: Optional[int] = None) -> str:
         kwargs = dict(instruction='', question='', rate=1.0 / ratio)
+        if target_tokens is not None:
+            kwargs['target_token'] = int(target_tokens)
         if self.long:
             kwargs.update(question=doc.question, concate_question=False, rank_method='longllmlingua',
                           condition_in_question='after_condition', reorder_context='sort',
@@ -417,7 +516,9 @@ class LLMLingua2Compressor:
         from .reader import resolve_device
         self.compressor = PromptCompressor(model_name=model_name, use_llmlingua2=True, device_map=resolve_device(device))
 
-    def compress(self, doc: QADocument, ratio: float) -> str:
+    by_tokens = False   # rate in XLM-R tokens: evaluate._text_within_budget tightens it to the budget
+
+    def compress(self, doc: QADocument, ratio: float, target_tokens: Optional[int] = None) -> str:
         return self.compressor.compress_prompt(doc.text(), rate=1.0 / ratio, force_tokens=['\n'])['compressed_prompt']
 
 
@@ -426,14 +527,22 @@ class LLMLingua2Compressor:
 # ---------------------------------------------------------------------------
 
 class Arm:
-    """name, kind ('chunk' | 'sentence' | 'text' | 'full'); chunk arms implement scores(doc), sentence
-    arms sentence_scores(doc), text arms compress_text(doc, ratio)."""
+    """name, kind ('chunk' | 'sentence' | 'fill' | 'text' | 'full'); chunk arms implement scores(doc),
+    sentence arms sentence_scores(doc), fill arms both (chunk scores from `inner`), text arms
+    compress_text(doc, ratio)."""
 
-    def __init__(self, name: str, kind: str, scorer=None, text_compressor=None, table: Optional[Dict] = None):
+    def __init__(self, name: str, kind: str, scorer=None, text_compressor=None, table: Optional[Dict] = None,
+                 inner: Optional['Arm'] = None):
         self.name, self.kind = name, kind
-        self._scorer, self._text, self._table = scorer, text_compressor, table
+        self._scorer, self._text, self._table, self._inner = scorer, text_compressor, table, inner
+
+    @property
+    def by_tokens(self) -> bool:
+        return bool(getattr(self._text, 'by_tokens', False))
 
     def scores(self, doc: QADocument) -> Optional[List[float]]:
+        if self._inner is not None:
+            return self._inner.scores(doc)
         C = doc.num_chunks
         if self.name == 'lead':
             return [-float(i) for i in range(C)]
@@ -458,8 +567,10 @@ class Arm:
         units = sentence_units(doc)
         return units, (self._scorer.score_sentences(doc, units) if units else [])
 
-    def compress_text(self, doc: QADocument, ratio: float) -> str:
-        return self._text.compress(doc, ratio)
+    def compress_text(self, doc: QADocument, ratio: float, target_tokens: Optional[int] = None) -> str:
+        if target_tokens is None:
+            return self._text.compress(doc, ratio)
+        return self._text.compress(doc, ratio, target_tokens)
 
 
 def load_beta_table(label_dirs: str) -> Dict[str, List[float]]:
@@ -469,10 +580,17 @@ def load_beta_table(label_dirs: str) -> Dict[str, List[float]]:
     return {lab.doc['doc_id']: lab.beta for lab in (load_chunk_labels(p) for p in paths)}
 
 
+WRAPPERS = {'sent+': 'sentence', 'fill+': 'fill'}   # prefix -> arm kind, around a model chunk arm
+
+
 def arm_models(spec: str) -> List[str]:
     """Hub ids an arm downloads, so scripts/prefetch.py can fetch them once before the shards start
     (and a gated one fails in the first minute)."""
+    for prefix in WRAPPERS:
+        if spec.startswith(prefix):
+            return arm_models(spec[len(prefix):])
     name, _, arg = spec.partition(':')
+    name = name[:-3] if name in ('llmlingua_tt', 'longllmlingua_tt') else name
     defaults = {'embed': ['BAAI/bge-m3'], 'reranker': ['BAAI/bge-reranker-v2-m3'], 'llmlingua2': [LLMLINGUA2_DEFAULT],
                 'llmlingua': [LLMLinguaCompressor.DEFAULT_MODEL], 'longllmlingua': [LLMLinguaCompressor.DEFAULT_MODEL],
                 'recomp': sorted(RecompScorer.DEFAULT.values()), 'provence': []}
@@ -484,6 +602,14 @@ def arm_models(spec: str) -> List[str]:
 
 
 def make_arm(spec: str, device: str = 'cuda', oracle_beta_dir: Optional[str] = None) -> Arm:
+    for prefix, kind in WRAPPERS.items():
+        if spec.startswith(prefix):
+            inner = make_arm(spec[len(prefix):], device, oracle_beta_dir)
+            scorer = inner._scorer or (BM25Scorer() if inner.name == 'bm25' else None)
+            if inner.kind != 'chunk' or scorer is None:
+                raise ValueError(f"{spec!r}: {prefix} wraps a model chunk arm (pruner:, reranker, embed, provence:, "
+                                 f"bm25), not {inner.name!r}")
+            return Arm(spec, kind, scorer=SentenceAdapter(scorer), inner=inner if kind == 'fill' else None)
     if spec == 'full':
         return Arm('full', 'full')
     if spec in ('lead', 'random', 'bm25', 'oracle_span', 'oracle_support'):
@@ -507,9 +633,10 @@ def make_arm(spec: str, device: str = 'cuda', oracle_beta_dir: Optional[str] = N
         model = spec.split(':', 1)[1] if ':' in spec else LLMLINGUA2_DEFAULT
         return Arm(spec, 'text', text_compressor=LLMLingua2Compressor(model, device))
     for name, long in (('llmlingua', False), ('longllmlingua', True)):
-        if spec == name or spec.startswith(name + ':'):
-            model = spec.split(':', 1)[1] if ':' in spec else LLMLinguaCompressor.DEFAULT_MODEL
-            return Arm(spec, 'text', text_compressor=LLMLinguaCompressor(model, long, device))
+        for by_tokens, arm_name in ((False, name), (True, name + '_tt')):
+            if spec == arm_name or spec.startswith(arm_name + ':'):
+                model = spec.split(':', 1)[1] if ':' in spec else LLMLinguaCompressor.DEFAULT_MODEL
+                return Arm(spec, 'text', text_compressor=LLMLinguaCompressor(model, long, device, by_tokens))
     if spec == 'recomp' or spec.startswith('recomp:'):
         return Arm(spec, 'sentence', scorer=RecompScorer(spec.split(':', 1)[1] if ':' in spec else None, device))
     if spec == 'exit' or spec.startswith('exit:'):

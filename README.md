@@ -25,6 +25,8 @@ generate_labels.py     measure (GPU) / fit (CPU) / ensemble (CPU)
 train_pruner.py        distill labels into a pruner
 evaluate.py            select (compress once) / answer (per reader) / report (CPU)
 run_pipeline.sh        the whole thing on N GPUs, resumable
+scripts/followup.sh    the follow-up experiments of 2026-09-30 on an existing run
+scripts/bench_latency.py  selection latency, one arm at a time on one GPU
 ```
 
 ## Run
@@ -56,6 +58,24 @@ MULTIHOP_PAD_CHARS=20000 ./run_pipeline.sh           # multi-hop docs padded wit
 python scripts/compare_runs.py --primary-reader Qwen--Qwen3-8B --out-dir results/compare \
   --run random=runs/main/results/eval_test/report.json --run hard=runs/main_distractors-hard/results/eval_test/report.json
 ```
+
+### Follow-up to the full run (2026-09-30)
+
+The per-document analysis of the full run (METHOD_SPEC.md §9) found that paragraph selection, not the labels,
+limits multi-hop F1 at 8x, that `oracle_beta`'s single-hop lead exists only on its labeling reader, and that
+the single-hop sources are saturated at 4x / 8x. `scripts/followup.sh` runs the experiments that follow from
+it on the existing `RUN_ROOT`, each resumable, cheapest first:
+
+```bash
+bash scripts/followup.sh                 # bench arms oracle units hard compare
+bash scripts/followup.sh bench arms      # or some of them
+```
+
+`bench`: selection latency one arm at a time (`STAGES=bench`); `arms`: `sent+` / `fill+` arms, LLMLingua with a
+token target, 16x / 32x on single-hop (`FOLLOWUP_ARMS=1 EXTRA_RATIOS_SINGLE=16,32`); `oracle`: `ORACLE_N=500`;
+`units`: `MULTIHOP_UNITS=sentence` ablation; `hard`: `DISTRACTORS=hard` ablation. The confirmatory families stay
+on the pre-registered 4x / 8x (`CONFIRM_RATIOS`); the report's first version is kept as `first_report.*`, and
+`report.md` gains exploratory diagnostics (answer coverage, bridge effect, selection overlap, oracle gap by reader).
 
 ### The whole campaign as one job
 

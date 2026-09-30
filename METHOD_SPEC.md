@@ -213,6 +213,14 @@ length not controllable), CORE-RAG (no released checkpoint), Selective Context (
 Selections are computed once and answered by every reader (fixed compressor ⇒ upgrade retention is
 meaningful).
 
+Exploratory arms added after the full run (2026-09-30, §9; outside every confirmatory family):
+`sent+<chunk arm>` scores sentences with a chunk scorer (the pruner, the reranker, …; each sentence with its
+paragraph title, in one pass for the pruner) and selects them like the sentence arms; `fill+<chunk arm>`
+keeps whole chunks by the chunk scores, then fills the budget left over with the best sentences of the chunks
+left out. `llmlingua_tt` / `longllmlingua_tt` ask LLMLingua / LongLLMLingua for the budget in tokens
+(`target_token`) instead of a rate. `EXTRA_RATIOS_SINGLE` (e.g. 16, 32) adds ratios on the single-hop
+sources only; the confirmatory families stay on `CONFIRM_RATIOS` = 4, 8.
+
 Reported per reader × source × ratio × arm: token F1, EM, answer recall, gold-chunk recall, realized
 compression, selection latency; cluster-bootstrap CIs (cluster = article for UIT, passage for XQuAD);
 paired Δ F1 of our arms vs every other arm with CI, raw p, BH q and Holm p (the whole paired table is
@@ -229,6 +237,7 @@ gold recall by needle-depth quintile for single-hop.
 | 1 reader vs ensemble | `ours_beta` vs `ours_ens`, incl. held-out reader |
 | single- vs multi-hop | per-source tables |
 | hard vs easy distractors | `DISTRACTORS=hard` / `MULTIHOP_PAD_CHARS=<n>` (label and eval time, own suffixed dirs; only the sources an ablation changes are re-measured, the others' raw labels are read from the main run); `scripts/compare_runs.py`. `xquad_vi` has no titles, so `hard` equals `random` there |
+| selection unit | `sent+` / `fill+` arms on the main documents (no retraining); `MULTIHOP_UNITS=sentence`: multi-hop documents with one chunk per sentence (supporting-fact sentences as gold) for labels, pruners and evaluation, own suffixed dirs |
 | training seed | `EXTRA_SEEDS` (default 1 2): `ours_beta_s<k>`, `ours_ens_s<k>`; per-hypothesis "every seed agrees" count, seed SD table |
 | label cost | `seconds` per record, reader calls = Σ(K+1) |
 
@@ -265,6 +274,36 @@ five runs + 2 × `EXTRA_SEEDS` seed reruns (nine by default), one GPU each, a fe
    `paper/references.bib` entries are marked TODO.
 
 ## 9. Known gaps / to verify (cluster, before submission)
+
+**Status 2026-09-30, after the full run** (code `d936896` + 2 patches; `reports/RUN_REPORT_2026-09-30_full_h100x4.md`;
+eval data on the HF dataset `thanthienhai/ttcompress-main-eval`). Families: H1 74/120 (every seed agrees),
+H1-oracle 0/10, H2a 1/12, H2b 1/4, H3 0/28, H3-heldout 0/28. The per-document analysis of the selections found:
+
+- **Paragraph selection is the multi-hop bottleneck, not the labels.** Given the answer string in the compressed
+  context, the primary reader's F1 is 0.68–0.76 for every arm; arms differ in how often they keep it. At 8x every
+  gold paragraph fits the budget in 28 % (HotpotQA), 51 % (VIMQA), 2.4 % (2Wiki) of the documents; EXIT touches
+  ~3 paragraphs at 8x against ~1.7 for chunk arms. Keeping every gold paragraph still adds +0.06–0.33 F1 when
+  the answer paragraph is kept (bridges matter). β itself ranks an answer chunk first in ~90 % of train
+  documents; β refit on sparse masks only (the 8x regime) does worse, so the labels are not the fix.
+  → `sent+` / `fill+` arms, `MULTIHOP_UNITS=sentence`.
+- **H1-oracle mixes a distillation gap with over-fitting to the labeling reader.** On single-hop,
+  `oracle_beta`'s lead over `ours_beta` (UIT 4x: +0.083 on Qwen3-8B) vanishes on the other three readers
+  (−0.008 to +0.002); on multi-hop it stays on every reader (+0.04–0.12). → the report's "oracle gap by reader"
+  table, `ORACLE_N=500`.
+- **H3 cannot be detected**: `ours_ens` and `ours_beta` keep sets overlapping as much as `ours_beta` and its own
+  seed rerun (Jaccard 0.67–0.86 on multi-hop); the full-context reader gaps (0.05–0.38) are not the problem.
+  `ours_beta` already transfers to the held-out Qwen3-32B.
+- **Single-hop is saturated at 4x / 8x** (every chunk arm keeps the needle). → `EXTRA_RATIOS_SINGLE=16,32`,
+  `DISTRACTORS=hard`.
+- **Latency**: the select stage's `ours_beta` time (36–76 ms/doc) is ~3x its identical seed reruns (12–50) at every
+  document: shard / GPU contention. → `STAGES=bench` (one arm at a time, one GPU).
+- **Fairness**: LLMLingua / LongLLMLingua were cut to the budget on 17–51 % of the multi-hop documents at 8x.
+  → `llmlingua_tt` / `longllmlingua_tt`.
+
+All of it runs with `scripts/followup.sh` (README). Still to confirm there: the published arms' behaviour on the
+sentence-unit documents is not evaluated (they are compared on the paragraph documents, by doc_id).
+
+Before the full run:
 
 Status 2026-09-29. What ran on the cluster so far: the pilot (2026-09-26, vLLM 0.26, 4×H100) and the smoke
 test (2026-09-28, commit `80975e9`, vLLM 0.28, 2×H100), every stage, **without** the published compressors

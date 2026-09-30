@@ -36,6 +36,11 @@ MAX_NEW_TOKENS = {'single': 64, 'multi': 48}
 # bumped whenever prompts, answer cleaning or budgets change; generate_labels.py measure records it, so a
 # label dir is never extended with answers produced differently
 PROMPT_VERSION = 2
+# base (non-chat) readers only, recorded in their label dirs as `base_prompt_version` (so the chat readers' dirs keep
+# their config): v2 ends the prompt with a newline -- after '### Đáp án:' Llama-SEA-LION-v3-8B emitted
+# <|end_of_text|> as its first token on 59-76% of the Vietnamese documents (full-run labels, 2026-09-29), while
+# after '### Đáp án:\n' it answers (VIMQA F1 0.19 -> 0.66, UIT-ViQuAD 0.31 -> 0.62 on a train sample)
+BASE_PROMPT_VERSION = 2
 _THINK_RE = re.compile(r'<think>.*?</think>', flags=re.DOTALL)
 
 
@@ -62,6 +67,7 @@ def resolve_device(device: str) -> str:
 # A base (non-chat) reader has no end-of-turn: after the answer it keeps writing the prompt's pattern
 # ("### Câu hỏi: ..."). Its answer is the text up to the first of these markers.
 BASE_STOP = ('\n', '###')
+BASE_STOP_GENERATE = ['###', '\n\n']   # stop strings for generation; clean_answer then keeps the first line
 
 
 def clean_answer(text: Optional[str], first_line: bool = False) -> str:
@@ -109,15 +115,15 @@ class Reader:
             except TypeError:
                 return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         # base model: plain completion prompt; the BOS token is added here because prompts are
-        # tokenized with add_special_tokens=False (chat templates already carry it). No trailing space: a
-        # Llama-3 tokenizer would end the prompt on a bare ' ' token the model never saw before an answer;
-        # the answer's own leading space belongs to its first token (see answer_target)
-        return (tok.bos_token or '') + user
+        # tokenized with add_special_tokens=False (chat templates already carry it). It ends with a newline
+        # (BASE_PROMPT_VERSION 2): the answer goes on the next line, as in the few-shot pattern the model writes
+        # itself ("### Đáp án:\n<answer>"); without it SEA-LION ended most Vietnamese prompts at once
+        return (tok.bos_token or '') + user + '\n'
 
     def answer_target(self, answer: str) -> List[int]:
         """Token ids of the gold answer as the model would continue the prompt: a base model writes
-        ' <answer>' after '...Answer:', a chat model starts a fresh assistant turn."""
-        text = answer if self.is_chat else ' ' + answer
+        '<answer>' on the line after '...Answer:', a chat model starts a fresh assistant turn."""
+        text = answer
         return self.tokenizer.encode(text, add_special_tokens=False) or [self.tokenizer.eos_token_id]
 
     def count_tokens(self, text: str) -> int:
@@ -254,7 +260,7 @@ class VLLMReader(Reader):
         from vllm.inputs import TokensPrompt
         # a base reader stops at the next prompt section; clean_answer then keeps its first line
         params = SamplingParams(temperature=0.0, max_tokens=max_new_tokens,
-                                stop=None if self.is_chat else ["###"])
+                                stop=None if self.is_chat else BASE_STOP_GENERATE)
         batch = [TokensPrompt(prompt_token_ids=self._fit(p, max_new_tokens)) for p in prompts]
         outs = self.llm.generate(batch, params, use_tqdm=False)
         return [clean_answer(o.outputs[0].text, first_line=not self.is_chat) for o in outs]
@@ -275,6 +281,12 @@ class VLLMReader(Reader):
             lps = [o.prompt_logprobs[start + j][tok].logprob for j, tok in enumerate(ans)]
             result.append(sum(lps) / len(lps))
         return result
+
+
+def reader_is_chat(model_name: str) -> bool:
+    """Whether `model_name` is read as a chat model (it has a chat template), without loading its weights."""
+    from transformers import AutoTokenizer
+    return bool(getattr(AutoTokenizer.from_pretrained(model_name, trust_remote_code=True), 'chat_template', None))
 
 
 def load_reader(model_name: str, backend: str = 'hf', device: str = 'cuda', dtype: str = 'bfloat16',

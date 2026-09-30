@@ -123,3 +123,33 @@ def test_xquad_vi_has_no_train_and_is_disjoint_by_passage():
     dev = load_documents('xquad_vi', 'dev', haystack_chars=3000)
     test = load_documents('xquad_vi', 'test', n=50, haystack_chars=3000)
     assert not {d.cluster_id for d in dev} & {d.cluster_id for d in test}
+
+
+def test_multihop_sentence_units():
+    doc = multihop_row_to_doc(_row(), 'hotpotqa', 'dev', units='sentence')
+    assert doc.chunks == ['A\ns1.', 'A\ns2.', 'B\nt1.', 'C\nu1.']
+    assert doc.metadata['para'] == [0, 0, 1, 2] and doc.metadata['units'] == 'sentence'
+    assert doc.gold_chunks == [0, 3]                  # the supporting sentences (A, 0) and (C, 0)
+    # written as paragraphs: the title once, the kept sentences of that paragraph after it
+    para = multihop_row_to_doc(_row(), 'hotpotqa', 'dev')
+    assert doc.text() == para.text() == 'A\ns1. s2.\n\nB\nt1.\n\nC\nu1.'
+    assert doc.text([1, 3]) == 'A\ns2.\n\nC\nu1.'
+    # the same rows exist in both units; a sent_id out of range falls back to the whole supporting paragraph
+    row = _row()
+    row['supporting_facts'] = {'title': ['A', 'C'], 'sent_id': [7, 0]}
+    assert multihop_row_to_doc(row, 'hotpotqa', 'dev', units='sentence').gold_chunks == [0, 1, 3]
+    assert multihop_row_to_doc(_row(answer='yes'), 'hotpotqa', 'dev', units='sentence') is None
+    with pytest.raises(ValueError):
+        multihop_row_to_doc(_row(), 'hotpotqa', 'dev', units='word')
+
+
+def test_sentence_unit_selection_writes_each_title_once(fake_tokenizer):
+    from ttcompress.selection import select_by_scores, select_sentences, sentence_units
+    count = lambda t: len(fake_tokenizer.encode(t))  # noqa: E731
+    doc = multihop_row_to_doc(_row(), 'hotpotqa', 'dev', units='sentence')
+    lengths = [count(c) for c in doc.chunks]
+    sel = select_by_scores(doc, [0.9, 0.8, 0.0, 0.7], lengths, budget=20, tokenizer=fake_tokenizer)
+    assert sel.kept == [0, 1, 2, 3] and sel.text == doc.text()
+    units = sentence_units(doc)                       # one unit per sentence chunk
+    sel = select_sentences(doc, units, [0.9, 0.8, 0.0, 0.7], count, 20, fake_tokenizer)
+    assert sel.text.count('A\n') == 1 and sel.text.startswith('A\ns1. s2.')
