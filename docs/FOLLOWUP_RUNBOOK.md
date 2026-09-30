@@ -9,14 +9,7 @@ Mọi lệnh chạy lại được: selections, câu trả lời và nhãn đã 
 
 ## Bước 0: đưa code mới lên cluster (~5 phút)
 
-Ở máy local: commit và push các thay đổi follow-up.
-
-```bash
-git checkout -b followup-2026-09-30
-git add -A ttcompress evaluate.py generate_labels.py run_pipeline.sh scripts tests paper METHOD_SPEC.md README.md TODO.md docs/FOLLOWUP_RUNBOOK.md
-git commit -m "Follow-up: sentence/fill arms, extra single-hop ratios, sentence units, bench, diagnostics"
-git push -u origin followup-2026-09-30
-```
+Code follow-up đã nằm trên `main` (commit `893673b` và các commit sau) và đã push lên `origin`.
 
 Trên cluster: dùng đúng thư mục code của bản full, để giữ nguyên `.env`, `.baseline_site` và `.llmlingua_site`.
 
@@ -24,7 +17,8 @@ Trên cluster: dùng đúng thư mục code của bản full, để giữ nguyê
 cd /mnt/hps/anhm-paper/ttcompress_new
 git diff > /mnt/hps/anhm-paper/cluster_d936896_local.patch   # lưu patch XProvence + defusedxml để gộp sau
 git stash push -m "full-run local patches (d936896)"
-git fetch origin && git checkout followup-2026-09-30
+git fetch origin && git checkout main && git pull --ff-only origin main
+git log --oneline -1                                          # phải là commit follow-up mới nhất
 ```
 
 `.env` phải giữ nguyên, vì nó trỏ `LABELS` tới `runs/labels_v2`. Thiếu nó, pipeline sẽ tìm nhãn ở `runs/main/labels`
