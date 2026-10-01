@@ -104,18 +104,33 @@ pruner) và LLMLingua theo số token (`*_tt`, nằm trong bước `arms`). Riê
 
 # Đợt 2: củng cố kết quả chấm điểm theo câu (không train lại)
 
-Mục tiêu: biến kết quả khám phá của đợt 1 (`ours_sent` ngang hoặc vượt EXIT) thành bằng chứng dùng được trong paper.
-Bốn việc, thứ tự chạy dưới đây. Không việc nào nạp XProvence, nên chạy được khi patch XProvence chưa gộp. Nếu job
-ablation `units` / `hard` đang chiếm GPU, chờ nó xong hoặc chạy trên một pod khác cùng HPS.
+Mục tiêu: biến kết quả khám phá của đợt 1 (`ours_sent` ngang hoặc vượt EXIT) thành bằng chứng dùng được trong paper,
+và kiểm định các họ R4–R7 đăng ký thêm ngày 2026-10-01 (`docs/PREREG_SENTENCE_REPLICATION.md` §9). Năm việc, thứ tự
+chạy dưới đây. Không việc nào bắt buộc nạp XProvence (R4b là tùy chọn, xem Bước 2.3). Nếu job ablation `hard` đang
+chiếm GPU, chờ nó xong hoặc chạy trên một pod khác cùng HPS.
 
-Tổng ước tính trên 4×H100: khoảng 3 giờ.
+Tổng ước tính trên 4×H100: khoảng 5 giờ (Bước 2.1b train một pruner trên một GPU, ~1.5 giờ).
 
 ## Bước 2.0: lấy code mới
 
+**Nếu job `abl_hard` đang chạy từ `ttcompress_new`, đừng `git pull` trong thư mục đó**: bash đọc `run_pipeline.sh`
+dần trong lúc chạy, nên đổi file giữa chừng có thể làm hỏng job. Khi đó dùng một thư mục code riêng (cách 2).
+
 ```bash
+# cách 1: không job nào đang chạy từ ttcompress_new
 cd /mnt/hps/anhm-paper/ttcompress_new
 git fetch origin && git checkout main && git pull --ff-only origin main
-git log --oneline -3          # phải có commit đăng ký trước docs/PREREG_SENTENCE_REPLICATION.md
+
+# cách 2: abl_hard đang chạy từ ttcompress_new -> thư mục code riêng, dùng chung .env và các site baseline
+cd /mnt/hps/anhm-paper/ttcompress_new && git fetch origin
+git worktree add /mnt/hps/anhm-paper/ttcompress_r2 origin/main
+cp .env /mnt/hps/anhm-paper/ttcompress_r2/
+ln -s "$PWD/.baseline_site" /mnt/hps/anhm-paper/ttcompress_r2/.baseline_site
+ln -s "$PWD/.llmlingua_site" /mnt/hps/anhm-paper/ttcompress_r2/.llmlingua_site
+cd /mnt/hps/anhm-paper/ttcompress_r2
+
+grep -E '^(RUN_ROOT|LABELS)=' .env   # cách 2 cần đường dẫn tuyệt đối (/mnt/hps/...), không phải tương đối
+git log --oneline -3          # phải có commit phụ lục đăng ký trước R4-R7 (2026-10-01)
 M=/mnt/hps/anhm-paper/ttscompress/runs/main/models
 R=/mnt/hps/anhm-paper/ttscompress/runs/main
 ```
@@ -131,14 +146,26 @@ BENCH_ARMS="ours_beta=pruner:$M/pruner_beta_primary,ours_sent=sent+pruner:$M/pru
 `ours_beta` và `reranker` được đo lại cùng lượt làm mốc so sánh. `BENCH_OUT` giữ nguyên file `bench_latency.json` của
 đợt 1.
 
-## Bước 2.2: ba reader còn lại và các seed của `ours_sent` trên tài liệu chính (~1–1.5 giờ)
+## Bước 2.1b: train bộ tỉa đối chứng `pruner_span_ans` (~1.5 giờ, một GPU)
 
 ```bash
-FOLLOWUP_ARMS=1 EXTRA_RATIOS_SINGLE=16,32 EXTRA_ARMS= STAGES="select answer" bash run_pipeline.sh
-REPORT_OURS=ours_beta,ours_ens,ours_fill,ours_sent STAGES=report bash run_pipeline.sh
+ROUND2_ARMS=1 STAGES=train bash run_pipeline.sh
+ls $M/pruner_span_ans/pruner_config.json && tail -n 2 $R/logs/train_pruner_span_ans.log
 ```
 
-- `select` chỉ tạo các nhánh mới `ours_sent_s1`, `ours_sent_s2` (mọi thứ khác đã có trên đĩa).
+- Nhãn 1 cho đoạn chứa chuỗi đáp án, cùng tài liệu huấn luyện với `pruner_beta_primary`; không dùng câu hỗ trợ ở bước
+  nào. Các pruner khác đã có `train_log.json` nên được bỏ qua.
+- Dòng đầu của log ghi số tài liệu train / dev (bản `pruner_span` của lần chạy chính: 9000 / 900).
+
+## Bước 2.2: ba reader còn lại và các seed của `ours_sent` trên tài liệu chính (~1.5–2 giờ)
+
+```bash
+FOLLOWUP_ARMS=1 ROUND2_ARMS=1 EXTRA_RATIOS_SINGLE=16,32 EXTRA_ARMS= STAGES="select answer" bash run_pipeline.sh
+REPORT_OURS=ours_beta,ours_ens,ours_fill,ours_sent,fuse_sent STAGES=report bash run_pipeline.sh
+```
+
+- `select` chỉ tạo các nhánh mới `ours_sent_s1`, `ours_sent_s2`, và (nhờ `ROUND2_ARMS=1`) `span_ans`, `span_ans_sent`,
+  `fuse_sent`; mọi thứ khác đã có trên đĩa. Trên 500 tài liệu này các nhánh mới chỉ là mô tả.
 - `answer` chạy với danh sách reader mặc định: Qwen3-8B trả lời các nhánh seed mới; Qwen3-1.7B, SEA-LION và
   Qwen3-32B trả lời mọi nhánh của đợt 1 (`*_sent`, `*_fill`, 16×/32×) và các nhánh seed.
 - Cần xem: bảng Qwen3-32B của các nguồn nhiều bước (`ours_sent` so với `exit`), và bảng "Training-seed variation"
@@ -154,19 +181,29 @@ sửa, ghi ở mục 8 của file `.md`).
 ARMS_REPL="full,ours_beta=pruner:@MODELS@/pruner_beta_primary,ours_sent=sent+pruner:@MODELS@/pruner_beta_primary"
 ARMS_REPL="$ARMS_REPL,ours_sent_s1=sent+pruner:@MODELS@/pruner_beta_primary_s1,ours_sent_s2=sent+pruner:@MODELS@/pruner_beta_primary_s2"
 ARMS_REPL="$ARMS_REPL,reranker_sent=sent+reranker:@BACKBONE@,span_sent=sent+pruner:@MODELS@/pruner_span,exit"
+# R4-R7 (phụ lục 2026-10-01)
+ARMS_REPL="$ARMS_REPL,ours_beta_s1=pruner:@MODELS@/pruner_beta_primary_s1,ours_beta_s2=pruner:@MODELS@/pruner_beta_primary_s2"
+ARMS_REPL="$ARMS_REPL,reranker=reranker:@BACKBONE@,span_ans_sent=sent+pruner:@MODELS@/pruner_span_ans"
+ARMS_REPL="$ARMS_REPL,fuse_sent=sent+rrf:pruner:@MODELS@/pruner_beta_primary|pruner:@MODELS@/pruner_span"
+EXTRA_REPL=exit
+# R4b, TÙY CHỌN: chỉ khi bản sửa XProvence cho transformers 5.x đã nằm trong repo (hiện chưa có). Không thì để nguyên
+# hai dòng comment, R4b ghi "not run". Quyết định trước khi chạy, không đổi sau khi thấy kết quả.
+# ARMS_REPL="$ARMS_REPL,xprovence=provence:naver/xprovence-reranker-bgem3-v1"
+# EXTRA_REPL="exit,xprovence=provence:naver/xprovence-reranker-bgem3-v1"
 
 EVAL_DIR=$R/results/eval_replication EVAL_SOURCES=vimqa,hotpotqa,2wiki EVAL_N=2000 EVAL_OFFSET=500 ORACLE_N=0 \
-  EXTRA_ARMS=exit FOLLOWUP_ARMS=0 EXTRA_RATIOS_SINGLE= ONLY_ARMS="$ARMS_REPL" \
+  EXTRA_ARMS="$EXTRA_REPL" FOLLOWUP_ARMS=0 EXTRA_RATIOS_SINGLE= ONLY_ARMS="$ARMS_REPL" \
   STAGES="select answer" bash run_pipeline.sh
 EVAL_DIR=$R/results/eval_replication PREREG_FILE=docs/prereg_sentence_replication.json \
-  REPORT_OURS=ours_sent,ours_beta STAGES=report bash run_pipeline.sh
+  REPORT_OURS=ours_sent,ours_beta,fuse_sent STAGES=report bash run_pipeline.sh
 ```
 
 - `EVAL_N=2000 EVAL_OFFSET=500`: mỗi nguồn lấy các tài liệu xếp hạng 501–2500, không tài liệu nào trùng 500 tài liệu
   của lần chạy chính (VIMQA chỉ còn 199). Thư mục riêng `results/eval_replication`, nên không đụng tới kết quả cũ.
 - `EXTRA_ARMS=exit` chỉ để pipeline kiểm tra gói của EXIT (peft); danh sách nhánh do `ONLY_ARMS` quyết định.
-- Cần xem: mục "Pre-registered families" đầu `results/eval_replication/report.md` (R1, R2, R3, kèm cột "every seed
-  agrees").
+- Các nhánh chọn theo đoạn (`ours_beta*`, `reranker`) chạy ở cả 4× và 8× (`RATIOS=4,8` trong `.env`); R4 kiểm cả hai.
+- Cần xem: mục "Pre-registered families" đầu `results/eval_replication/report.md` (R1–R7, kèm cột "every seed
+  agrees"). Dòng ghi chú phải có "Amended 2026-10-01"; nếu không, báo cáo đang đọc bản đăng ký cũ.
 
 ## Gửi kết quả về
 
@@ -176,4 +213,9 @@ huggingface-cli upload thanthienhai/ttcompress-main-eval $R/results/eval_test/re
 huggingface-cli upload thanthienhai/ttcompress-main-eval $R/results/eval_test/report.md followup2/report.md --repo-type dataset
 huggingface-cli upload thanthienhai/ttcompress-main-eval $R/results/eval_replication/report.json followup2/replication/report.json --repo-type dataset
 huggingface-cli upload thanthienhai/ttcompress-main-eval $R/results/eval_replication/report.md followup2/replication/report.md --repo-type dataset
+huggingface-cli upload thanthienhai/ttcompress-main-eval $M/pruner_span_ans/train_log.json followup2/train_log_pruner_span_ans.json --repo-type dataset
+huggingface-cli upload thanthienhai/ttcompress-main-eval $R/logs/train_pruner_span_ans.log followup2/train_pruner_span_ans.log --repo-type dataset
 ```
+
+Nên gửi thêm, để kiểm định ghép cặp theo `doc_id` giữa các lần chạy: `answers_*.jsonl` của `eval_replication`, và
+`report.json` cùng `answers_*.jsonl` của ablation `units` (hiện trên HF mới có `abl_units_report.md`).

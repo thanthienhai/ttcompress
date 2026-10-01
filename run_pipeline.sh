@@ -82,6 +82,11 @@ EXTRA_RATIOS_SINGLE=${EXTRA_RATIOS_SINGLE:-}
 # ours_beta, span_sup and the reranker scoring sentences (sent+) and filling the budget paragraphs leave with
 # sentences (fill+), and LLMLingua / LongLLMLingua asked for the budget in tokens (_tt) when EXTRA_ARMS runs them.
 FOLLOWUP_ARMS=${FOLLOWUP_ARMS:-0}
+# ROUND2_ARMS=1: the arms of the second follow-up round (docs/PREREG_SENTENCE_REPLICATION.md §9; exploratory on
+# the main test set, pre-registered on the replication documents) -- `train` adds pruner_span_ans (binary "chunk
+# contains the answer string" label: an annotation-free control), `select` adds span_ans, span_ans_sent and
+# fuse_sent (rank fusion of ours_beta and span_sup scoring sentences).
+ROUND2_ARMS=${ROUND2_ARMS:-0}
 # A replication on documents no earlier result has seen (docs/PREREG_*.md): EVAL_N documents per source after
 # skipping the first EVAL_OFFSET (hash order; the main test set is the first N_TEST), into its own EVAL_DIR.
 # N_TEST itself stays the run's (run_config.txt). ONLY_ARMS replaces the arm list of `select` (full specs);
@@ -541,6 +546,8 @@ if has_stage train; then
   for seed in $EXTRA_SEEDS; do  # name | source | reader | target | extra | seed
     RUNS+=("pruner_beta_primary_s$seed|beta|$PRIMARY|f1||$seed" "pruner_beta_ensemble_s$seed|ensemble|ensemble|f1||$seed")
   done
+  # same fit dirs (documents) as pruner_beta_primary; the label itself never reads the reader
+  [[ "$ROUND2_ARMS" == 1 ]] && RUNS+=("pruner_span_ans|answer|$PRIMARY|f1|")
   # one run per GPU; the next run starts as soon as any GPU frees (9 runs on 4 GPUs: no 1-GPU last wave)
   pool_start "$NUM_GPUS"
   for run in "${RUNS[@]}"; do
@@ -578,6 +585,10 @@ if has_stage select; then
     has_arm llmlingua && ARMS="$ARMS,llmlingua_tt"
     has_arm longllmlingua && ARMS="$ARMS,longllmlingua_tt"
   fi
+  if [[ "$ROUND2_ARMS" == 1 ]]; then
+    ARMS="$ARMS,span_ans=pruner:$MODELS/pruner_span_ans,span_ans_sent=sent+pruner:$MODELS/pruner_span_ans"
+    ARMS="$ARMS,fuse_sent=sent+rrf:pruner:$MODELS/pruner_beta_primary|pruner:$MODELS/pruner_span"
+  fi
   oracle_flags=()
   if (( ORACLE_N > 0 )); then
     oracle_dirs=""
@@ -597,7 +608,7 @@ if has_stage select; then
   doc_set_flags=(--n "${EVAL_N:-$N_TEST}")
   (( EVAL_OFFSET > 0 )) && doc_set_flags+=(--offset "$EVAL_OFFSET")
   # our checkpoints must exist before 4 shards start (e.g. STAGES="select ..." after a failed train)
-  for ckpt in $(echo "$ARMS" | tr ',' '\n' | sed -nE 's/^([^=]*=)?((sent|fill)\+)?pruner:(.+)$/\4/p'); do
+  for ckpt in $(echo "$ARMS" | grep -oE 'pruner:[^|,]+' | sed 's/^pruner://'); do   # also inside rrf:a|b
     if [[ "$ckpt" == "$MODELS"/* && ! -f "$ckpt/pruner_config.json" ]]; then
       echo "!! $ckpt is not a finished pruner checkpoint; run the train stage first (logs: $LOGS/train_*.log)"; exit 1
     fi

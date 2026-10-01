@@ -12,6 +12,8 @@ def test_parse_arms_labels_and_prefixes():
         ('lead', 'lead'), ('beta', 'pruner:C:/m/x'), ('pruner:models/y', 'pruner:models/y')]
     assert parse_arms('reranker=reranker:BAAI/x,reranker:a=b') == [
         ('reranker', 'reranker:BAAI/x'), ('reranker:a=b', 'reranker:a=b')]
+    assert parse_arms('fuse=sent+rrf:pruner:m/a|pruner:m/b,rrf:bm25|reranker') == [
+        ('fuse', 'sent+rrf:pruner:m/a|pruner:m/b'), ('rrf:bm25|reranker', 'rrf:bm25|reranker')]
 
 
 def _row(reader, arm, ratio, doc, f1, cluster):
@@ -360,3 +362,28 @@ def test_report_preregistered_families_with_seed_check(tmp_path):
     assert report['hypotheses'][0]['n_tests'] == 0                             # confirmatory families untouched
     md = (tmp_path / 'report.md').read_text(encoding='utf-8')
     assert '## Pre-registered families: test prereg' in md and 'Fixed 2026-09-30' in md
+
+
+def test_registered_replication_file_reads_and_reports_absent_arms_as_not_run(tmp_path):
+    """docs/prereg_sentence_replication.json as committed: every family parses, R1-R3 come first and unchanged
+    in name, and a family whose arm was not run (R4b without xprovence) has no tests instead of failing."""
+    rows = []
+    for i in range(40):
+        for ratio in (4.0, 8.0):
+            for arm, f1 in (('ours_beta', 0.7), ('reranker', 0.5), ('ours_sent', 0.7), ('exit', 0.6),
+                            ('reranker_sent', 0.5), ('span_sent', 0.69), ('span_ans_sent', 0.5), ('fuse_sent', 0.8)):
+                rows.append(_hrow('Qwen--Qwen3-8B', arm, ratio, i, f1 + 0.01 * (i % 3), 'hotpotqa'))
+    with open(tmp_path / 'answers_Qwen--Qwen3-8B_shard0.jsonl', 'w', encoding='utf-8') as f:
+        f.writelines(json.dumps(r) + '\n' for r in rows)
+    res = subprocess.run([sys.executable, 'evaluate.py', 'report', '--out-dir', str(tmp_path), '--ours', 'ours_sent',
+                          '--n-boot', '200', '--prereg', 'docs/prereg_sentence_replication.json', '--no-diagnostics'],
+                         capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    report = json.loads((tmp_path / 'report.json').read_text(encoding='utf-8'))
+    fam = {f['name']: f for f in report['prereg']['families']}
+    assert list(fam)[:3] == ['R1', 'R2', 'R3'] and report['prereg']['amended']
+    assert fam['R4']['n_tests'] == 2 and fam['R4']['n_supported'] == 2          # hotpotqa at 4x and 8x
+    assert fam['R4b']['n_tests'] == 0                                           # xprovence not run
+    assert fam['R5']['n_supported'] == 1 and fam['R7']['n_supported'] == 1
+    assert fam['R6']['kind'] == 'noninferiority' and fam['R6']['n_supported'] == 1
+    assert 'Amended 2026-10-01' in (tmp_path / 'report.md').read_text(encoding='utf-8')

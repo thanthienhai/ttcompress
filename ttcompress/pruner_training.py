@@ -5,6 +5,10 @@ Label sources (what the pruner is supervised on), chosen per run:
   ensemble  mean z-score over several readers (reader-agnostic label, RQ3)
   span      binary gold-chunk label (needle / supporting facts): the
             answer-span-supervised pruner the utility label must beat (RQ2)
+  answer    binary "chunk contains the answer string" label (the same test
+            as oracle_span): an annotation-free control -- unlike span, it
+            reads no supporting-fact annotation, in training or in model
+            selection (docs/PREREG_SENTENCE_REPLICATION.md §9)
 
 Losses:
   listnet   cross-entropy between softmax(target / tau) and softmax(scores)
@@ -13,7 +17,7 @@ Losses:
   mse       regression on the z-score (keeps score scale meaningful; used
             as an auxiliary term, weight w_mse)
   bce       binary cross-entropy on the span label
-Default: listnet + 0.5 * mse for beta/ensemble, bce for span.
+Default: listnet + 0.5 * mse for beta/ensemble, bce for span and answer.
 
 Reductions: listnet SUMS over the C chunks (a cross-entropy between two
 distributions, Cao et al. 2007); mse is the MEAN over chunks (the paper
@@ -42,6 +46,9 @@ import torch.nn.functional as F
 
 from .attribution import ChunkLabels, load_chunk_labels, position_bin, record_paths
 from .metrics import ndcg_at_k, spearman
+from .sources import contains_answer
+
+BINARY_SOURCES = ('span', 'answer')   # BCE on a 0/1 chunk label, model selection on its recall
 
 
 @dataclass
@@ -50,8 +57,8 @@ class TrainExample:
     source: str
     question: str
     chunks: List[str]
-    target: List[float]        # z-label (beta/ensemble) or 0/1 (span)
-    gold: List[int]
+    target: List[float]        # z-label (beta/ensemble) or 0/1 (span, answer)
+    gold: List[int]            # chunks the dev recall counts: answer-string chunks for `answer`, else gold_chunks
     beta_z: Optional[List[float]] = None   # kept for dev metrics even when training on span
 
 
@@ -70,21 +77,30 @@ def make_examples(labels: Sequence[ChunkLabels], label_source: str,
     """Uninformative documents (outcome never varied) are dropped: a constant
     label carries no ranking signal. Also for span, whose label does not need
     the reader: the RQ2 control must train on exactly pruner_beta_primary's
-    documents (it reads the same fit dirs), so only the label type differs."""
+    documents (it reads the same fit dirs), so only the label type differs.
+    `answer` also drops the documents where no chunk contains the answer
+    string (no positive chunk), and its `gold` is the answer-string chunks,
+    so no supporting-fact annotation reaches its model selection either."""
     out = []
     for lab in labels:
         if not lab.informative:
             continue
         doc = lab.doc
         C = len(doc['chunks'])
+        gold = list(doc['gold_chunks'])
         if label_source == 'span':
-            target = [1.0 if i in set(doc['gold_chunks']) else 0.0 for i in range(C)]
+            target = [1.0 if i in set(gold) else 0.0 for i in range(C)]
+        elif label_source == 'answer':
+            gold = [i for i, c in enumerate(doc['chunks']) if contains_answer(c, doc['answers'])]
+            if not gold:
+                continue
+            target = [1.0 if i in set(gold) else 0.0 for i in range(C)]
         else:
             target = list(lab.z)
             if position_prior is not None:
                 target = [z - position_prior[position_bin(i, C, len(position_prior))] for i, z in enumerate(target)]
         out.append(TrainExample(doc['doc_id'], doc['source'], doc['question'], doc['chunks'], target,
-                                list(doc['gold_chunks']), list(lab.z)))
+                                gold, list(lab.z)))
     return out
 
 
@@ -101,7 +117,7 @@ def example_loss(scores: torch.Tensor, ex: TrainExample, label_source: str, tau:
                  parts: Optional[Dict[str, float]] = None) -> torch.Tensor:
     """`parts`, if given, receives the unweighted component values (for logging)."""
     target = torch.tensor(ex.target, dtype=scores.dtype, device=scores.device)
-    if label_source == 'span':
+    if label_source in BINARY_SOURCES:
         pos = target.sum().clamp_min(1.0)
         pos_weight = ((len(target) - pos) / pos).clamp_min(1.0)  # few gold chunks among many
         loss = F.binary_cross_entropy_with_logits(scores, target, pos_weight=pos_weight)

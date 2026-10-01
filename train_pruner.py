@@ -10,6 +10,9 @@
     # answer-span-supervised control (same docs, same backbone, binary gold label)
     python train_pruner.py --label-source span --train-labels ... --dev-labels ... --out-dir models/pruner_span
 
+    # annotation-free control: binary "chunk contains the answer string" label, no supporting facts
+    python train_pruner.py --label-source answer --train-labels ... --dev-labels ... --out-dir models/pruner_span_ans
+
 Model selection is reader-free: after each epoch the pruner ranks the dev
 documents' chunks and is scored against the dev labels (--select-metric);
 the best epoch is kept. No test data and no reader calls are involved.
@@ -32,7 +35,8 @@ from ttcompress.pruner import (
     DEFAULT_BACKBONE, ChunkPruner, compact_windows, document_scores, effective_max_len, pack_windows,
 )
 from ttcompress.pruner_training import (
-    accumulation_group_size, example_loss, load_label_dirs, make_examples, mean_metrics, ranking_metrics,
+    BINARY_SOURCES, accumulation_group_size, example_loss, load_label_dirs, make_examples, mean_metrics,
+    ranking_metrics,
 )
 from ttcompress.reader import resolve_device
 
@@ -55,7 +59,7 @@ def main():
     except AttributeError:
         pass
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--label-source', choices=['beta', 'ensemble', 'span'], required=True,
+    ap.add_argument('--label-source', choices=['beta', 'ensemble', *BINARY_SOURCES], required=True,
                     help="beta/ensemble: point --train-labels at single-reader or ensemble fit dirs")
     ap.add_argument('--train-labels', required=True, help="comma list of fit dirs")
     ap.add_argument('--dev-labels', required=True, help="comma list of fit dirs (dev split)")
@@ -75,7 +79,8 @@ def main():
     ap.add_argument('--no-bf16', dest='bf16', action='store_false')
     ap.add_argument('--grad-checkpointing', action='store_true')
     ap.add_argument('--select-metric', default=None,
-                    help="dev metric to maximize (default: ndcg@3_beta for beta/ensemble, gold_recall@25%% for span)")
+                    help="dev metric to maximize (default: ndcg@3_beta for beta/ensemble, gold_recall@25%% for "
+                         "span/answer)")
     ap.add_argument('--max-train-docs', type=int, default=None)
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--seed', type=int, default=0)
@@ -91,13 +96,13 @@ def main():
     prior = fit_position_prior(train_labels) if args.position_adjust else None
     train = make_examples(train_labels, args.label_source, prior)
     # dev keeps the unadjusted label: model selection targets the real attribution
-    dev = make_examples(dev_labels, 'span' if args.label_source == 'span' else 'beta')
+    dev = make_examples(dev_labels, args.label_source if args.label_source in BINARY_SOURCES else 'beta')
     if args.max_train_docs and args.max_train_docs < len(train):
         # train is ordered by source: taking the first N would train on the first source only
         train = random.Random(args.seed).sample(train, args.max_train_docs)
     if not train:
         raise SystemExit("no usable training documents (all uninformative?)")
-    metric = args.select_metric or ('gold_recall@25%' if args.label_source == 'span' else 'ndcg@3_beta')
+    metric = args.select_metric or ('gold_recall@25%' if args.label_source in BINARY_SOURCES else 'ndcg@3_beta')
     print(f"train: {len(train)} docs ({len(train_labels) - len(train)} dropped as uninformative); dev: {len(dev)} docs; "
           f"selecting on dev {metric}")
 

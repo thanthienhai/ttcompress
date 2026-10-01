@@ -1,6 +1,6 @@
 # TODO
 
-Các việc còn lại so với `METHOD_SPEC.md`, rà soát 2026-09-30. Hạn nộp ARR: **2026-10-12**.
+Các việc còn lại so với `METHOD_SPEC.md`, rà soát 2026-10-01. Hạn nộp ARR: **2026-10-12**.
 
 Hiện trạng: bản full 3000/300/500 đã chạy xong trên cluster (29/09, code `d936896` + 2 patch;
 `reports/RUN_REPORT_2026-09-30_full_h100x4.md`; dữ liệu eval trên HF `thanthienhai/ttcompress-main-eval`). Code
@@ -36,15 +36,40 @@ Phân tích theo từng tài liệu và các thay đổi code: `METHOD_SPEC.md` 
 - [x] Đăng ký trước lần lặp lại `ours_sent` so với EXIT / `reranker_sent` trên tài liệu mới
   (`docs/PREREG_SENTENCE_REPLICATION.md`, `docs/prereg_sentence_replication.json`); code: `select --offset`,
   `report --prereg`, `EVAL_N` / `EVAL_OFFSET` / `ONLY_ARMS` / `PREREG_FILE` / `BENCH_OUT` trong `run_pipeline.sh`.
-- [ ] Chạy lần lặp lại: Bước 2.3 của runbook; rồi điền R1–R3 vào paper.
-- [ ] Ablation `units` và `hard`: đang chạy trong job `ttcompress-ablation-h100x4`; sau đó `compare`.
-- [x] Điền kết quả follow-up vào `paper/main.tex`: bảng `tab:sentence`, mục Thí nghiệm bổ sung (a), (c), (e), (f),
-  bảng chi phí đo riêng, H1-oracle với 500 tài liệu, hình pareto (thời gian đo riêng) và tokens (có
-  `ours_fill` / `ours_sent`, 16×/32×). Còn 6 `\todo` chờ các mục trên.
+- [x] Phụ lục đăng ký trước R4–R7 (2026-10-01, trước khi chạy; `docs/PREREG_SENTENCE_REPLICATION.md` §9, JSON chỉ
+  thêm họ, R1–R3 giữ nguyên): R4 `ours_beta` > `reranker` (theo đoạn, 4×/8×), R4b > `xprovence` (tùy chọn), R5
+  `ours_sent` > `span_ans_sent`, R6 `ours_sent` không kém `span_sent` quá 0.02, R7 `fuse_sent` > `span_sent`. Code:
+  `--label-source answer` (`pruner_span_ans`, nhãn đoạn chứa chuỗi đáp án, không đọc câu hỗ trợ kể cả lúc chọn
+  epoch), arm `rrf:a|b` (reciprocal rank fusion, k = 60), `ROUND2_ARMS=1` trong `run_pipeline.sh`, report ghi
+  "Amended"; runbook Đợt 2 thêm Bước 2.1b và các nhánh mới; 104/104 test pass.
+- [ ] Chạy Đợt 2 (Bước 2.1, 2.1b, 2.2, 2.3 của runbook, ~5 giờ); rồi điền R1–R7 vào paper (`\todo{kết quả R1--R7.}`).
+- [x] Ablation `units` (`MULTIHOP_UNITS=sentence`, đo lại nhãn + train lại, 4 reader): xong 30/09, kiểm 01/10 từ
+  `followup/abl_units_report.md` (HF chỉ có bản `.md`). Kết quả (khám phá): `ours_beta` mức câu hơn `ours_sent`
+  không quá +0.028 F1; hơn EXIT bản chính ở 8× +0.040 / +0.004 / +0.112 (VIMQA / HotpotQA / 2Wiki, Qwen3-8B) và
+  +0.022 / +0.004 / +0.108 (Qwen3-32B); H1 28/30, H1-oracle 0/6, H2a 2/12 (cả hai là so với `oracle_span` trên
+  VIMQA; so với `span_sup` cả 6 ô âm, −0.024..−0.003), H3 0/16, H3-heldout 0/16; R² surrogate giảm 0.56/0.54 →
+  0.26. Đã vào paper (Bảng `tab:units`, (b)).
+  *Báo cáo tiến độ `ABL_UNITS_PROGRESS_REPORT_2026-09-30.md` sai ở §2.2–2.5:* các cột "F1" là answer-in-context
+  (ví dụ 2Wiki 8× "0.726 vs 0.282", `oracle_span` "1.000"); F1 thật 0.568 vs 0.347. Δ với `span_sup` ghi dương
+  trên 2Wiki nhưng thật ra âm; "H1 62% → 93%" so hai họ khác cỡ (cùng 30 phép kiểm định: 27/30 → 28/30); "*_tt
+  đã xong" vẫn sai; "`ours_fill` thu hẹp 25–35% khoảng cách tới EXIT" sai (8×: 37% VIMQA, 19% 2Wiki, âm trên
+  HotpotQA).
+- [ ] Upload `report.json` (và `answers_*.jsonl`) của `units-sentence` lên HF: cần cho kiểm định ghép cặp theo
+  `doc_id` giữa hai lần chạy (`ours_beta` mức câu vs EXIT / `ours_sent`); hiện các so sánh đó trong paper chỉ là mô tả.
+  Tài liệu test trùng theo `doc_id` (cùng hàng, `sources.multihop_row_to_doc`), nên ghép cặp được.
+- [ ] Ablation `hard`: đang chạy (job `ttcompress-ablation-h100x4`, 30/09 16:21 UTC còn ở bước labels, 112/750 tài
+  liệu mỗi shard); sau đó `compare`. Điền (d) trong paper.
+- [x] Điền kết quả follow-up vào `paper/main.tex`: bảng `tab:sentence`, `tab:units`, mục Thí nghiệm bổ sung (a), (b),
+  (c), (e), (f), bảng chi phí đo riêng, H1-oracle với 500 tài liệu, hình pareto (thời gian đo riêng) và tokens (có
+  `ours_fill` / `ours_sent`, 16×/32×); tóm tắt, giới thiệu, kết luận, hạn chế nhắc (b). Còn 6 `\todo`: ba reader
+  cho (a)/(c), bench `ours_sent`, R1–R3 (đều chờ Đợt 2), (d) chờ `abl_hard`, (g) `*_tt` chưa chạy, giấy phép.
+  Biên dịch sạch bằng pdfLaTeX (thân bài tới trang 16).
 - [x] Kiểm `span_sup` của bản full: train trên 9000 tài liệu, `ours_beta` trên 8628 (372 tài liệu không mang thông
   tin, 4.1%, chỉ `span_sup` giữ; log `run/logs/train_pruner_*.log` trên HF). Lợi thế nhỏ nghiêng về đối chứng, nên
   kết quả âm của H2 là thận trọng; đã ghi vào paper. Train lại `pruner_span` là tùy chọn.
-- [ ] Gộp patch XProvence / `defusedxml` vào repo: đã có trên HF (`run/patches/20-cluster-rest.patch`).
+- [ ] Gộp patch XProvence / `defusedxml` vào repo: đã có trên HF (`run/patches/20-cluster-rest.patch`). Cần người
+  duyệt và áp dụng (01/10 Claude không được phép áp patch tải từ HF). Là điều kiện để chạy R4b; quyết định trước khi
+  chạy Bước 2.3.
 
 ## 1. Chạy trên cluster
 
@@ -59,7 +84,7 @@ Tất cả các bước dưới đây nằm trong **một job**: `python scripts
   - [x] Bản full 3000/300/500: job `ttcompress-full-h100x4`, xong 29/09 (chạy thẳng `run_pipeline.sh` với
     `RUN_ROOT=runs/main`, không qua campaign). Smoke đã chạy 28/09, pilot 26/09.
   - [x] Upload eval + nhãn của bản full: `thanthienhai/ttcompress-main-eval`.
-  - [ ] `abl_hard`. *Chưa chạy:* chuyển sang bước `hard` của `scripts/followup.sh`.
+  - [ ] `abl_hard`. *Đang chạy* (bước `hard` của `scripts/followup.sh`, xem §0).
   - [ ] Upload pruner của bản full lên HF. *Chưa làm:* HF mới có pruner của pilot; cần cho việc kiểm `span_sup` (§0)
     và để công bố. Chạy `STAGES=upload` từ một pod CPU.
 - [x] Kiểm tra các baseline đã công bố: cả 7 chạy đủ 500/500 tài liệu ở mọi ô của bản full, không tài liệu nào lỗi

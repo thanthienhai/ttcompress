@@ -248,6 +248,33 @@ def test_sent_and_fill_wrap_model_chunk_arms():
         make_arm('sent+lead', device='cpu')
 
 
+def test_rank_fusion_sums_reciprocal_ranks_and_wraps_like_a_chunk_arm():
+    from ttcompress.selection import RRFScorer, arm_models
+
+    class Fixed:
+        def __init__(self, scores):
+            self.scores = scores
+
+        def score_chunks(self, question, chunks):
+            return list(self.scores)
+
+    fused = RRFScorer([Fixed([3.0, 2.0, 1.0]), Fixed([1.0, float('nan'), 2.0])], k=60).score_chunks('q', 'abc')
+    # ranks (1, 2, 3) and (2, 3, 1): the NaN ranks last
+    assert fused == pytest.approx([1 / 61 + 1 / 62, 1 / 62 + 1 / 63, 1 / 63 + 1 / 61])
+    with pytest.raises(ValueError, match='at least two'):
+        RRFScorer([Fixed([1.0])])
+    doc = make_doc(['Paris\nParis is in France. It is big.', 'Berlin\nBerlin is in Germany.'], hop='multi',
+                   question='Where is Berlin?')
+    arm = make_arm('rrf:bm25|bm25', device='cpu')
+    assert arm.kind == 'chunk' and arm.scores(doc).index(max(arm.scores(doc))) == 1
+    sent = make_arm('sent+rrf:bm25|bm25', device='cpu')
+    units, scores = sent.sentence_scores(doc)
+    assert sent.kind == 'sentence' and len(scores) == len(units) == 3 and scores.index(max(scores)) == 2
+    with pytest.raises(ValueError, match='wraps a model chunk arm'):
+        make_arm('rrf:bm25|lead', device='cpu')
+    assert arm_models('sent+rrf:reranker|embed') == ['BAAI/bge-reranker-v2-m3', 'BAAI/bge-m3']
+
+
 def test_sentence_scorer_reads_titled_sentences():
     from ttcompress.selection import SentenceAdapter, sentence_units
 

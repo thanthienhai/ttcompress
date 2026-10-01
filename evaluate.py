@@ -42,12 +42,12 @@ from ttcompress.metrics import (
 )
 from ttcompress.reader import MAX_NEW_TOKENS, load_reader, reader_tag
 from ttcompress.selection import (
-    WRAPPERS, Selection, budget_for, make_arm, select_by_scores, select_sentences, select_with_fill,
+    FUSION, WRAPPERS, Selection, budget_for, make_arm, select_by_scores, select_sentences, select_with_fill,
 )
 from ttcompress.sources import contains_answer, load_documents, parse_source_list
 
 _PREFIXES = ('pruner:', 'provence:', 'embed:', 'reranker:', 'llmlingua2:', 'llmlingua:', 'longllmlingua:',
-             'llmlingua_tt:', 'longllmlingua_tt:', 'recomp:', 'exit:') + tuple(WRAPPERS)
+             'llmlingua_tt:', 'longllmlingua_tt:', 'recomp:', 'exit:', FUSION) + tuple(WRAPPERS)
 
 
 def parse_arms(spec: str):
@@ -800,7 +800,8 @@ def prereg_families(cell, rows, prereg_path, n_boot):
                     'n_budget_mismatch': sum(bool(t.get('budget_mismatch')) for t in tests),
                     'n_seed_robust': sum(t['supported'] and t['seeds_agree'] for t in seeded) if seeded else None,
                     'tests': tests})
-    return {'name': spec.get('name', os.path.basename(prereg_path)), 'fixed': spec.get('fixed'), 'families': out}
+    return {'name': spec.get('name', os.path.basename(prereg_path)), 'fixed': spec.get('fixed'),
+            'amended': spec.get('amended'), 'families': out}
 
 
 def arms_outside_families(arms) -> list:
@@ -951,7 +952,8 @@ def _markdown(report) -> str:
     if report.get('prereg'):
         pr = report['prereg']
         lines += _hypotheses_markdown(pr['families'], title=f"Pre-registered families: {pr['name']}",
-                                      note=f"Fixed {pr.get('fixed')}, before these documents were evaluated.")
+                                      note=f"Fixed {pr.get('fixed')}, before these documents were evaluated."
+                                           + (f" Amended {pr['amended']}." if pr.get('amended') else ''))
     if report.get('outside_families'):
         lines += [f"Arms in no confirmatory family: {', '.join(report['outside_families'])}. A published "
                   f"compressor is tested in H1 only under one of these labels: {', '.join(H1_PUBLISHED)}.", '']

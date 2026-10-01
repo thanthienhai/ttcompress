@@ -2,6 +2,7 @@
   "name": "Sentence-level scoring replication (ours_sent vs EXIT, ours_sent vs reranker_sent)",
   "fixed": "2026-09-30, before any of these documents were evaluated (docs/PREREG_SENTENCE_REPLICATION.md)",
   "documents": "test split, per source the documents ranked 501-2500 in hash order (select --n 2000 --offset 500); vimqa has 199 (501-699)",
+  "amended": "2026-10-01, families R4-R7 added before any replication document was evaluated and before span_ans_sent / fuse_sent were evaluated anywhere (docs/PREREG_SENTENCE_REPLICATION.md section 9); R1-R3 unchanged",
   "families": [
     {
       "name": "R1",
@@ -33,6 +34,61 @@
       "vs": ["exit"],
       "kind": "noninferiority",
       "margin": 0.02,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [8]
+    },
+    {
+      "name": "R4",
+      "claim": "ours_beta > reranker (its untrained backbone), paragraph selection: utility labels beat relevance (primary reader)",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "ours_beta",
+      "vs": ["reranker"],
+      "kind": "superiority",
+      "margin": 0.0,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [4, 8]
+    },
+    {
+      "name": "R4b",
+      "claim": "ours_beta > xprovence (same initialization family), paragraph selection (primary reader); not run if the xprovence arm is not run",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "ours_beta",
+      "vs": ["xprovence"],
+      "kind": "superiority",
+      "margin": 0.0,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [4, 8]
+    },
+    {
+      "name": "R5",
+      "claim": "ours_sent > span_ans_sent at 8x: utility labels beat the annotation-free answer-string label (primary reader)",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "ours_sent",
+      "vs": ["span_ans_sent"],
+      "kind": "superiority",
+      "margin": 0.0,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [8]
+    },
+    {
+      "name": "R6",
+      "claim": "ours_sent not worse than span_sent by more than 0.02 token F1 at 8x: no supporting-fact annotation, close to supporting-fact supervision (primary reader)",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "ours_sent",
+      "vs": ["span_sent"],
+      "kind": "noninferiority",
+      "margin": 0.02,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [8]
+    },
+    {
+      "name": "R7",
+      "claim": "fuse_sent (rank fusion of ours_sent and span_sent, k=60) > span_sent at 8x: utility labels add to supporting-fact labels (primary reader)",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "fuse_sent",
+      "vs": ["span_sent"],
+      "kind": "superiority",
+      "margin": 0.0,
       "sources": ["vimqa", "hotpotqa", "2wiki"],
       "ratios": [8]
     }

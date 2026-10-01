@@ -36,6 +36,9 @@ Arms (name -> what it is):
                    like RECOMP / EXIT: paragraph selection cannot keep two evidence paragraphs at 1/8
   fill+<chunk arm> whole chunks by the chunk scorer, then the budget left over filled with the best sentences
                    (same scorer on sentences) of the chunks left out
+  rrf:<arm>|<arm>[|...]
+                   reciprocal rank fusion (k = 60) of two or more model chunk scorers; wraps like one
+                   (sent+rrf:pruner:a|pruner:b scores sentences with both pruners and fuses their ranks)
 Not included, because their output length cannot be set to a budget: RECOMP abstractive, CompAct,
 CORE-RAG (no released checkpoint). Selective Context is English/Chinese-only and superseded by the
 LLMLingua family.
@@ -285,6 +288,28 @@ class SentenceAdapter:
 
     def score_sentences(self, doc: QADocument, units: Sequence[SentenceUnit]) -> List[float]:
         return self.scorer.score_chunks(doc.question, [unit_with_title(doc, u) for u in units])
+
+
+class RRFScorer:
+    """Reciprocal rank fusion (Cormack et al., SIGIR 2009) of several chunk scorers: chunk i scores
+    sum_j 1 / (k + rank_j(i)), rank_j its 1-based rank under scorer j within the document (ties and
+    non-finite scores: document order, non-finite last). k = 60 as in that paper, fixed before any fused
+    selection was evaluated (docs/PREREG_SENTENCE_REPLICATION.md §9). Ranks are only comparable inside one
+    call, which is how every arm scores: one call per document (SentenceAdapter: all its sentences at once)."""
+
+    def __init__(self, scorers: Sequence, k: float = 60.0):
+        if len(scorers) < 2:
+            raise ValueError("rank fusion needs at least two scorers")
+        self.scorers, self.k = list(scorers), k
+
+    def score_chunks(self, question: str, chunks: Sequence[str]) -> List[float]:
+        fused = [0.0] * len(chunks)
+        for scorer in self.scorers:
+            scores = scorer.score_chunks(question, chunks)
+            key = [-s if math.isfinite(s) else math.inf for s in scores]
+            for rank, i in enumerate(sorted(range(len(chunks)), key=lambda i: (key[i], i)), start=1):
+                fused[i] += 1.0 / (self.k + rank)
+        return fused
 
 
 class EmbeddingScorer:
@@ -581,6 +606,16 @@ def load_beta_table(label_dirs: str) -> Dict[str, List[float]]:
 
 
 WRAPPERS = {'sent+': 'sentence', 'fill+': 'fill'}   # prefix -> arm kind, around a model chunk arm
+FUSION = 'rrf:'   # rrf:<arm>|<arm>[|...]: rank fusion of model chunk arms, itself a model chunk arm
+
+
+def _chunk_scorer(inner: Arm, spec: str):
+    """The chunk scorer of a model chunk arm, for an arm built around it (sent+, fill+, rrf:)."""
+    scorer = inner._scorer or (BM25Scorer() if inner.name == 'bm25' else None)
+    if inner.kind != 'chunk' or scorer is None:
+        raise ValueError(f"{spec!r} wraps a model chunk arm (pruner:, reranker, embed, provence:, bm25, rrf:), "
+                         f"not {inner.name!r}")
+    return scorer
 
 
 def arm_models(spec: str) -> List[str]:
@@ -589,6 +624,8 @@ def arm_models(spec: str) -> List[str]:
     for prefix in WRAPPERS:
         if spec.startswith(prefix):
             return arm_models(spec[len(prefix):])
+    if spec.startswith(FUSION):
+        return [m for part in spec[len(FUSION):].split('|') for m in arm_models(part)]
     name, _, arg = spec.partition(':')
     name = name[:-3] if name in ('llmlingua_tt', 'longllmlingua_tt') else name
     defaults = {'embed': ['BAAI/bge-m3'], 'reranker': ['BAAI/bge-reranker-v2-m3'], 'llmlingua2': [LLMLINGUA2_DEFAULT],
@@ -605,11 +642,12 @@ def make_arm(spec: str, device: str = 'cuda', oracle_beta_dir: Optional[str] = N
     for prefix, kind in WRAPPERS.items():
         if spec.startswith(prefix):
             inner = make_arm(spec[len(prefix):], device, oracle_beta_dir)
-            scorer = inner._scorer or (BM25Scorer() if inner.name == 'bm25' else None)
-            if inner.kind != 'chunk' or scorer is None:
-                raise ValueError(f"{spec!r}: {prefix} wraps a model chunk arm (pruner:, reranker, embed, provence:, "
-                                 f"bm25), not {inner.name!r}")
+            scorer = _chunk_scorer(inner, spec)
             return Arm(spec, kind, scorer=SentenceAdapter(scorer), inner=inner if kind == 'fill' else None)
+    if spec.startswith(FUSION):
+        parts = spec[len(FUSION):].split('|')
+        return Arm(spec, 'chunk', scorer=RRFScorer([_chunk_scorer(make_arm(p, device, oracle_beta_dir), spec)
+                                                    for p in parts]))
     if spec == 'full':
         return Arm('full', 'full')
     if spec in ('lead', 'random', 'bm25', 'oracle_span', 'oracle_support'):

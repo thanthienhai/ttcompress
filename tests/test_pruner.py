@@ -182,6 +182,23 @@ def test_make_examples_label_sources():
     assert m['gold_recall@25%'] == 1.0 and m['ndcg@3_beta'] == 1.0
 
 
+def test_answer_label_reads_no_supporting_facts():
+    def lab(chunks, answers, gold, informative=True):
+        doc = {'doc_id': 'd', 'source': 's', 'question': 'q', 'chunks': chunks, 'gold_chunks': gold, 'answers': answers}
+        return ChunkLabels(doc=doc, reader='r', target='f1', beta=[0.0] * len(chunks), intercept=0.0,
+                           z=[0.0] * len(chunks), informative=informative, alpha=1.0, cv_r2=0.5, full_f1=1.0)
+    labs = [lab(['Paris is big', 'Lyon is in France', 'rivers'], ['France'], gold=[0, 1]),
+            lab(['no', 'match'], ['France'], gold=[0]),                         # no answer chunk: dropped
+            lab(['France'], ['France'], gold=[0], informative=False)]          # same documents as beta
+    ex = make_examples(labs, 'answer')
+    assert len(ex) == 1 and ex[0].target == [0.0, 1.0, 0.0]
+    assert ex[0].gold == [1]                                    # dev recall counts answer chunks, not gold_chunks
+    assert ranking_metrics([0.0, 1.0, 0.5], ex[0])['gold_recall@25%'] == 1.0
+    parts = {}
+    example_loss(torch.tensor([0.0, 1.0, 0.0]), ex[0], 'answer', 1.0, 0.5, parts)
+    assert set(parts) == {'bce'}
+
+
 def test_effective_max_len_respects_roberta_position_offset():
     model = ChunkPruner.from_backbone(TINY_ENCODER)
     limit = effective_max_len(model.encoder.config, 10_000)
