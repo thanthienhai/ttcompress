@@ -1,6 +1,6 @@
 % References for main.tex.
-% Entries marked "TODO" need their author list / venue checked against the arXiv page
-% or the ACL Anthology before submission (METHOD_SPEC.md §0.2 only gives the arXiv id).
+% Author lists / venues of the recent arXiv entries were checked against the arXiv API,
+% ACL Anthology and Crossref on 2026-10-01.
 
 @inproceedings{cohenwang2024contextcite,
   title     = {{ContextCite}: Attributing Model Generation to Context},
@@ -26,38 +26,36 @@
 }
 
 @article{looComp2026,
-  title   = {{LooComp}: Leave-One-Out Context Compression},
-  author  = {{TODO}},
+  title   = {{EnComp}: Lightweight Encoder-Only Context Compression for Retrieval-Augmented Question Answering},
+  author  = {Do, Thao and Tran, Dinh Phu and Vo, An and Kim, Seon Kwon and Kim, Daeyoung},
   journal = {arXiv preprint arXiv:2603.09222},
   year    = {2026},
-  note    = {TODO: check title and authors},
+  note    = {Accepted at AACL 2026 (Main). Version~1 was titled ``{LooComp}: Leverage Leave-One-Out Strategy to Encoder-only Transformer for Efficient Query-aware Context Compression''},
   url     = {https://arxiv.org/abs/2603.09222}
 }
 
 @inproceedings{coreRag2026,
-  title     = {Less Is More: Compressing Retrieved Documents with Reinforcement Learning for {RAG}},
-  author    = {{TODO}},
+  title     = {Less Is More: Elevating {RAG} via Performance-Driven Context Compression},
+  author    = {Cui, Ziqiang and Weng, Yunpeng and Tang, Xing and Liu, Peiyang and Li, Shiwei and He, Bowei and Chen, Jiamin and Zhang, Yansen and He, Xiuqiang and Ma, Chen},
   booktitle = {Proceedings of the International Conference on Machine Learning},
   year      = {2026},
-  note      = {TODO: check title and authors; arXiv:2508.19282},
+  note      = {arXiv:2508.19282},
   url       = {https://arxiv.org/abs/2508.19282}
 }
 
 @article{ecorag2025,
   title   = {{ECoRAG}: Evidentiality-guided Compression for Long Context {RAG}},
-  author  = {{TODO}},
+  author  = {Jeong, Yeonseok and Kim, Jinsu and Lee, Dohyeon and Hwang, Seung-won},
   journal = {arXiv preprint arXiv:2506.05167},
   year    = {2025},
-  note    = {TODO: check authors},
   url     = {https://arxiv.org/abs/2506.05167}
 }
 
 @article{poc2026,
-  title   = {{PoC}: Performance-oriented Context Compression},
-  author  = {{TODO}},
+  title   = {{PoC}: Performance-oriented Context Compression for Large Language Models via Performance Prediction},
+  author  = {Zhao, Runsong and Liu, Shilei and Tang, Jiwei and Liu, Langming and Chen, Haibin and Zhang, Weidong and Yuan, Yujin and Xiao, Tong and Zhu, Jingbo and Su, Wenbo and Zheng, Bo},
   journal = {arXiv preprint arXiv:2603.19733},
   year    = {2026},
-  note    = {TODO: check title and authors},
   url     = {https://arxiv.org/abs/2603.19733}
 }
 
@@ -70,20 +68,19 @@
 }
 
 @inproceedings{xprovence2026,
-  title     = {{XProvence}: Multilingual Context Pruning for Retrieval-Augmented Generation},
-  author    = {{TODO}},
+  title     = {{XProvence}: Zero-Cost Multilingual Context Pruning for Retrieval-Augmented Generation},
+  author    = {Mohamed, Youssef and Elhoseiny, Mohamed and Formal, Thibault and Chirkova, Nadezhda},
   booktitle = {Proceedings of the European Conference on Information Retrieval},
   year      = {2026},
-  note      = {TODO: check title and authors; arXiv:2601.18886},
+  note      = {arXiv:2601.18886},
   url       = {https://arxiv.org/abs/2601.18886}
 }
 
 @inproceedings{hwang2025exit,
   title     = {{EXIT}: Context-Aware Extractive Compression for Enhancing Retrieval-Augmented Generation},
-  author    = {Hwang, Taeho and others},
+  author    = {Hwang, Taeho and Cho, Sukmin and Jeong, Soyeong and Song, Hoyun and Han, SeungYoon and Park, Jong C.},
   booktitle = {Findings of the Association for Computational Linguistics: ACL 2025},
   year      = {2025},
-  note      = {TODO: full author list},
   url       = {https://arxiv.org/abs/2412.12559}
 }
 
@@ -138,10 +135,9 @@
 
 @article{readerScaling2026,
   title   = {Fixed {RAG} Compression Collapses Measured Reader Scaling},
-  author  = {{TODO}},
+  author  = {Panthi, Sugam and Abdelfattah, Rabab},
   journal = {arXiv preprint arXiv:2606.21807},
   year    = {2026},
-  note    = {TODO: check authors},
   url     = {https://arxiv.org/abs/2606.21807}
 }
 
@@ -176,10 +172,24 @@
 
 @inproceedings{vimqa2022,
   title     = {{VIMQA}: A {V}ietnamese Dataset for Advanced Reasoning and Explainable Multi-hop Question Answering},
-  author    = {{TODO}},
+  author    = {Le, Nguyen-Khang and Nguyen, Dieu-Hien and Le, Tung and Nguyen, Minh},
   booktitle = {Proceedings of the Thirteenth Language Resources and Evaluation Conference},
+  pages     = {6521--6529},
+  address   = {Marseille, France},
+  publisher = {European Language Resources Association},
   year      = {2022},
-  note      = {TODO: authors; ACL Anthology 2022.lrec-1.700}
+  url       = {https://aclanthology.org/2022.lrec-1.700/}
+}
+
+@article{vimrc2022viquad2,
+  title   = {{VLSP} 2021-{ViMRC} Challenge: {V}ietnamese Machine Reading Comprehension},
+  author  = {Nguyen, Kiet Van and Tran, Son Quoc and Nguyen, Luan Thanh and Huynh, Tin Van and Luu, Son Thanh and Nguyen, Ngan Luu-Thuy},
+  journal = {VNU Journal of Science: Computer Science and Communication Engineering},
+  volume  = {38},
+  number  = {2},
+  year    = {2022},
+  doi     = {10.25073/2588-1086/vnucsce.340},
+  url     = {https://arxiv.org/abs/2203.11400}
 }
 
 @inproceedings{artetxe2020xquad,
@@ -219,12 +229,16 @@
   year    = {2025}
 }
 
-@misc{sealion2024,
-  title  = {{SEA-LION}: Southeast Asian Languages in One Network},
-  author = {{AI Singapore}},
-  year   = {2024},
-  note   = {TODO: cite the Llama-SEA-LION-v3 technical report},
-  url    = {https://huggingface.co/aisingapore/Llama-SEA-LION-v3-8B}
+@inproceedings{sealion2024,
+  title     = {{SEA-LION}: {S}outheast {A}sian Languages in One Network},
+  author    = {Ng, Raymond and Nguyen, Thanh Ngan and Yuli, Huang and Chia, Tai Ngee and Yi, Leong Wai and Leong, Wei Qi and Yong, Xianbin and Ngui, Jian Gang and Susanto, Yosephine and Cheng, Nicholas and Rengarajan, Hamsawardhini and Limkonchotiwat, Peerat and Hulagadri, Adithya Venkatadri and Teng, Kok Wai and Tong, Yeo Yeow and Siow, Bryan and Teo, Wei Yi and Meng, Tan Choon and Ong, Brandon and Ong, Zhi Hao and Montalan, Jann Railey and Chan, Adwin and Antonyrex, Sajeban and Lee, Ren and Choa, Esther and Tat-Wee, David Ong and Liu, Bing Jie Darius and Tjhi, William Chandra and Cambria, Erik and Teo, Leslie},
+  booktitle = {Proceedings of the 14th International Joint Conference on Natural Language Processing and the 4th Conference of the Asia-Pacific Chapter of the Association for Computational Linguistics},
+  pages     = {512--526},
+  address   = {Mumbai, India},
+  publisher = {The Asian Federation of Natural Language Processing and The Association for Computational Linguistics},
+  year      = {2025},
+  doi       = {10.18653/v1/2025.ijcnlp-long.30},
+  url       = {https://aclanthology.org/2025.ijcnlp-long.30/}
 }
 
 @article{holm1979,
@@ -277,5 +291,6 @@
   booktitle = {Proceedings of the 32nd International ACM SIGIR Conference on Research and Development in Information Retrieval},
   pages     = {758--759},
   year      = {2009},
-  note      = {TODO: check pages and booktitle against the ACM DL}
+  publisher = {ACM},
+  doi       = {10.1145/1571941.1572114}
 }
