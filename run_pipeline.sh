@@ -87,6 +87,21 @@ FOLLOWUP_ARMS=${FOLLOWUP_ARMS:-0}
 # contains the answer string" label: an annotation-free control), `select` adds span_ans, span_ans_sent and
 # fuse_sent (rank fusion of ours_beta and span_sup scoring sentences).
 ROUND2_ARMS=${ROUND2_ARMS:-0}
+# LOO_ARMS=1: the leave-one-out labeling baseline (docs/prereg_loo.json), primary reader only -- `labels` measures
+# LOO masks (one per chunk, each dropping that chunk, + the full context) of the train/dev documents into
+# <labels>/raw_loo; `fit` writes the LOO labels (<fit>/loo/...) and the equal-cost control, Ridge on K=11 of the
+# existing random masks (<fit>/k11/..., alpha on dev with the same subsampling); `train` adds pruner_loo and
+# pruner_k11 (ours_beta's loss) with the EXTRA_SEEDS reruns; `select` adds ours_loo, loo_sent, ours_k11, k11_sent
+# and their _s<k> seed arms. LOO_BIN=1 also trains pruner_loo_bin (LooComp-style binary BCE on the LOO labels,
+# LOO_BIN_THRESHOLD -> --loo-threshold) with arms loocomp_bin, loocomp_bin_sent (+ seeds). LOO_ONLY=1 (needs
+# LOO_ARMS=1): labels / fit / train run only these steps -- an existing run's labels, fits and pruners stay
+# untouched (STAGES="labels fit train"); select is resumable and runs only the arms not yet on disk.
+LOO_ARMS=${LOO_ARMS:-0}
+LOO_BIN=${LOO_BIN:-0}
+LOO_BIN_THRESHOLD=${LOO_BIN_THRESHOLD:-}
+LOO_ONLY=${LOO_ONLY:-0}
+LOO_K_MASKS=11   # in the arm names (ours_k11): not a setting
+if [[ "$LOO_ONLY" == 1 && "$LOO_ARMS" != 1 ]]; then echo "!! LOO_ONLY=1 needs LOO_ARMS=1"; exit 1; fi
 # A replication on documents no earlier result has seen (docs/PREREG_*.md): EVAL_N documents per source after
 # skipping the first EVAL_OFFSET (hash order; the main test set is the first N_TEST), into its own EVAL_DIR.
 # N_TEST itself stays the run's (run_config.txt). ONLY_ARMS replaces the arm list of `select` (full specs);
@@ -184,6 +199,7 @@ HF_UPLOAD_LABELS=${HF_UPLOAD_LABELS:-false}
 
 echo "== config${ENV_FILE:+ ($ENV_FILE)}: RUN_ROOT=$RUN_ROOT LABELS=$LABELS FIT=$FIT NUM_GPUS=$NUM_GPUS BACKEND=$BACKEND"
 echo "   N_TRAIN=$N_TRAIN N_DEV=$N_DEV N_TEST=$N_TEST ORACLE_N=$ORACLE_N RATIOS=$RATIOS STAGES=\"$STAGES\""
+echo "   LOO_ARMS=$LOO_ARMS LOO_BIN=$LOO_BIN LOO_ONLY=$LOO_ONLY FOLLOWUP_ARMS=$FOLLOWUP_ARMS ROUND2_ARMS=$ROUND2_ARMS"
 echo "   EXTRA_SEEDS=\"$EXTRA_SEEDS\"${ABLATION:+ ABLATION=$ABLATION}${SMOKE:+ SMOKE=$SMOKE}"
 echo "   LABEL_READERS=\"$LABEL_READERS\""
 echo "   EVAL_READERS=\"$EVAL_READERS\""
@@ -447,8 +463,12 @@ if has_stage prefetch; then
   if has_stage preflight; then run_tests; fi   # a launch from scratch: the unit tests, before any GPU hour
 fi
 
+# LOO_ONLY=1: the main run's label / fit / train steps are skipped (its outputs stay as they are)
+MAIN_READERS=$LABEL_READERS; MAIN_ORACLE_N=$ORACLE_N
+[[ "$LOO_ONLY" == 1 ]] && { MAIN_READERS=""; MAIN_ORACLE_N=0; }
+
 if has_stage labels; then
-  for reader in $LABEL_READERS; do
+  for reader in $MAIN_READERS; do
     tp=$(tp_for "$reader")
     for src in $TRAIN_SOURCES; do
       for split in train dev; do
@@ -465,7 +485,7 @@ if has_stage labels; then
       done
     done
   done
-  if (( ORACLE_N > 0 )); then  # never read by training: label_dirs() only lists train/dev
+  if (( MAIN_ORACLE_N > 0 )); then  # never read by training: label_dirs() only lists train/dev
     tp=$(tp_for "$PRIMARY_MODEL")
     for src in ${EVAL_SOURCES//,/ }; do
       echo "== labels (oracle_beta): $PRIMARY_MODEL $src/test (n=$ORACLE_N, tp=$tp)"
@@ -476,13 +496,28 @@ if has_stage labels; then
         --outcomes f1
     done
   fi
+  if [[ "$LOO_ARMS" == 1 ]]; then
+    # same documents (--n, hash order) as the main measure; a separate out-root: measure refuses mixed mask schemes
+    tp=$(tp_for "$PRIMARY_MODEL")
+    for src in $TRAIN_SOURCES; do
+      for split in train dev; do
+        n=$N_TRAIN; [[ $split == dev ]] && n=$N_DEV
+        echo "== labels (LOO): $PRIMARY_MODEL $src/$split (n=$n, tp=$tp)"
+        run_sharded "labels_loo_${PRIMARY}_${src}_$split" "$tp" \
+          python generate_labels.py measure --source "$src" --split "$split" --n "$n" \
+          --reader-model "$PRIMARY_MODEL" --backend "$BACKEND" --max-model-len "$MAX_MODEL_LEN" --tp "$tp" \
+          --gpu-memory-utilization "$GPU_MEM" --docs-per-call "$DOCS_PER_CALL" --out-root "$(raw_root "$src")_loo" $MEASURE_ARGS \
+          --mask-scheme loo --outcomes f1
+      done
+    done
+  fi
 fi
 
 if has_stage fit; then
   # independent CPU jobs (alpha comes from the raw dev measurements, not from another fit): run them together
   mkdir -p "$LOGS/fit"
   pool_start "$CPU_JOBS"
-  for reader in $LABEL_READERS; do
+  for reader in $MAIN_READERS; do
     r=$(tag "$reader")
     targets=f1; [[ "$reader" == "$PRIMARY_MODEL" ]] && targets="f1 logprob"
     for target in $targets; do
@@ -497,7 +532,7 @@ if has_stage fit; then
       done
     done
   done
-  if (( ORACLE_N > 0 )); then
+  if (( MAIN_ORACLE_N > 0 )); then
     pooled_dev=""
     for s in $TRAIN_SOURCES; do pooled_dev="$pooled_dev,$(raw_root "$s")/$PRIMARY/${s}_dev"; done
     for src in ${EVAL_SOURCES//,/ }; do
@@ -508,6 +543,24 @@ if has_stage fit; then
       pool_run "fit oracle $src" "$LOGS/fit/${PRIMARY}_f1_${src}_test.log" \
         env OMP_NUM_THREADS=1 python generate_labels.py fit --raw-dir "$(raw_root "$src")/$PRIMARY/${src}_test" \
         --target f1 --alpha-from "$alpha_from" --out-dir "$FIT/$PRIMARY/f1/${src}_test" --n "$ORACLE_N" --alpha-n "$N_DEV"
+    done
+  fi
+  if [[ "$LOO_ARMS" == 1 ]]; then
+    # <fit>/loo|k11/<reader>/f1/<set>: one level below the main fits, so label_quality's table keeps its rows
+    for src in $TRAIN_SOURCES; do
+      for split in train dev; do
+        n=$N_TRAIN; [[ $split == dev ]] && n=$N_DEV
+        echo "== fit (LOO): $PRIMARY $src/$split"
+        pool_run "fit loo $src/$split" "$LOGS/fit/loo_${PRIMARY}_${src}_$split.log" \
+          env OMP_NUM_THREADS=1 python generate_labels.py fit --raw-dir "$(raw_root "$src")_loo/$PRIMARY/${src}_$split" \
+          --estimator loo --out-dir "$FIT/loo/$PRIMARY/f1/${src}_$split" --n "$n"
+        # equal-cost control: the method's Ridge on K=11 of the existing random masks (~ the LOO call count)
+        echo "== fit (K=$LOO_K_MASKS masks): $PRIMARY $src/$split"
+        pool_run "fit k$LOO_K_MASKS $src/$split" "$LOGS/fit/k${LOO_K_MASKS}_${PRIMARY}_${src}_$split.log" \
+          env OMP_NUM_THREADS=1 python generate_labels.py fit --raw-dir "$(raw_root "$src")/$PRIMARY/${src}_$split" \
+          --target f1 --max-masks "$LOO_K_MASKS" --mask-seed 0 --alpha-from "$(raw_root "$src")/$PRIMARY/${src}_dev" \
+          --out-dir "$FIT/k$LOO_K_MASKS/$PRIMARY/f1/${src}_$split" --n "$n" --alpha-n "$N_DEV"
+      done
     done
   fi
   pool_wait
@@ -548,6 +601,16 @@ if has_stage train; then
   done
   # same fit dirs (documents) as pruner_beta_primary; the label itself never reads the reader
   [[ "$ROUND2_ARMS" == 1 ]] && RUNS+=("pruner_span_ans|answer|$PRIMARY|f1|")
+  [[ "$LOO_ONLY" == 1 ]] && RUNS=()
+  if [[ "$LOO_ARMS" == 1 ]]; then
+    # reader field = the fit dir under $FIT (label_dirs): <fit>/loo/<primary>, <fit>/k11/<primary>
+    loo_runs=("pruner_loo|beta|loo/$PRIMARY|f1|" "pruner_k$LOO_K_MASKS|beta|k$LOO_K_MASKS/$PRIMARY|f1|")
+    [[ "$LOO_BIN" == 1 ]] && loo_runs+=("pruner_loo_bin|loo_bin|loo/$PRIMARY|f1|${LOO_BIN_THRESHOLD:+--loo-threshold $LOO_BIN_THRESHOLD}")
+    for run in "${loo_runs[@]}"; do   # seed reruns as for pruner_beta_primary: name_s<k>, 6th field = seed
+      RUNS+=("$run")
+      for seed in $EXTRA_SEEDS; do RUNS+=("${run%%|*}_s$seed|${run#*|}|$seed"); done
+    done
+  fi
   # one run per GPU; the next run starts as soon as any GPU frees (9 runs on 4 GPUs: no 1-GPU last wave)
   pool_start "$NUM_GPUS"
   for run in "${RUNS[@]}"; do
@@ -588,6 +651,17 @@ if has_stage select; then
   if [[ "$ROUND2_ARMS" == 1 ]]; then
     ARMS="$ARMS,span_ans=pruner:$MODELS/pruner_span_ans,span_ans_sent=sent+pruner:$MODELS/pruner_span_ans"
     ARMS="$ARMS,fuse_sent=sent+rrf:pruner:$MODELS/pruner_beta_primary|pruner:$MODELS/pruner_span"
+  fi
+  if [[ "$LOO_ARMS" == 1 ]]; then   # paragraph arm | sentence arm | pruner, + seed reruns of both (docs/prereg_loo.json)
+    loo_arms="ours_loo|loo_sent|pruner_loo ours_k$LOO_K_MASKS|k${LOO_K_MASKS}_sent|pruner_k$LOO_K_MASKS"
+    [[ "$LOO_BIN" == 1 ]] && loo_arms="$loo_arms loocomp_bin|loocomp_bin_sent|pruner_loo_bin"
+    for spec in $loo_arms; do
+      IFS='|' read -r para sent pruner <<< "$spec"
+      ARMS="$ARMS,$para=pruner:$MODELS/$pruner,$sent=sent+pruner:$MODELS/$pruner"
+      for seed in $EXTRA_SEEDS; do
+        ARMS="$ARMS,${para}_s$seed=pruner:$MODELS/${pruner}_s$seed,${sent}_s$seed=sent+pruner:$MODELS/${pruner}_s$seed"
+      done
+    done
   fi
   oracle_flags=()
   if (( ORACLE_N > 0 )); then

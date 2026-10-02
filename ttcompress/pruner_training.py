@@ -9,6 +9,14 @@ Label sources (what the pruner is supervised on), chosen per run:
             as oracle_span): an annotation-free control -- unlike span, it
             reads no supporting-fact annotation, in training or in model
             selection (docs/PREREG_SENTENCE_REPLICATION.md §9)
+  loo_bin   binary leave-one-out label (LooComp/EnComp-style baseline):
+            chunk i is positive iff its LOO effect beta_i = F1(full) -
+            F1(full without chunk i) exceeds loo_threshold (default 0: the
+            reader's F1 drops when the chunk is removed). Reads only fit dirs
+            written by `fit --estimator loo`; ridge records are refused, since
+            thresholding ridge betas would silently be a different baseline.
+            Like `answer`, no supporting-fact annotation reaches training or
+            model selection: dev recall counts the LOO-positive chunks
 
 Losses:
   listnet   cross-entropy between softmax(target / tau) and softmax(scores)
@@ -17,7 +25,7 @@ Losses:
   mse       regression on the z-score (keeps score scale meaningful; used
             as an auxiliary term, weight w_mse)
   bce       binary cross-entropy on the span label
-Default: listnet + 0.5 * mse for beta/ensemble, bce for span and answer.
+Default: listnet + 0.5 * mse for beta/ensemble, bce for span, answer and loo_bin.
 
 Reductions: listnet SUMS over the C chunks (a cross-entropy between two
 distributions, Cao et al. 2007); mse is the MEAN over chunks (the paper
@@ -48,7 +56,7 @@ from .attribution import ChunkLabels, load_chunk_labels, position_bin, record_pa
 from .metrics import ndcg_at_k, spearman
 from .sources import contains_answer
 
-BINARY_SOURCES = ('span', 'answer')   # BCE on a 0/1 chunk label, model selection on its recall
+BINARY_SOURCES = ('span', 'answer', 'loo_bin')   # BCE on a 0/1 chunk label, model selection on its recall
 
 
 @dataclass
@@ -57,8 +65,9 @@ class TrainExample:
     source: str
     question: str
     chunks: List[str]
-    target: List[float]        # z-label (beta/ensemble) or 0/1 (span, answer)
-    gold: List[int]            # chunks the dev recall counts: answer-string chunks for `answer`, else gold_chunks
+    target: List[float]        # z-label (beta/ensemble) or 0/1 (span, answer, loo_bin)
+    gold: List[int]            # chunks the dev recall counts: answer-string chunks for `answer`, LOO-positive
+                               # chunks for `loo_bin`, else gold_chunks
     beta_z: Optional[List[float]] = None   # kept for dev metrics even when training on span
 
 
@@ -73,29 +82,48 @@ def load_label_dirs(dirs: Sequence[str]) -> List[ChunkLabels]:
 
 
 def make_examples(labels: Sequence[ChunkLabels], label_source: str,
-                  position_prior: Optional[Sequence[float]] = None) -> List[TrainExample]:
+                  position_prior: Optional[Sequence[float]] = None,
+                  loo_threshold: float = 0.0) -> List[TrainExample]:
     """Uninformative documents (outcome never varied) are dropped: a constant
     label carries no ranking signal. Also for span, whose label does not need
     the reader: the RQ2 control must train on exactly pruner_beta_primary's
     documents (it reads the same fit dirs), so only the label type differs.
     `answer` also drops the documents where no chunk contains the answer
     string (no positive chunk), and its `gold` is the answer-string chunks,
-    so no supporting-fact annotation reaches its model selection either."""
+    so no supporting-fact annotation reaches its model selection either.
+    `loo_bin` follows `answer`: positives are the chunks whose LOO F1 drop
+    beta_i > loo_threshold, documents with no positive chunk are dropped (an
+    all-zero BCE target has no ranking signal, and its dev recall would be
+    undefined), and `gold` is the LOO-positive chunks. Every record must come
+    from `fit --estimator loo` (SystemExit otherwise)."""
+    if label_source == 'loo_bin':
+        bad = [lab for lab in labels if lab.estimator != 'loo']
+        if bad:
+            raise SystemExit(f"--label-source loo_bin needs leave-one-out fit records (fit --estimator loo); "
+                             f"{len(bad)} record(s) have estimator={sorted({lab.estimator for lab in bad})} "
+                             f"(e.g. doc {bad[0].doc.get('doc_id')!r}). A binary label thresholded from ridge betas "
+                             f"would be a different baseline.")
     out = []
     for lab in labels:
         if not lab.informative:
             continue
         doc = lab.doc
         C = len(doc['chunks'])
-        gold = list(doc['gold_chunks'])
         if label_source == 'span':
+            gold = list(doc['gold_chunks'])
             target = [1.0 if i in set(gold) else 0.0 for i in range(C)]
         elif label_source == 'answer':
             gold = [i for i, c in enumerate(doc['chunks']) if contains_answer(c, doc['answers'])]
             if not gold:
                 continue
             target = [1.0 if i in set(gold) else 0.0 for i in range(C)]
+        elif label_source == 'loo_bin':
+            gold = [i for i, b in enumerate(lab.beta) if b > loo_threshold]
+            if not gold:
+                continue
+            target = [1.0 if i in set(gold) else 0.0 for i in range(C)]
         else:
+            gold = list(doc['gold_chunks'])   # beta/ensemble: a logged dev metric, not their default selection metric
             target = list(lab.z)
             if position_prior is not None:
                 target = [z - position_prior[position_bin(i, C, len(position_prior))] for i, z in enumerate(target)]

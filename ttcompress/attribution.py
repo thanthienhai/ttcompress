@@ -28,7 +28,7 @@ import json
 import math
 import os
 import random
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -68,6 +68,23 @@ def generate_masks(C: int, K: int, keep_rates: Sequence[float], seed: int) -> Li
 def masks_for_document(doc_id: str, C: int, keep_rates: Sequence[float], k_min: int, k_per_chunk: float,
                        k_max: int) -> List[List[bool]]:
     return generate_masks(C, num_masks(C, k_min, k_per_chunk, k_max), keep_rates, seed=hash_seed(f'masks:{doc_id}'))
+
+
+def loo_masks(C: int) -> List[List[bool]]:
+    """Leave-one-out masks (the LOO labeling baseline): mask i keeps every chunk except i, i = 0..C-1.
+    C reader calls (+ the full context measure appends) instead of K >= 64 random masks. For C == 1 the
+    single mask is the empty context [False] -- the one place an empty mask is allowed: dropping the only
+    chunk IS the leave-one-out ablation, and the reader answers it like any other prompt."""
+    if C <= 0:
+        raise ValueError(f"C must be > 0; got {C}")
+    return [[j != i for j in range(C)] for i in range(C)]
+
+
+def is_loo_masks(masks) -> bool:
+    """True iff `masks` is exactly loo_masks(C) for its chunk count (same order)."""
+    if not masks or not masks[0]:
+        return False
+    return [list(map(bool, m)) for m in masks] == loo_masks(len(masks[0]))
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +254,9 @@ class ChunkLabels:
     diagnostics: Dict[str, float] = field(default_factory=dict)
     ci_lo: Optional[List[float]] = None
     ci_hi: Optional[List[float]] = None
+    # 'ridge' (random masks + ridge surrogate, the method) | 'loo' (leave-one-out deltas, baseline);
+    # defaulted so fit dirs written before the field existed still load as ridge
+    estimator: str = 'ridge'
 
 
 def _write(obj, path: str) -> None:
@@ -292,6 +312,43 @@ def fit_document(rec: MaskOutcomes, target: str, alpha: float, n_boot: int = 0) 
     return labels
 
 
+def fit_document_loo(rec: MaskOutcomes, target: str = 'f1') -> ChunkLabels:
+    """Leave-one-out attribution: beta_i = u(full context) - u(full context without chunk i).
+    No surrogate, so no alpha and no held-out R^2 (both nan). The intercept is the full-context outcome.
+    Uninformative when every delta is equal (typically: dropping any one chunk never changes the answer),
+    which on redundant multi-hop evidence is exactly LOO's known failure mode."""
+    doc_id = rec.doc['doc_id']
+    if not is_loo_masks(rec.masks):
+        raise ValueError(f"{doc_id}: masks are not leave-one-out masks (measure with --mask-scheme loo)")
+    outcomes = rec.f1 if target == 'f1' else rec.logprob
+    full = rec.full_f1 if target == 'f1' else rec.full_logprob
+    if outcomes is None or full is None:
+        raise ValueError(f"{doc_id}: no {target!r} outcomes were measured")
+    if len(outcomes) != len(rec.masks):
+        raise ValueError(f"{doc_id}: {len(outcomes)} outcomes for {len(rec.masks)} masks")
+    beta = (float(full) - np.asarray(outcomes, dtype=float)).tolist()
+    z, varied = zscore(beta)
+    return ChunkLabels(
+        doc=rec.doc, reader=rec.reader, target=target, beta=beta, intercept=float(full), z=z, informative=varied,
+        alpha=float('nan'), cv_r2=float('nan'), full_f1=rec.full_f1,
+        diagnostics=gold_diagnostics(beta, rec.doc['gold_chunks']), estimator='loo',
+    )
+
+
+def subsample_masks(rec: MaskOutcomes, n: int, seed: int) -> MaskOutcomes:
+    """`rec` cut to n of its masks (equal-cost ridge baseline: K matched to LOO's reader calls). The subset
+    is drawn without replacement by an RNG seeded by (seed, doc_id) only -- never by which other documents
+    were subsampled before -- and keeps the original mask order. n >= len(masks): `rec` unchanged."""
+    if n >= len(rec.masks):
+        return rec
+    if n <= 0:
+        raise ValueError(f"n must be > 0; got {n}")
+    rng = random.Random(hash_seed(f"subsample:{seed}:{rec.doc['doc_id']}"))
+    keep = sorted(rng.sample(range(len(rec.masks)), n))
+    return replace(rec, masks=[rec.masks[i] for i in keep], f1=[rec.f1[i] for i in keep],
+                   logprob=[rec.logprob[i] for i in keep] if rec.logprob is not None else None)
+
+
 def ensemble_labels(per_reader: Sequence[ChunkLabels]) -> ChunkLabels:
     """Reader-agnostic label: mean of the readers' within-document z-scores
     (only readers for which the document was informative contribute)."""
@@ -300,6 +357,8 @@ def ensemble_labels(per_reader: Sequence[ChunkLabels]) -> ChunkLabels:
     C = len(base.beta)
     if any(len(lab.beta) != C for lab in per_reader):
         raise ValueError(f"{base.doc['doc_id']}: readers disagree on the chunk count")
+    if any(lab.estimator != base.estimator for lab in per_reader):  # a ridge+LOO mean is neither label
+        raise ValueError(f"{base.doc['doc_id']}: readers' labels come from different estimators")
     if ok:
         mean_z = np.mean([lab.z for lab in ok], axis=0)
         z, varied = zscore(mean_z)

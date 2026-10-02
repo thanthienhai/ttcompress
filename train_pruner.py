@@ -13,6 +13,11 @@
     # annotation-free control: binary "chunk contains the answer string" label, no supporting facts
     python train_pruner.py --label-source answer --train-labels ... --dev-labels ... --out-dir models/pruner_span_ans
 
+    # LooComp/EnComp-style baseline: BCE on a binary leave-one-out label; the fit dirs must be
+    # written by `fit --estimator loo` (chunk positive iff its LOO F1 drop > --loo-threshold)
+    python train_pruner.py --label-source loo_bin --train-labels <loo fit dirs> --dev-labels <loo fit dirs> \
+        --out-dir models/pruner_loo_bin
+
 Model selection is reader-free: after each epoch the pruner ranks the dev
 documents' chunks and is scored against the dev labels (--select-metric);
 the best epoch is kept. No test data and no reader calls are involved.
@@ -63,6 +68,10 @@ def main():
                     help="beta/ensemble: point --train-labels at single-reader or ensemble fit dirs")
     ap.add_argument('--train-labels', required=True, help="comma list of fit dirs")
     ap.add_argument('--dev-labels', required=True, help="comma list of fit dirs (dev split)")
+    ap.add_argument('--loo-threshold', type=float, default=0.0,
+                    help="loo_bin only: chunk i is positive iff beta_i > this, where beta_i = F1(full) - "
+                         "F1(full without chunk i) is the LOO effect of removing chunk i (F1 units; default 0: "
+                         "any F1 drop)")
     ap.add_argument('--position-adjust', action='store_true', help="subtract the pooled position prior (ablation)")
     ap.add_argument('--backbone', default=DEFAULT_BACKBONE)
     ap.add_argument('--max-len', type=int, default=4096)
@@ -80,7 +89,7 @@ def main():
     ap.add_argument('--grad-checkpointing', action='store_true')
     ap.add_argument('--select-metric', default=None,
                     help="dev metric to maximize (default: ndcg@3_beta for beta/ensemble, gold_recall@25%% for "
-                         "span/answer)")
+                         "span/answer/loo_bin -- the recall of the source's own positives)")
     ap.add_argument('--max-train-docs', type=int, default=None)
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--seed', type=int, default=0)
@@ -94,17 +103,18 @@ def main():
     train_labels = load_label_dirs(args.train_labels.split(','))
     dev_labels = load_label_dirs(args.dev_labels.split(','))
     prior = fit_position_prior(train_labels) if args.position_adjust else None
-    train = make_examples(train_labels, args.label_source, prior)
+    train = make_examples(train_labels, args.label_source, prior, loo_threshold=args.loo_threshold)
     # dev keeps the unadjusted label: model selection targets the real attribution
-    dev = make_examples(dev_labels, args.label_source if args.label_source in BINARY_SOURCES else 'beta')
+    dev = make_examples(dev_labels, args.label_source if args.label_source in BINARY_SOURCES else 'beta',
+                        loo_threshold=args.loo_threshold)
     if args.max_train_docs and args.max_train_docs < len(train):
         # train is ordered by source: taking the first N would train on the first source only
         train = random.Random(args.seed).sample(train, args.max_train_docs)
     if not train:
         raise SystemExit("no usable training documents (all uninformative?)")
     metric = args.select_metric or ('gold_recall@25%' if args.label_source in BINARY_SOURCES else 'ndcg@3_beta')
-    print(f"train: {len(train)} docs ({len(train_labels) - len(train)} dropped as uninformative); dev: {len(dev)} docs; "
-          f"selecting on dev {metric}")
+    print(f"train: {len(train)} docs ({len(train_labels) - len(train)} dropped as uninformative or without a "
+          f"positive chunk); dev: {len(dev)} docs; selecting on dev {metric}")
 
     device = resolve_device(args.device)
     args.bf16 = args.bf16 and device.startswith('cuda')
@@ -182,6 +192,7 @@ def main():
             model.save_pretrained(args.out_dir, tokenizer, extra={
                 'max_len': args.max_len, 'pair_format': True, 'backbone': args.backbone, 'label_source': args.label_source,
                 'train_labels': args.train_labels, 'position_adjust': args.position_adjust,
+                'loo_threshold': args.loo_threshold if args.label_source == 'loo_bin' else None,
                 'best_epoch': epoch + 1, 'select_metric': metric, 'best_dev': dev_metrics})
             print(f"  saved (best dev {metric}={best:.4f}) -> {args.out_dir}")
 
@@ -190,6 +201,7 @@ def main():
         model.save_pretrained(args.out_dir, tokenizer, extra={
             'max_len': args.max_len, 'pair_format': True, 'backbone': args.backbone, 'label_source': args.label_source,
             'train_labels': args.train_labels, 'position_adjust': args.position_adjust,
+            'loo_threshold': args.loo_threshold if args.label_source == 'loo_bin' else None,
             'best_epoch': args.epochs, 'select_metric': None})
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, 'train_log.json'), 'w', encoding='utf-8') as f:

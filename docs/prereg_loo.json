@@ -1,0 +1,56 @@
+{
+  "name": "Leave-one-out labeling baseline (ours vs LOO-trained pruners, LOO vs equal-cost K=11 Ridge)",
+  "fixed": "2026-10-02, before any LOO or K=11 label, pruner or arm (ours_loo, loo_sent, ours_k11, k11_sent, loocomp_bin*) was measured, trained or evaluated anywhere",
+  "documents": "test split, per source the documents ranked 501-2500 in hash order (select --n 2000 --offset 500, the round-2 replication set); vimqa has 199 (501-699)",
+  "arms": "run_pipeline.sh LOO_ARMS=1: ours_loo / loo_sent = pruner_loo (LOO labels, ours_beta's loss), ours_k11 / k11_sent = pruner_k11 (the method's Ridge on 11 of the existing random masks: about the LOO call count), each with seed reruns _s1/_s2; the LooComp-style binary pruner (LOO_BIN=1: loocomp_bin, loocomp_bin_sent) is exploratory, in no family",
+  "seeds": "as in the existing families: a supported test is also reported 'every seed agrees' when every seed rerun of the tested arm (<ours>_s<k>) points the same way against the fixed comparison arm",
+  "two_sided": "the schema tests one-sided claims only; L2 (ours_k11 vs ours_loo, no direction fixed) is split into L2a and L2b, one per direction, each at alpha 0.025 with Holm within it: a two-sided test at 0.05 per family pair. At most one of the two can be supported for a given cell",
+  "families": [
+    {
+      "name": "L1",
+      "claim": "ours_sent > loo_sent at 8x: random-mask Ridge attribution labels beat leave-one-out labels at sentence level (primary reader)",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "ours_sent",
+      "vs": ["loo_sent"],
+      "kind": "superiority",
+      "margin": 0.0,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [8]
+    },
+    {
+      "name": "L1p",
+      "claim": "ours_beta > ours_loo, paragraph selection at 4x and 8x: the same comparison as L1 without the sentence step (primary reader)",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "ours_beta",
+      "vs": ["ours_loo"],
+      "kind": "superiority",
+      "margin": 0.0,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [4, 8]
+    },
+    {
+      "name": "L2a",
+      "claim": "ours_k11 > ours_loo at 4x and 8x: at equal labeling cost (~11 reader calls per document), random masks + Ridge beat LOO (primary reader; one direction of a two-sided test, alpha 0.025)",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "ours_k11",
+      "vs": ["ours_loo"],
+      "kind": "superiority",
+      "margin": 0.0,
+      "alpha": 0.025,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [4, 8]
+    },
+    {
+      "name": "L2b",
+      "claim": "ours_loo > ours_k11 at 4x and 8x: at equal labeling cost, LOO beats random masks + Ridge (primary reader; the other direction of L2a, alpha 0.025)",
+      "reader": "Qwen--Qwen3-8B",
+      "ours": "ours_loo",
+      "vs": ["ours_k11"],
+      "kind": "superiority",
+      "margin": 0.0,
+      "alpha": 0.025,
+      "sources": ["vimqa", "hotpotqa", "2wiki"],
+      "ratios": [4, 8]
+    }
+  ]
+}

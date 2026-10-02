@@ -74,3 +74,4 @@ runs/
 # data/SOURCES.md (provenance/license notes) stays tracked.
 data/*.json
 data/*.jsonl
+.pytest_tmp/

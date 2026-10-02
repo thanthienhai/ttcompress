@@ -30,8 +30,9 @@ from collections import defaultdict
 import numpy as np
 
 from ttcompress.attribution import (
-    MaskOutcomes, ensemble_labels, fit_document, fit_position_prior, load_chunk_labels, load_mask_outcomes,
-    masks_for_document, position_r2, record_paths, save_record, select_alpha,
+    MaskOutcomes, ensemble_labels, fit_document, fit_document_loo, fit_position_prior, load_chunk_labels,
+    load_mask_outcomes, loo_masks, masks_for_document, position_r2, record_paths, save_record, select_alpha,
+    subsample_masks,
 )
 from ttcompress.metrics import spearman, token_f1
 from ttcompress.reader import MAX_NEW_TOKENS, load_reader, reader_tag
@@ -82,6 +83,11 @@ def cmd_measure(args):
     if not single and args.multihop_units != 'paragraph':
         # only when it differs from the default, so label dirs measured before the option still match
         config['multihop_units'] = args.multihop_units
+    if args.mask_scheme != 'random':
+        # same pattern: random-mask label dirs measured before the option keep matching their config. A LOO
+        # dir is a different label set (its masks are not the method's), so it must never share a dir with them
+        # -- and `fit` reads this key to refuse fitting one with the other's estimator
+        config['mask_scheme'] = args.mask_scheme
     os.makedirs(out_dir, exist_ok=True)
     config_path = os.path.join(out_dir, 'measure_config.json')
     # checked even when every document is on disk: a finished dir from other settings must not be fitted
@@ -121,7 +127,11 @@ def cmd_measure(args):
         prompts, owners = [], []
         per_doc_masks = []
         for di, d in enumerate(group):
-            masks = masks_for_document(d.doc_id, d.num_chunks, keep_rates, args.k_min, args.k_per_chunk, args.k_max)
+            if args.mask_scheme == 'loo':
+                masks = loo_masks(d.num_chunks)
+            else:
+                masks = masks_for_document(d.doc_id, d.num_chunks, keep_rates, args.k_min, args.k_per_chunk,
+                                           args.k_max)
             per_doc_masks.append(masks)
             for m in masks:
                 prompts.append(reader.build_prompt(d.text([i for i, k in enumerate(m) if k]), d.question, d.language))
@@ -197,10 +207,71 @@ def _first_n_records(raw_dir: str, n):
     return [r for r in records if r.doc['doc_id'] in keep]
 
 
+def _mask_scheme(raw_dir: str) -> str:
+    """How a raw dir's masks were drawn (measure --mask-scheme). A dir without measure_config.json, or one
+    measured before the option existed, holds random masks."""
+    path = os.path.join(raw_dir, 'measure_config.json')
+    if not os.path.exists(path):
+        return 'random'
+    with open(path, encoding='utf-8') as f:
+        return json.load(f).get('mask_scheme', 'random')
+
+
+def _fit_loo(args, records):
+    """estimator=loo: no surrogate, so nothing to choose on dev and nothing to bootstrap."""
+    if args.alpha is not None or args.alpha_from:
+        raise SystemExit("--estimator loo has no alpha: drop --alpha/--alpha-from")
+    if args.max_masks is not None:
+        raise SystemExit("--max-masks subsamples random masks for ridge; LOO needs every leave-one-out mask")
+    if args.n_boot:
+        raise SystemExit("--n-boot is a ridge diagnostic; LOO has no resampling CI")
+    labels = []
+    for rec in records:
+        lab = fit_document_loo(rec, args.target)
+        save_record(lab, args.out_dir)
+        labels.append(lab)
+    import warnings
+    with warnings.catch_warnings():  # cv_r2 is nan by construction: the nanmeans of it warn on every LOO fit
+        warnings.simplefilter('ignore', RuntimeWarning)
+        summary = _summary_stats(labels, {'alpha': None})
+    return summary
+
+
 def cmd_fit(args):
+    # the estimator must match how the raw dir was measured: ridge on LOO masks is a near-singular fit of C
+    # rows, and LOO on random masks has no "full minus one" contrast to read off
+    scheme = _mask_scheme(args.raw_dir)
+    if args.estimator == 'loo' and scheme != 'loo':
+        raise SystemExit(f"{args.raw_dir} was measured with mask_scheme={scheme}; --estimator loo needs a dir "
+                         f"measured with --mask-scheme loo")
+    if args.estimator == 'ridge' and scheme != 'random':
+        raise SystemExit(f"{args.raw_dir} was measured with mask_scheme={scheme}; --estimator ridge needs random "
+                         f"masks (fit it with --estimator {scheme})")
+    if args.estimator == 'ridge' and args.max_masks is not None and args.max_masks <= 0:
+        raise SystemExit(f"--max-masks must be > 0; got {args.max_masks}")
     records = _first_n_records(args.raw_dir, args.n)
     if not records:
         raise SystemExit(f"no measure output in {args.raw_dir}")
+    os.makedirs(args.out_dir, exist_ok=True)
+    for stale in record_paths(args.out_dir):  # a re-fit with a smaller --n must not leave extra documents behind
+        os.remove(stale)
+    if args.estimator == 'loo':
+        summary = _fit_loo(args, records)
+        summary.update({'target': args.target, 'raw_dir': args.raw_dir, 'n_requested': args.n, 'estimator': 'loo'})
+        with open(os.path.join(args.out_dir, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        print(json.dumps({k: v for k, v in summary.items() if k != 'position_prior_by_decile'}, indent=2))
+        return
+
+    def cut(recs):
+        # equal-cost baseline: every record (train AND the dev records alpha is chosen on) cut to the same K,
+        # so alpha is selected for the regime it is used in. Seeded per (mask_seed, doc_id): a document's
+        # subset does not depend on --n, sharding or which other documents are fitted
+        if args.max_masks is None:
+            return recs
+        return [subsample_masks(r, args.max_masks, args.mask_seed) for r in recs]
+
+    records = cut(records)
     alpha_info = {}
     if args.alpha is not None:
         alpha = args.alpha
@@ -208,16 +279,18 @@ def cmd_fit(args):
         if not args.alpha_from:
             raise SystemExit("pass --alpha, or --alpha-from <dev measure dir> (alpha is chosen on dev, never on train)")
         # comma list: an eval-only source (xquad_vi, 2wiki) has no dev labels of its own -> pooled train-source dev
-        dev = [r for d in args.alpha_from.split(',') if d for r in _first_n_records(d, args.alpha_n)]
+        dev_dirs = [d for d in args.alpha_from.split(',') if d]
+        for d in dev_dirs:
+            if _mask_scheme(d) != 'random':
+                raise SystemExit(f"--alpha-from {d} was measured with mask_scheme={_mask_scheme(d)}; "
+                                 f"ridge alpha CV needs random masks")
+        dev = cut([r for d in dev_dirs for r in _first_n_records(d, args.alpha_n)])
         if not dev:
             raise SystemExit(f"no measure output in {args.alpha_from}")
         grid = [float(a) for a in args.alpha_grid.split(',')]
         alpha, scores = select_alpha([(r.masks, r.f1 if args.target == 'f1' else r.logprob) for r in dev], grid)
         alpha_info = {'alpha': alpha, 'alpha_cv_mse': scores, 'alpha_dev_dir': args.alpha_from, 'n_alpha_docs': len(dev)}
         print(f"alpha={alpha} by dev CV over {len(dev)} docs: {scores}")
-    os.makedirs(args.out_dir, exist_ok=True)
-    for stale in record_paths(args.out_dir):  # a re-fit with a smaller --n must not leave extra documents behind
-        os.remove(stale)
     labels = []
     for rec in records:
         lab = fit_document(rec, args.target, alpha, args.n_boot)
@@ -225,6 +298,9 @@ def cmd_fit(args):
         labels.append(lab)
     summary = _summary_stats(labels, alpha_info or {'alpha': alpha})
     summary.update({'target': args.target, 'raw_dir': args.raw_dir, 'n_requested': args.n})
+    if args.max_masks is not None:  # only off the default path, so the main fit dirs' summaries keep their keys
+        summary.update({'estimator': 'ridge', 'max_masks': args.max_masks, 'mask_seed': args.mask_seed,
+                        'mean_masks_used': float(np.mean([len(r.masks) for r in records]))})
     with open(os.path.join(args.out_dir, 'summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(json.dumps({k: v for k, v in summary.items() if k != 'position_prior_by_decile'}, indent=2))
@@ -289,6 +365,9 @@ def main():
     m.add_argument('--k-min', type=int, default=64)
     m.add_argument('--k-per-chunk', type=float, default=1.0)
     m.add_argument('--k-max', type=int, default=256)
+    m.add_argument('--mask-scheme', choices=['random', 'loo'], default='random',
+                   help="random: Bernoulli masks (the method; --keep-rates/--k-*); loo: the C leave-one-out masks "
+                        "(LOO baseline, fit with --estimator loo; --keep-rates/--k-* unused)")
     m.add_argument('--docs-per-call', type=int, default=16, help="documents whose masks go to the reader together")
     m.add_argument('--shard', type=int, default=0)
     m.add_argument('--num-shards', type=int, default=1)
@@ -305,6 +384,13 @@ def main():
                    help="fit only the first n documents (load_documents order) of --raw-dir; default all")
     f.add_argument('--alpha-n', type=int, default=None, help="same, for each --alpha-from dir")
     f.add_argument('--n-boot', type=int, default=0, help="bootstrap CIs per chunk (slow; diagnostics only)")
+    f.add_argument('--estimator', choices=['ridge', 'loo'], default='ridge',
+                   help="ridge: surrogate on random masks (the method); loo: full-minus-one deltas on a "
+                        "--mask-scheme loo raw dir (baseline; no alpha)")
+    f.add_argument('--max-masks', type=int, default=None,
+                   help="ridge only: fit each document (and the --alpha-from dev documents) on a random subset of "
+                        "at most N of its masks (equal-cost baseline); default all")
+    f.add_argument('--mask-seed', type=int, default=0, help="seed of the --max-masks subset (per document)")
     f.add_argument('--out-dir', required=True)
     f.set_defaults(func=cmd_fit)
 

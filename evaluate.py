@@ -844,7 +844,9 @@ def _multi_support_markdown(tests) -> list:
     return lines + ['']
 
 
-SEED_ARM = re.compile(r'^(ours_beta|ours_ens|ours_sent|ours_fill)_s(\d+)$')
+# + the leave-one-out baseline's pruners (run_pipeline.sh LOO_ARMS=1, docs/prereg_loo.json)
+SEED_ARM = re.compile(r'^(ours_beta|ours_ens|ours_sent|ours_fill|ours_loo|loo_sent|ours_k11|k11_sent'
+                      r'|loocomp_bin|loocomp_bin_sent)_s(\d+)$')
 
 
 def seed_variants(arms):
